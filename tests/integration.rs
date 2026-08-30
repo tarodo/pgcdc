@@ -83,6 +83,42 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
     assert!(json["before"].is_null());
     assert_eq!(json["unchanged_columns"], serde_json::json!([]));
 
+    // Ядро контракта на LSN: PostgreSQL должен подтвердить ровно end_lsn, а не
+    // commit_lsn (они различаются на фиксированные 0x30 байт — DECISIONS/бриф
+    // Task 6). Опрашиваем в цикле: send_feedback() уходит из цикла репликации
+    // асинхронно относительно этого запроса, поэтому однократное чтение гонится
+    // с нашим же подтверждением.
+    let expected_end = tx.end_lsn.to_string();
+    let expected_commit = tx.commit_lsn.to_string();
+    assert_ne!(
+        expected_end, expected_commit,
+        "end_lsn и commit_lsn обязаны отличаться, иначе проверка равенства ничего не доказывает"
+    );
+
+    let mut confirmed = String::new();
+    for _ in 0..100 {
+        confirmed = client
+            .query_one(
+                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'pgcdc_slot'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if confirmed == expected_end {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        confirmed, expected_end,
+        "PostgreSQL должен был подтвердить end_lsn транзакции"
+    );
+    assert_ne!(
+        confirmed, expected_commit,
+        "подтверждена не должна быть позиция начала COMMIT-записи"
+    );
+
     handle.abort();
 }
 

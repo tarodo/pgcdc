@@ -69,9 +69,15 @@ pub enum OutputKind {
 #[derive(Debug, Parser)]
 #[command(name = "pgcdc", about = "PostgreSQL CDC via logical replication")]
 pub struct Config {
-    #[arg(long, env = "PGCDC_DATABASE_URL")]
+    // hide_env_values: без него clap печатает СЫРОЕ значение переменной
+    // окружения в `--help` (`[env: PGCDC_DATABASE_URL=postgres://...:hunter2@...]`),
+    // в обход DatabaseUrl и его редактирующих Debug/Display целиком.
+    #[arg(long, env = "PGCDC_DATABASE_URL", hide_env_values = true)]
     pub database_url: DatabaseUrl,
 
+    // Осознанное решение: publication/slot/output/max_transaction_events секретов
+    // не несут, поэтому им hide_env_values не нужен — видимость текущего значения
+    // в `--help` тут помогает отладке конфигурации и ничего не утекает.
     #[arg(long, env = "PGCDC_PUBLICATION")]
     pub publication: String,
 
@@ -87,6 +93,8 @@ pub struct Config {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
 
     #[test]
@@ -108,5 +116,29 @@ mod tests {
     fn url_without_a_password_is_unchanged() {
         let url = DatabaseUrl::new("postgres://cdc@db.example:5432/app".into());
         assert!(format!("{url}").contains("cdc@db.example"));
+    }
+
+    #[test]
+    fn help_output_never_shows_the_env_var_password() {
+        // clap's default `[env: VAR=value]` help hint bypasses DatabaseUrl entirely:
+        // it prints the raw environment string, not our redacting Display. A test
+        // that only exercises Debug/Display would stay green while this leaks.
+        // SAFETY: cargo test runs this binary's tests in one process and no other
+        // test reads or writes PGCDC_DATABASE_URL, so this mutation is not racy
+        // with the rest of the suite.
+        unsafe {
+            std::env::set_var(
+                "PGCDC_DATABASE_URL",
+                "postgres://cdc:hunter2@db.example:5432/app",
+            );
+        }
+        let help = Config::command().render_help().to_string();
+        unsafe {
+            std::env::remove_var("PGCDC_DATABASE_URL");
+        }
+        assert!(
+            !help.contains("hunter2"),
+            "password leaked into --help output:\n{help}"
+        );
     }
 }
