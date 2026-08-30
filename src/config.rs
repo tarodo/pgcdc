@@ -146,16 +146,61 @@ pub struct Config {
 
     /// Как часто вызывается барьер durability и уходит подтверждение.
     /// Задержка подтверждения на корректность не влияет: инвариант 1
-    /// сохраняется, а дубликаты после сбоя контракт разрешает.
-    #[arg(long, env = "PGCDC_ACK_INTERVAL_MS", default_value = "200")]
+    /// сохраняется, а дубликаты после сбоя контракт разрешает. Нижняя
+    /// граница — 1: с нулём условие "интервал прошёл" истинно на каждой
+    /// итерации цикла, то есть busy spin с fsync на каждый холостой тик
+    /// (review Task 4, round 1, F4). Запрещаем это на уровне парсера,
+    /// а не только в комментарии.
+    #[arg(
+        long,
+        env = "PGCDC_ACK_INTERVAL_MS",
+        default_value = "200",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub ack_interval_ms: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+    use clap::Parser;
 
     use super::*;
+
+    /// Аргументы, минимально достаточные для успешного разбора, без
+    /// `--ack-interval-ms` — тест дописывает его сам.
+    fn base_args() -> Vec<&'static str> {
+        vec![
+            "pgcdc",
+            "--database-url",
+            "postgres://u:p@h:5432/db",
+            "--publication",
+            "p",
+            "--slot",
+            "s",
+        ]
+    }
+
+    #[test]
+    fn ack_interval_ms_rejects_zero_at_the_parser_level() {
+        // F4 (review Task 4, round 1): 0 означает, что `elapsed() >= interval`
+        // истинно на каждой итерации цикла — busy spin с fsync на каждый
+        // проход. Отвергать это должен парсер, чтобы конфигурацию с нулём
+        // нельзя было выразить вовсе, а не только надеяться, что цикл
+        // как-то переживёт такое значение.
+        let mut args = base_args();
+        args.extend(["--ack-interval-ms", "0"]);
+        let err = Config::try_parse_from(args).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn ack_interval_ms_accepts_one_as_the_lowest_valid_value() {
+        let mut args = base_args();
+        args.extend(["--ack-interval-ms", "1"]);
+        let cfg = Config::try_parse_from(args).expect("1 обязан быть валиден");
+        assert_eq!(cfg.ack_interval_ms, 1);
+    }
 
     #[test]
     fn from_str_accepts_anything_so_clap_never_echoes_the_input() {

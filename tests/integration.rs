@@ -47,22 +47,39 @@ impl Sink for FailingSink {
     }
 }
 
-/// Принимает запись успешно, но барьер у него всегда падает. Существует
-/// отдельно от `FailingSink`, потому что тот падает внутри `write_transaction`
-/// и никогда не доходит до кода, который отмечает durable, — так что он не
-/// охраняет разделение «запись прошла» / «барьер прошёл», ради которого
-/// затевалась задача 2 (review Task 2, round 1, F2).
-struct FlushFailsSink;
+/// Принимает запись успешно, но барьер падает всякий раз, когда есть что
+/// проваливать. Существует отдельно от `FailingSink`, потому что тот падает
+/// внутри `write_transaction` и никогда не доходит до кода, который отмечает
+/// durable, — так что он не охраняет разделение «запись прошла» / «барьер
+/// прошёл», ради которого затевалась задача 2 (review Task 2, round 1, F2).
+///
+/// Task 4 review, round 1, F1: раньше `flush` падал БЕЗУСЛОВНО, включая
+/// пустой тик без единой записи. После задачи 4 барьер достижим и на
+/// холостых тиках (в этом весь смысл таймера), поэтому такой дублёр мог
+/// оборвать `run()` ожидаемой ошибкой ещё до первого `write_transaction` —
+/// тест проходил бы, ничего не проверив. Форма — как у остальных sink'ов:
+/// `write_transaction` запоминает принятую позицию, `flush` при пустом
+/// накопителе честно отвечает `Ok(None)` (контракт трейта и уже
+/// существующий юнит-тест для других дублёров), а падает только тогда,
+/// когда действительно было что подтверждать.
+struct FlushFailsSink(Option<Lsn>);
 
 #[async_trait::async_trait]
 impl Sink for FlushFailsSink {
     fn durability(&self) -> Durability {
         Durability::Fsync
     }
-    async fn write_transaction(&mut self, _tx: &Transaction) -> Result<(), PgcdcError> {
+    async fn write_transaction(&mut self, tx: &Transaction) -> Result<(), PgcdcError> {
+        self.0 = Some(tx.end_lsn);
         Ok(())
     }
     async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError> {
+        if self.0.is_none() {
+            return Ok(None);
+        }
+        // Позицию нарочно не забираем: барьер провалился, данные не стали
+        // durable, и повторная попытка обязана видеть ту же ожидающую
+        // позицию, а не молча её терять.
         Err(PgcdcError::Sink("deliberate barrier failure".into()))
     }
 }
@@ -274,7 +291,7 @@ async fn barrier_failure_stops_us_before_the_slot_advances() {
 
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(FlushFailsSink)).await
+        pgcdc::postgres::replication::run(cfg, Box::new(FlushFailsSink(None))).await
     });
 
     client

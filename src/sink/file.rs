@@ -79,6 +79,15 @@ fn flush_durable<W: DurableWrite>(
     writer: &mut BufWriter<W>,
     pending: &mut Option<Lsn>,
 ) -> Result<Option<Lsn>, PgcdcError> {
+    // Ничего не принято с прошлого барьера => буфер пуст и уже
+    // синхронизирован — иначе было бы что принимать. Без этой проверки
+    // барьер таймера (задача 4) вызывал бы flush и fsync на каждом тике
+    // безусловно, включая полностью простаивающий поток — несколько
+    // fsync в секунду в файл, к которому никто не притрагивался (review
+    // Task 4, round 1, F3).
+    if pending.is_none() {
+        return Ok(None);
+    }
     writer
         .flush()
         .map_err(|e| PgcdcError::Sink(format!("flush: {e}")))?;
@@ -280,6 +289,24 @@ mod tests {
         assert_eq!(
             pending, None,
             "барьер обязан забрать ожидающую позицию, оставив None"
+        );
+    }
+
+    #[test]
+    fn flush_durable_does_not_touch_the_device_when_nothing_is_pending() {
+        // F3 (review Task 4, round 1): барьер таймера достигается на каждом
+        // тике, включая холостые — вызывать flush/fsync безусловно означало
+        // бы синхронизировать нетронутый файл несколько раз в секунду вечно
+        // простаивающего потока. Ничего не принято => буфер уже пуст и уже
+        // синхронизирован, так что ни один вызов сюда не должен доходить.
+        let mut writer = BufWriter::new(RecordingSyncWriter::default());
+        let mut pending = None;
+        let durable = flush_durable(&mut writer, &mut pending).unwrap();
+        assert_eq!(durable, None);
+        assert!(
+            writer.get_ref().calls.borrow().is_empty(),
+            "нечего подтверждать — flush и durable_sync не должны были вызваться: {:?}",
+            writer.get_ref().calls.borrow()
         );
     }
 }
