@@ -26,6 +26,9 @@ fn replication_url(base: &str) -> String {
 }
 
 pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcError> {
+    // Первым делом — до любого подключения и любого лога, где могла бы всплыть строка.
+    config.database_url.validate()?;
+
     // Обязательство Q25(а): guard ДО start(), потому что start() безусловно
     // зовёт ensure_replication_slot() и при отсутствующем слоте молча создаст
     // новый на текущей позиции WAL, потеряв всё закоммиченное раньше.

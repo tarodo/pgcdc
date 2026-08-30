@@ -2,6 +2,8 @@ use std::fmt;
 
 use clap::{Parser, ValueEnum};
 
+use crate::error::PgcdcError;
+
 /// Обёртка над строкой подключения. Ручные Debug и Display вырезают пароль,
 /// поэтому утечь он может только через явный `expose()`.
 #[derive(Clone)]
@@ -38,6 +40,18 @@ impl DatabaseUrl {
             None => self.0.clone(),
         }
     }
+
+    /// Принимаем только URL-форму. Строку libpq (`host=... password=...`) отвергаем:
+    /// её нельзя ни отредактировать (`redacted()` не найдёт `@` и вернёт ввод дословно),
+    /// ни корректно дополнить параметром репликации. Принять формат, который мы не умеем
+    /// обработать, — значит слить секрет и всё равно упасть.
+    pub fn validate(&self) -> Result<(), PgcdcError> {
+        if self.0.starts_with("postgres://") || self.0.starts_with("postgresql://") {
+            Ok(())
+        } else {
+            Err(PgcdcError::InvalidDatabaseUrl)
+        }
+    }
 }
 
 impl fmt::Display for DatabaseUrl {
@@ -52,27 +66,13 @@ impl fmt::Debug for DatabaseUrl {
     }
 }
 
-/// libpq принимает `key=value`-строки (`host=... user=... password=...`), но ни
-/// `redacted()` выше, ни `replication_url` в `postgres/replication.rs` не умеют
-/// с ними работать: первая не находит `://` и возвращает пароль как есть, вторая
-/// приклеивает `?replication=database` к строке без `?`/`&`-грамматики. Принять
-/// такую форму и потом не суметь её ни спрятать, ни расширить — хуже, чем
-/// отказать сразу, поэтому здесь отвергается всё, что не выглядит как URL.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "database URL must be a URL, e.g. postgres://user:password@host:5432/dbname \
-     (libpq `key=value` connection strings are not supported)"
-)]
-pub struct InvalidDatabaseUrl;
-
-/// clap требует именно `FromStr`: одного `From<String>` для `#[arg]` недостаточно,
-/// и без этой реализации derive не соберётся.
+/// Разбор намеренно не может провалиться. Если вернуть здесь ошибку, clap напечатает
+/// отвергнутое значение целиком в своей обёртке «invalid value '...'», и пароль
+/// окажется в stderr. Проверка живёт в `validate()`, который зовётся первой строкой
+/// `run()`, где текст ошибки контролируем мы.
 impl std::str::FromStr for DatabaseUrl {
-    type Err = InvalidDatabaseUrl;
+    type Err = std::convert::Infallible;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if !s.contains("://") {
-            return Err(InvalidDatabaseUrl);
-        }
         Ok(Self::new(s.to_owned()))
     }
 }
@@ -114,6 +114,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_str_accepts_anything_so_clap_never_echoes_the_input() {
+        // clap печатает отвергнутое значение в собственной обёртке «invalid value '...'».
+        // Единственный способ этого избежать — не давать clap повода отвергнуть:
+        // разбор всегда успешен, а проверка живёт в validate().
+        let libpq = "host=db user=cdc password=hunter2 dbname=app";
+        let parsed: DatabaseUrl = libpq.parse().expect("разбор обязан быть инфаллибельным");
+        assert!(
+            parsed.validate().is_err(),
+            "но validate обязан это отвергнуть"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_libpq_key_value_form() {
+        let url = DatabaseUrl::new("host=db user=cdc password=hunter2".into());
+        let err = url.validate().unwrap_err();
+        assert!(matches!(err, PgcdcError::InvalidDatabaseUrl));
+        assert!(
+            !err.to_string().contains("hunter2"),
+            "текст ошибки не должен содержать ввод: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_password_containing_a_scheme_separator() {
+        // Подстрочная проверка «содержит ://» пропускала libpq-строку, в ПАРОЛЕ
+        // которой есть ://, а redacted() возвращал такую строку дословно.
+        let url = DatabaseUrl::new("host=db password=weird://leak dbname=app".into());
+        assert!(url.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_both_url_schemes() {
+        assert!(DatabaseUrl::new("postgres://u:p@h:5432/db".into())
+            .validate()
+            .is_ok());
+        assert!(DatabaseUrl::new("postgresql://u:p@h:5432/db".into())
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
     fn password_never_reaches_debug_or_display() {
         // Требование §4 спеки — это тип, а не «не забыть»: раз Debug вырезает
         // пароль, ни #[derive(Debug)] на конфиге, ни поле tracing не смогут его слить.
@@ -132,29 +174,6 @@ mod tests {
     fn url_without_a_password_is_unchanged() {
         let url = DatabaseUrl::new("postgres://cdc@db.example:5432/app".into());
         assert!(format!("{url}").contains("cdc@db.example"));
-    }
-
-    #[test]
-    fn libpq_key_value_form_is_rejected() {
-        // Живой прогон ревьюера: этот вид строки проходит preflight guard
-        // (tokio-postgres его понимает) и утекает через Debug/Display, а
-        // replication_url ломает его наложением `?replication=database`.
-        // Отказ на этапе парсинга должен наступить раньше, чем что-либо из
-        // этого случится.
-        use std::str::FromStr;
-        let err = DatabaseUrl::from_str(
-            "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=app",
-        )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("URL"),
-            "сообщение должно направить к форме URL"
-        );
-        assert!(
-            !msg.contains("host=127.0.0.1"),
-            "сообщение об ошибке не должно эхом повторять введённую строку"
-        );
     }
 
     #[test]

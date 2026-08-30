@@ -270,6 +270,39 @@ async fn stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error() {
 }
 
 #[tokio::test]
+async fn libpq_connection_string_is_rejected_without_echoing_the_password() {
+    // Отвергать такую строку мы научились в этапе 1, но clap печатал её целиком
+    // в тексте своей ошибки. Здесь проверяется именно отсутствие эха.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+        .args([
+            "--database-url",
+            "host=127.0.0.1 port=5432 user=postgres password=SUPERSECRET_XYZZY dbname=app",
+            "--publication",
+            "pgcdc_pub",
+            "--slot",
+            "pgcdc_slot",
+        ])
+        .output()
+        .expect("запустить бинарь");
+
+    assert!(
+        !output.status.success(),
+        "невалидный URL обязан давать ненулевой код"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.is_empty(), "stdout несёт только полезную нагрузку");
+    assert!(
+        !stderr.contains("SUPERSECRET_XYZZY"),
+        "пароль не должен появляться в stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("postgres://"),
+        "сообщение должно подсказывать нужную форму: {stderr}"
+    );
+}
+
+#[tokio::test]
 async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;

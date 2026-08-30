@@ -36,6 +36,9 @@ pub enum PgcdcError {
 
     #[error("postgres connection error: {0}")]
     Connection(String),
+
+    #[error("database URL must start with postgres:// or postgresql:// (libpq key=value connection strings are not supported)")]
+    InvalidDatabaseUrl,
 }
 
 impl PgcdcError {
@@ -51,6 +54,7 @@ impl PgcdcError {
             Self::AckBeyondDurable { .. } => "ack_beyond_durable",
             Self::Sink(_) => "sink",
             Self::Connection(_) => "connection",
+            Self::InvalidDatabaseUrl => "invalid_database_url",
         }
     }
 
@@ -65,6 +69,7 @@ impl PgcdcError {
             Self::AckBeyondDurable { .. } => true,
             Self::Sink(_) => true,
             Self::Connection(_) => false,
+            Self::InvalidDatabaseUrl => true,
         }
     }
 }
