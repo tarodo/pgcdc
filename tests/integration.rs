@@ -73,6 +73,7 @@ fn config(conn: &str) -> Config {
         publication: "pgcdc_pub".into(),
         slot: "pgcdc_slot".into(),
         output: OutputKind::Stdout,
+        output_path: None,
         max_transaction_events: 100_000,
     }
 }
@@ -388,6 +389,33 @@ async fn libpq_connection_string_is_rejected_without_echoing_the_password() {
     assert!(
         stderr.contains("postgres://"),
         "сообщение должно подсказывать нужную форму: {stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_output_without_a_path_is_rejected_by_the_binary() {
+    // Проверяется поведение бинаря целиком: clap разбирает конфигурацию,
+    // а решение об обязательности пути принимает main.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+        .args([
+            "--database-url",
+            "postgres://u:p@127.0.0.1:1/db",
+            "--publication",
+            "p",
+            "--slot",
+            "s",
+            "--output",
+            "file",
+        ])
+        .output()
+        .expect("запустить бинарь");
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.is_empty(), "stdout несёт только полезную нагрузку");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--output-path"),
+        "сообщение называет недостающий флаг: {stderr}"
     );
 }
 

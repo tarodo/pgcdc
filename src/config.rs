@@ -113,6 +113,7 @@ impl std::str::FromStr for DatabaseUrl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputKind {
     Stdout,
+    File,
 }
 
 #[derive(Debug, Parser)]
@@ -135,6 +136,10 @@ pub struct Config {
 
     #[arg(long, env = "PGCDC_OUTPUT", value_enum, default_value = "stdout")]
     pub output: OutputKind,
+
+    /// Путь для `--output file`. Обязателен при этом варианте.
+    #[arg(long, env = "PGCDC_OUTPUT_PATH")]
+    pub output_path: Option<std::path::PathBuf>,
 
     #[arg(long, env = "PGCDC_MAX_TRANSACTION_EVENTS", default_value = "100000")]
     pub max_transaction_events: usize,

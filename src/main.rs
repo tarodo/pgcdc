@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use pgcdc::config::{Config, OutputKind};
-use pgcdc::sink::{Sink, StdoutSink};
+use pgcdc::sink::{FileSink, Sink, StdoutSink};
 use tracing::error;
 
 #[tokio::main]
@@ -20,8 +20,22 @@ async fn main() -> ExitCode {
         .init();
 
     let config = Config::parse();
-    let sink: Box<dyn Sink> = match config.output {
-        OutputKind::Stdout => Box::new(StdoutSink::new()),
+    // Исчерпывающий match по (output, output_path) намеренный: появление
+    // третьего варианта вывода заставит компилятор потребовать решения,
+    // а не провалиться сквозь молчаливую ветку по умолчанию.
+    let sink: Box<dyn Sink> = match (config.output, &config.output_path) {
+        (OutputKind::Stdout, _) => Box::new(StdoutSink::new()),
+        (OutputKind::File, Some(path)) => match FileSink::open(path) {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                error!(error_kind = e.kind(), fatal = e.is_fatal(), "{e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        (OutputKind::File, None) => {
+            error!("--output file requires --output-path");
+            return ExitCode::FAILURE;
+        }
     };
 
     match pgcdc::postgres::replication::run(config, sink).await {

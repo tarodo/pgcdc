@@ -1,5 +1,7 @@
+pub mod file;
 pub mod stdout;
 
+pub use file::FileSink;
 pub use stdout::StdoutSink;
 
 use crate::error::PgcdcError;
