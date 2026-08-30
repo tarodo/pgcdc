@@ -772,4 +772,167 @@ mod tests {
         assert!(json.contains(r#""after":null"#));
         assert!(json.contains(r#""unchanged_columns":[]"#));
     }
+
+    #[test]
+    fn update_with_key_only_old_tuple_omits_unsent_columns() {
+        // F1: swapping build_key_row for build_full_row on the Key arm would
+        // turn the server's "did not send" stub into a lying `null` for
+        // title and qty. before must carry only the column that arrived.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1000);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(items_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        a.handle(
+            PgOutputMessage::Update {
+                relation_id: 16392,
+                old: Some((
+                    OldTupleKind::Key,
+                    TupleData {
+                        columns: vec![
+                            ColumnValue::Text("10".into()),
+                            ColumnValue::Null,
+                            ColumnValue::Null,
+                        ],
+                    },
+                )),
+                new: TupleData {
+                    columns: vec![
+                        ColumnValue::Text("10".into()),
+                        ColumnValue::Text("Widget2".into()),
+                        ColumnValue::Text("8".into()),
+                    ],
+                },
+            },
+            Lsn(0x200),
+            &mut cache,
+        )
+        .unwrap();
+        let tx = a
+            .handle(commit(), Lsn(0x1000), &mut cache)
+            .unwrap()
+            .unwrap();
+        let ev = &tx.changes[0];
+        assert_eq!(ev.before_kind, Some(BeforeKind::Key));
+        let before = ev.before.as_ref().unwrap();
+        assert_eq!(before.len(), 1, "только присланная колонка");
+        assert!(
+            !before.contains_key("title"),
+            "заглушка не превращается в null"
+        );
+    }
+
+    #[test]
+    fn delete_with_full_old_tuple_keeps_real_nulls() {
+        // F2: collapsing this arm to build_key_row + BeforeKind::Key would
+        // both mislabel before_kind and silently drop a genuinely-NULL
+        // column (0009_delete.bin carries bio = NULL as a real 'n' under
+        // an 'O' tag, and that null is meaningful).
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1000);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(items_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        a.handle(
+            PgOutputMessage::Delete {
+                relation_id: 16392,
+                old_kind: OldTupleKind::Full,
+                old: TupleData {
+                    columns: vec![
+                        ColumnValue::Text("10".into()),
+                        ColumnValue::Null,
+                        ColumnValue::Text("7".into()),
+                    ],
+                },
+            },
+            Lsn(0x200),
+            &mut cache,
+        )
+        .unwrap();
+        let tx = a
+            .handle(commit(), Lsn(0x1000), &mut cache)
+            .unwrap()
+            .unwrap();
+        let ev = &tx.changes[0];
+        assert_eq!(ev.before_kind, Some(BeforeKind::Full));
+        let before = ev.before.as_ref().unwrap();
+        assert!(
+            before.get("title").unwrap().is_null(),
+            "настоящий NULL в полном старом кортеже должен остаться null"
+        );
+    }
+
+    #[test]
+    fn delete_key_tuple_arity_mismatch_is_a_decode_error() {
+        // F3: check_arity must also guard the key path. A short key tuple
+        // would otherwise zip-truncate to the shorter side in silence.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1000);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(items_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        let err = a
+            .handle(
+                PgOutputMessage::Delete {
+                    relation_id: 16392,
+                    old_kind: OldTupleKind::Key,
+                    old: TupleData {
+                        columns: vec![ColumnValue::Text("10".into()), ColumnValue::Null],
+                    },
+                },
+                Lsn(0x200),
+                &mut cache,
+            )
+            .unwrap_err();
+        assert!(matches!(err, PgcdcError::Decode(_)), "получили {err:?}");
+    }
+
+    #[test]
+    fn insert_rejects_unchanged_toast_marker() {
+        // F4: 'u' cannot legitimately arrive on an INSERT — the value is
+        // written in the same transaction and the reorder buffer resolves
+        // it before the plugin sees it. Silence here would be the worst
+        // response, so the guard must actually fire.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1000);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(items_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        let err = a
+            .handle(
+                PgOutputMessage::Insert {
+                    relation_id: 16392,
+                    tuple: TupleData {
+                        columns: vec![
+                            ColumnValue::Text("10".into()),
+                            ColumnValue::UnchangedToast,
+                            ColumnValue::Text("7".into()),
+                        ],
+                    },
+                },
+                Lsn(0x200),
+                &mut cache,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, PgcdcError::Decode(msg) if msg.contains("title")),
+            "получили {err:?}"
+        );
+    }
 }
