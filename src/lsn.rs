@@ -19,15 +19,16 @@ impl serde::Serialize for Lsn {
     }
 }
 
-/// Три позиции, которые нельзя путать (DECISIONS Q4). Четвёртая, `processed`, —
-/// работа этапа 3 (`DECISIONS.md` §4) и здесь намеренно ещё не появляется.
-/// Персистентности нет: слот PostgreSQL — единственный источник истины,
-/// трекер живёт только в памяти процесса.
+/// Четыре позиции, которые нельзя путать (DECISIONS Q4, Q26a). `processed` —
+/// работа этапа 3 (`DECISIONS.md` §4): она может опережать `durable`, и это
+/// разрыв, ради которого её завели. Персистентности нет: слот PostgreSQL —
+/// единственный источник истины, трекер живёт только в памяти процесса.
 #[derive(Debug, Default)]
 pub struct LsnTracker {
     received: Lsn,
     durable: Lsn,
     acked: Lsn,
+    processed: Lsn,
 }
 
 impl LsnTracker {
@@ -74,6 +75,20 @@ impl LsnTracker {
 
     pub fn acked(&self) -> Lsn {
         self.acked
+    }
+
+    /// Позиция, до которой сообщения разобраны и отданы sink'у. Может опережать
+    /// `durable`: между записью и fsync существует окно, и именно из-за него
+    /// условие продвижения по keepalive (Q26a) требует `processed == durable`,
+    /// а не только пустого буфера сборщика.
+    pub fn note_processed(&mut self, lsn: Lsn) {
+        if lsn > self.processed {
+            self.processed = lsn;
+        }
+    }
+
+    pub fn processed(&self) -> Lsn {
+        self.processed
     }
 }
 
@@ -132,5 +147,29 @@ mod tests {
         t.note_durable(Lsn(0x2000));
         t.note_durable(Lsn(0x1000));
         assert_eq!(t.durable(), Lsn(0x2000));
+    }
+
+    #[test]
+    fn processed_is_tracked_separately_and_moves_forward_only() {
+        let mut t = LsnTracker::new();
+        t.note_received(Lsn(0x3000));
+        t.note_processed(Lsn(0x2000));
+        assert_eq!(t.processed(), Lsn(0x2000));
+        t.note_processed(Lsn(0x1000));
+        assert_eq!(t.processed(), Lsn(0x2000), "позиция не откатывается");
+    }
+
+    #[test]
+    fn processed_may_run_ahead_of_durable() {
+        // Ровно та ситуация, ради которой позиция и заведена: транзакция
+        // отдана в sink, но fsync ещё не случился.
+        let mut t = LsnTracker::new();
+        t.note_processed(Lsn(0x2000));
+        assert_eq!(t.durable(), Lsn(0));
+        assert!(t.processed() > t.durable());
+        assert!(
+            t.try_ack(Lsn(0x2000)).is_err(),
+            "подтверждать по processed нельзя"
+        );
     }
 }

@@ -753,6 +753,7 @@ mod tests {
         assert_eq!(ev.operation, Operation::Delete);
         assert_eq!(ev.before_kind, Some(BeforeKind::Key));
         assert!(ev.after.is_none(), "у DELETE нового кортежа нет");
+        assert_eq!(ev.lsn, Lsn(0x200), "у события — wal_start своей строки");
         let before = ev.before.as_ref().unwrap();
         assert_eq!(before.len(), 1);
         assert!(

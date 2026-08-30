@@ -45,7 +45,7 @@ fn config(conn: &str) -> Config {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn insert_travels_end_to_end_and_arrives_as_one_event() {
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
@@ -122,7 +122,7 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
     handle.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn postgres_does_not_send_rolled_back_transactions() {
     // Проверяет НАШЕ понимание протокола, а не наш код: logical decoding
     // физически не отдаёт откаченные транзакции. Если тест покраснеет,
@@ -163,7 +163,7 @@ async fn postgres_does_not_send_rolled_back_transactions() {
     handle.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn sink_failure_stops_us_before_the_slot_advances() {
     // Ядро контракта: подтверждение не уходит вперёд того, что записал sink.
     let (_pg, conn) = common::start_postgres().await;
@@ -217,7 +217,7 @@ async fn sink_failure_stops_us_before_the_slot_advances() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error() {
     // I2: "JSONL на stdout, логи на stderr" — поведенчески верно, но ничего не
     // упало бы при регрессии. `--help` для этого не годится: он не проходит ни
@@ -269,7 +269,7 @@ async fn stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn libpq_connection_string_is_rejected_without_echoing_the_password() {
     // Отвергать такую строку мы научились в этапе 1, но clap печатал её целиком
     // в тексте своей ошибки. Здесь проверяется именно отсутствие эха.
@@ -302,7 +302,7 @@ async fn libpq_connection_string_is_rejected_without_echoing_the_password() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
@@ -325,7 +325,7 @@ async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn changing_a_key_column_produces_a_key_only_before_image() {
     // Единственная форма UPDATE, которой нет в замороженном захвате: тег 'K'.
     // Юнит-тест проверяет её синтетическими байтами, то есть нашим пониманием
@@ -379,7 +379,7 @@ async fn changing_a_key_column_produces_a_key_only_before_image() {
     handle.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn schema_change_resends_relation_and_the_cache_takes_the_new_one() {
     // pgoutput пересылает RELATION при инвалидации записи — например после DDL.
     // Захват этапа 0 такого случая не содержит, а замена записи в кэше

@@ -3,7 +3,7 @@ mod common;
 use pgcdc::error::PgcdcError;
 use pgcdc::postgres::guard::preflight_cold_start;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn cold_start_fails_when_the_slot_is_missing_and_does_not_create_it() {
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
@@ -24,7 +24,7 @@ async fn cold_start_fails_when_the_slot_is_missing_and_does_not_create_it() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn cold_start_returns_slot_positions_when_the_slot_exists() {
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
