@@ -98,4 +98,24 @@ fn dump(seq: usize, raw: &RawXLogData) {
             .collect();
         eprintln!("{:04x}  {:<47}  |{ascii}|", i * 16, hex.join(" "));
     }
+
+    // Task 4: замораживаем сырые payload'ы pgoutput как байтовые фикстуры для
+    // тестов декодера этапа 2 (DECISIONS Q17: позиции WAL живут в манифесте,
+    // не в файле).
+    let name = match kind {
+        'B' => "begin",
+        'C' => "commit",
+        'R' => "relation",
+        'I' => "insert",
+        'U' => "update",
+        'D' => "delete",
+        'T' => "truncate",
+        'Y' => "type",
+        'O' => "origin",
+        _ => "unknown",
+    };
+    let path = format!("tests/fixtures/{seq:04}_{name}.bin");
+    std::fs::create_dir_all("tests/fixtures").ok();
+    std::fs::write(&path, payload).expect("write fixture");
+    eprintln!("    -> {path}");
 }
