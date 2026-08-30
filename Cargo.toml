@@ -15,6 +15,8 @@ thiserror = "2.0.20"
 async-trait = "0.1.92"
 tracing = "0.1.44"
 tokio-postgres = "0.7.18"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 testcontainers = "0.28.0"
