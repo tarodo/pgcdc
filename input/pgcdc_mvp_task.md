@@ -1,0 +1,787 @@
+# pgcdc — MVP Specification
+
+## 1. Goal
+
+Build a minimal PostgreSQL CDC engine in Rust that reads logical replication events directly from PostgreSQL via the native `pgoutput` protocol and emits normalized JSON change events.
+
+The MVP is intentionally narrow. The goal is **not** to reproduce Debezium feature-for-feature, but to prove that a small standalone Rust process can reliably:
+
+1. connect to PostgreSQL using the replication protocol;
+2. consume changes from a logical replication slot;
+3. decode `pgoutput` messages;
+4. reconstruct transactions and row-level changes;
+5. emit those changes as JSON;
+6. acknowledge WAL positions only after the corresponding output has been successfully written;
+7. restart without silently losing committed changes.
+
+## 2. Non-goals
+
+The MVP does **not** need to support:
+
+- MySQL, Oracle, SQL Server, or any database other than PostgreSQL;
+- Kafka;
+- Iceberg, Delta Lake, Parquet, or object storage;
+- Avro / Protobuf / Schema Registry;
+- automatic initial snapshots;
+- automatic creation or management of publications;
+- automatic schema migrations;
+- DDL capture;
+- exactly-once delivery;
+- distributed execution or high availability;
+- configuration hot reload;
+- a web UI or control plane.
+
+These can be considered after the replication core is proven reliable.
+
+---
+
+## 3. Supported environment
+
+Initial target:
+
+- Rust stable;
+- PostgreSQL 14+;
+- PostgreSQL logical replication;
+- `wal_level = logical`;
+- existing publication;
+- existing logical replication slot using `pgoutput`;
+- one PostgreSQL source per process.
+
+Example PostgreSQL setup:
+
+```sql
+CREATE TABLE users (
+    id BIGINT PRIMARY KEY,
+    name TEXT,
+    email TEXT
+);
+
+CREATE PUBLICATION pgcdc_pub FOR TABLE users;
+
+SELECT pg_create_logical_replication_slot(
+    'pgcdc_slot',
+    'pgoutput'
+);
+```
+
+---
+
+## 4. CLI
+
+The application should be runnable as a single binary.
+
+Example:
+
+```bash
+pgcdc \
+  --database-url 'postgres://cdc:password@localhost:5432/app' \
+  --publication pgcdc_pub \
+  --slot pgcdc_slot \
+  --output stdout
+```
+
+Minimum configuration:
+
+```text
+--database-url
+--publication
+--slot
+--output
+```
+
+Environment variables may also be supported.
+
+Secrets such as database passwords must never be printed in logs.
+
+---
+
+## 5. High-level architecture
+
+```text
+PostgreSQL
+    │
+    │ Logical Replication Protocol
+    │ pgoutput
+    ▼
+┌───────────────────────────┐
+│ Replication Client        │
+└─────────────┬─────────────┘
+              ▼
+┌───────────────────────────┐
+│ pgoutput Decoder          │
+└─────────────┬─────────────┘
+              ▼
+┌───────────────────────────┐
+│ Relation / Schema Cache   │
+└─────────────┬─────────────┘
+              ▼
+┌───────────────────────────┐
+│ Transaction Assembler     │
+└─────────────┬─────────────┘
+              ▼
+┌───────────────────────────┐
+│ Normalized CDC Events     │
+└─────────────┬─────────────┘
+              ▼
+┌───────────────────────────┐
+│ Sink                      │
+│ stdout / file             │
+└─────────────┬─────────────┘
+              │ durable write
+              ▼
+       acknowledge LSN
+              │
+              ▼
+         PostgreSQL
+```
+
+The key reliability invariant is:
+
+> **Never acknowledge an LSN to PostgreSQL before all output associated with that checkpoint has been successfully written to the sink.**
+
+---
+
+## 6. Core modules
+
+Suggested project structure:
+
+```text
+src/
+├── main.rs
+├── config.rs
+├── postgres/
+│   ├── mod.rs
+│   ├── connection.rs
+│   ├── replication.rs
+│   └── pgoutput.rs
+├── schema/
+│   ├── mod.rs
+│   └── relation.rs
+├── transaction/
+│   ├── mod.rs
+│   └── assembler.rs
+├── event/
+│   ├── mod.rs
+│   └── change.rs
+├── sink/
+│   ├── mod.rs
+│   ├── stdout.rs
+│   └── file.rs
+└── checkpoint.rs
+```
+
+The exact structure is flexible; separation of responsibilities is not.
+
+---
+
+## 7. PostgreSQL replication client
+
+Implement a PostgreSQL replication connection capable of starting logical replication from the configured slot.
+
+Conceptually:
+
+```text
+START_REPLICATION SLOT pgcdc_slot LOGICAL <LSN>
+(
+    proto_version '1',
+    publication_names 'pgcdc_pub'
+)
+```
+
+The client must handle:
+
+- replication data messages;
+- PostgreSQL keepalive messages;
+- standby status updates;
+- WAL positions / LSNs;
+- reconnects after transient connection failures.
+
+The implementation should use an existing PostgreSQL/Rust library where practical rather than implementing the entire PostgreSQL wire protocol from scratch.
+
+---
+
+## 8. pgoutput decoder
+
+Decode at minimum these logical replication messages:
+
+```text
+BEGIN
+COMMIT
+RELATION
+INSERT
+UPDATE
+DELETE
+```
+
+Optional for MVP if encountered:
+
+```text
+TRUNCATE
+TYPE
+ORIGIN
+```
+
+Unsupported messages must not be silently ignored. They should either be explicitly handled or produce a clear warning/error depending on whether ignoring them is safe.
+
+---
+
+## 9. Relation cache
+
+`pgoutput` row messages reference a relation by relation ID. The process therefore needs an in-memory relation cache populated from `RELATION` messages.
+
+Example model:
+
+```rust
+struct Relation {
+    relation_id: u32,
+    namespace: String,
+    name: String,
+    columns: Vec<Column>,
+}
+
+struct Column {
+    name: String,
+    type_oid: u32,
+    is_key: bool,
+}
+```
+
+When PostgreSQL sends a new `RELATION` message for an existing relation ID, the cached definition must be replaced.
+
+Row decoding must use the schema version known at the point the row event is processed.
+
+---
+
+## 10. CDC event model
+
+Normalize PostgreSQL-specific replication messages into an internal event model.
+
+Example:
+
+```rust
+enum Operation {
+    Insert,
+    Update,
+    Delete,
+}
+
+struct ChangeEvent {
+    schema: String,
+    table: String,
+    operation: Operation,
+    before: Option<Row>,
+    after: Option<Row>,
+    transaction_id: Option<u32>,
+    lsn: PgLsn,
+    commit_timestamp: Option<DateTime<Utc>>,
+}
+```
+
+`Row` can initially be represented as a map:
+
+```rust
+HashMap<String, Value>
+```
+
+The external JSON representation should be stable and independent from the raw `pgoutput` representation.
+
+Example INSERT:
+
+```json
+{
+  "schema": "public",
+  "table": "users",
+  "operation": "insert",
+  "before": null,
+  "after": {
+    "id": "42",
+    "name": "Roman",
+    "email": "roman@example.com"
+  },
+  "transaction_id": 81234,
+  "lsn": "0/16B6C50",
+  "commit_timestamp": "2026-08-30T12:00:00Z"
+}
+```
+
+For the MVP it is acceptable to encode PostgreSQL values conservatively as strings/null instead of implementing perfect PostgreSQL → JSON type conversion.
+
+Correctness is more important than sophisticated type mapping.
+
+---
+
+## 11. Transaction handling
+
+Do not treat every row message as an independent committed event.
+
+The engine must understand transaction boundaries:
+
+```text
+BEGIN
+  INSERT
+  UPDATE
+  DELETE
+COMMIT
+```
+
+Changes should be buffered until `COMMIT`.
+
+Conceptual model:
+
+```rust
+struct Transaction {
+    xid: u32,
+    begin_lsn: PgLsn,
+    changes: Vec<ChangeEvent>,
+}
+```
+
+On `COMMIT`:
+
+1. finalize transaction metadata;
+2. write the transaction's events to the sink;
+3. ensure the sink reports successful completion;
+4. update the local checkpoint if applicable;
+5. acknowledge the corresponding LSN to PostgreSQL.
+
+If sink writing fails, the LSN must **not** be acknowledged.
+
+---
+
+## 12. Sink abstraction
+
+Define a small sink interface so the replication engine does not depend on a specific destination.
+
+Conceptually:
+
+```rust
+#[async_trait]
+trait Sink {
+    async fn write_transaction(
+        &mut self,
+        transaction: &Transaction,
+    ) -> Result<()>;
+}
+```
+
+MVP sinks:
+
+### stdout
+
+One JSON object per line.
+
+Useful for development and piping into other tools.
+
+### file
+
+Append JSON Lines to a local file.
+
+Example:
+
+```text
+changes.jsonl
+```
+
+File writes used for checkpoint acknowledgement must have clearly defined durability semantics. If the implementation considers a transaction durable only after `fsync`, perform it before acknowledging the corresponding LSN.
+
+---
+
+## 13. LSN and acknowledgement semantics
+
+This is the most important correctness requirement in the project.
+
+The engine must distinguish between:
+
+```text
+received LSN
+processed LSN
+sink-durable LSN
+acknowledged LSN
+```
+
+The following must never happen:
+
+```text
+receive WAL
+    ↓
+ACK PostgreSQL
+    ↓
+write sink
+    ↓
+CRASH
+```
+
+because a crash between ACK and sink durability can produce silent data loss.
+
+Required ordering:
+
+```text
+receive WAL
+    ↓
+decode
+    ↓
+assemble transaction
+    ↓
+COMMIT received
+    ↓
+write sink
+    ↓
+sink confirms durability
+    ↓
+checkpoint
+    ↓
+ACK PostgreSQL
+```
+
+At-least-once delivery after crashes is acceptable for the MVP.
+
+Silent loss is not.
+
+---
+
+## 14. Restart and recovery
+
+The process must survive a normal restart.
+
+Expected behavior:
+
+```text
+pgcdc running
+    ↓
+consume transactions
+    ↓
+process killed
+    ↓
+restart
+    ↓
+reconnect to slot
+    ↓
+continue consuming
+```
+
+Duplicate output around the crash boundary is acceptable.
+
+Missing committed rows is not.
+
+If the replication slot no longer exists or has been invalidated, terminate with a non-zero exit code and a clear diagnostic message.
+
+Do not automatically recreate a missing slot in the MVP because doing so could hide data loss.
+
+---
+
+## 15. Error handling
+
+The process must fail loudly on correctness-threatening conditions.
+
+Examples:
+
+### Recoverable
+
+- temporary network failure;
+- PostgreSQL restart;
+- temporary connection refusal.
+
+Retry with bounded/exponential backoff.
+
+### Fatal
+
+- replication slot missing;
+- replication slot invalidated;
+- incompatible `pgoutput` message;
+- impossible relation lookup;
+- malformed replication data;
+- authentication failure after configured retries;
+- sink cannot make progress.
+
+Fatal errors must:
+
+```text
+log ERROR
+return non-zero exit code
+```
+
+No condition capable of causing missing CDC events should result in exit code `0`.
+
+---
+
+## 16. Logging
+
+Use structured logging via the Rust `tracing` ecosystem or equivalent.
+
+Useful fields include:
+
+```text
+slot
+publication
+lsn
+xid
+schema
+table
+operation
+retry_count
+```
+
+Example conceptual logs:
+
+```text
+INFO  replication_started slot=pgcdc_slot publication=pgcdc_pub
+INFO  transaction_committed xid=81234 changes=17 lsn=0/16B6C50
+WARN  postgres_connection_lost retry=1
+INFO  postgres_connection_restored
+ERROR replication_slot_invalidated slot=pgcdc_slot
+```
+
+Do not log entire row payloads by default.
+
+---
+
+## 17. Metrics
+
+Metrics do not need a Prometheus endpoint in the first implementation, but the internal counters should be easy to expose later.
+
+Useful metrics:
+
+```text
+pgcdc_events_total
+pgcdc_transactions_total
+pgcdc_bytes_received_total
+pgcdc_reconnects_total
+pgcdc_errors_total
+pgcdc_last_received_lsn
+pgcdc_last_acknowledged_lsn
+pgcdc_transaction_buffer_size
+```
+
+Optional later metric:
+
+```text
+pgcdc_replication_lag_bytes
+```
+
+---
+
+## 18. Tests
+
+### Unit tests
+
+Test binary decoding for at least:
+
+```text
+RELATION
+BEGIN
+INSERT
+UPDATE
+DELETE
+COMMIT
+```
+
+Test relation cache replacement.
+
+Test transaction assembly.
+
+Test event serialization.
+
+### Integration tests
+
+Run PostgreSQL in Docker/Testcontainers.
+
+Minimum scenarios:
+
+#### Insert
+
+```sql
+INSERT INTO users VALUES (1, 'Alice', 'alice@example.com');
+```
+
+Expect one INSERT event.
+
+#### Update
+
+```sql
+UPDATE users SET name = 'Bob' WHERE id = 1;
+```
+
+Expect one UPDATE event.
+
+#### Delete
+
+```sql
+DELETE FROM users WHERE id = 1;
+```
+
+Expect one DELETE event.
+
+#### Multi-row transaction
+
+```sql
+BEGIN;
+INSERT ...;
+UPDATE ...;
+DELETE ...;
+COMMIT;
+```
+
+Verify all changes are associated with the same transaction and emitted only after commit.
+
+#### Rollback
+
+```sql
+BEGIN;
+INSERT ...;
+ROLLBACK;
+```
+
+No CDC event should be emitted as committed output.
+
+#### Restart
+
+1. consume some rows;
+2. kill pgcdc;
+3. insert more rows;
+4. restart pgcdc;
+5. verify every committed source row is represented in output.
+
+Duplicates are acceptable around the crash boundary.
+
+Missing rows are not.
+
+#### Sink failure
+
+Artificially make the sink fail before durability confirmation.
+
+Verify that PostgreSQL is **not** sent an acknowledgement advancing beyond the failed transaction.
+
+#### Slot invalidation / missing slot
+
+Verify pgcdc fails explicitly and returns a non-zero exit code rather than silently starting from a new position.
+
+---
+
+## 19. Demo scenario
+
+The repository should contain a reproducible local demo using Docker Compose.
+
+Desired workflow:
+
+```bash
+docker compose up -d postgres
+
+cargo run -- \
+  --database-url postgres://postgres:postgres@localhost:5432/postgres \
+  --publication pgcdc_pub \
+  --slot pgcdc_slot \
+  --output stdout
+```
+
+Then:
+
+```sql
+INSERT INTO users VALUES (1, 'Alice', 'alice@example.com');
+UPDATE users SET name = 'Bob' WHERE id = 1;
+DELETE FROM users WHERE id = 1;
+```
+
+Expected output:
+
+```json
+{"schema":"public","table":"users","operation":"insert",...}
+{"schema":"public","table":"users","operation":"update",...}
+{"schema":"public","table":"users","operation":"delete",...}
+```
+
+---
+
+## 20. Definition of Done
+
+The MVP is complete when all of the following are true:
+
+- [ ] project builds on stable Rust;
+- [ ] single executable starts from CLI configuration;
+- [ ] connects to PostgreSQL in logical replication mode;
+- [ ] consumes an existing `pgoutput` replication slot;
+- [ ] decodes `BEGIN`, `COMMIT`, `RELATION`, `INSERT`, `UPDATE`, and `DELETE`;
+- [ ] maintains a relation/schema cache;
+- [ ] reconstructs transaction boundaries;
+- [ ] emits normalized JSON CDC events;
+- [ ] supports stdout output;
+- [ ] supports JSONL file output;
+- [ ] does not emit rolled-back transactions;
+- [ ] acknowledges WAL only after successful sink processing;
+- [ ] reconnects after temporary PostgreSQL/network failures;
+- [ ] exits non-zero when the replication slot is missing or unusable;
+- [ ] restart test demonstrates no silent loss of committed changes;
+- [ ] sink-failure test demonstrates that WAL is not acknowledged prematurely;
+- [ ] integration tests run against a real PostgreSQL instance;
+- [ ] repository contains a Docker Compose demo and README.
+
+---
+
+## 21. Explicit MVP correctness contract
+
+The MVP does **not** promise exactly-once delivery.
+
+It should promise:
+
+> For transactions observed through the configured PostgreSQL logical replication slot, pgcdc will not intentionally advance PostgreSQL's acknowledged WAL position beyond data that the configured sink has reported as successfully written.
+
+Therefore, after crashes or reconnects:
+
+```text
+duplicates: acceptable
+silent loss: unacceptable
+```
+
+This invariant should drive implementation decisions throughout the project.
+
+---
+
+## 22. Possible post-MVP roadmap
+
+Do not implement these until the MVP correctness tests pass.
+
+### Phase 2 — PostgreSQL completeness
+
+- initial snapshot;
+- snapshot → streaming handoff;
+- TOAST handling;
+- `REPLICA IDENTITY` variants;
+- tables without primary keys;
+- richer PostgreSQL type mapping;
+- large/streaming transactions;
+- TRUNCATE;
+- schema evolution tests;
+- publication discovery.
+
+### Phase 3 — operational maturity
+
+- Prometheus endpoint;
+- health/readiness endpoints;
+- replication lag metrics;
+- configurable retry policy;
+- graceful shutdown;
+- persistent checkpoint metadata;
+- backpressure and bounded transaction memory;
+- dead-letter/error policy where safe.
+
+### Phase 4 — sinks
+
+```text
+Kafka
+Parquet
+S3-compatible object storage
+Iceberg
+```
+
+A particularly interesting target architecture is:
+
+```text
+PostgreSQL
+    ↓
+pgoutput
+    ↓
+pgcdc (Rust)
+    ↓
+Iceberg
+```
+
+but the Iceberg sink should remain outside the MVP until the replication and acknowledgement semantics are proven correct.
