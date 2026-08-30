@@ -4,12 +4,15 @@ use std::time::Duration;
 
 use pgcdc::config::{Config, DatabaseUrl, OutputKind};
 use pgcdc::error::PgcdcError;
+use pgcdc::lsn::Lsn;
 use pgcdc::sink::{Durability, Sink};
 use pgcdc::transaction::Transaction;
 use tokio::sync::mpsc;
 
-/// Копит транзакции в канал, чтобы тест мог их дождаться.
-struct ChannelSink(mpsc::UnboundedSender<Transaction>);
+/// Копит транзакции в канал, чтобы тест мог их дождаться. Наибольшая
+/// принятая позиция с прошлого барьера хранится отдельно: возврат
+/// `write_transaction` не означает durable (это и есть смысл Task 2).
+struct ChannelSink(mpsc::UnboundedSender<Transaction>, Option<Lsn>);
 
 #[async_trait::async_trait]
 impl Sink for ChannelSink {
@@ -18,7 +21,11 @@ impl Sink for ChannelSink {
     }
     async fn write_transaction(&mut self, tx: &Transaction) -> Result<(), PgcdcError> {
         self.0.send(tx.clone()).expect("send");
+        self.1 = Some(tx.end_lsn);
         Ok(())
+    }
+    async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError> {
+        Ok(self.1.take())
     }
 }
 
@@ -31,6 +38,11 @@ impl Sink for FailingSink {
         Durability::Fsync
     }
     async fn write_transaction(&mut self, _tx: &Transaction) -> Result<(), PgcdcError> {
+        Err(PgcdcError::Sink("deliberate test failure".into()))
+    }
+    async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError> {
+        // Барьер сюда никогда не доходит: write_transaction всегда падает первым.
+        // Честная реализация — тоже падать, а не молча заявлять durable.
         Err(PgcdcError::Sink("deliberate test failure".into()))
     }
 }
@@ -55,7 +67,7 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send))).await
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
     });
 
     client
@@ -135,7 +147,7 @@ async fn postgres_does_not_send_rolled_back_transactions() {
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send))).await
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
     });
 
     client
@@ -339,7 +351,7 @@ async fn changing_a_key_column_produces_a_key_only_before_image() {
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send))).await
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
     });
 
     client
@@ -393,7 +405,7 @@ async fn schema_change_resends_relation_and_the_cache_takes_the_new_one() {
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send))).await
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
     });
 
     client

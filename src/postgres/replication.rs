@@ -96,24 +96,31 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
             let changes = tx.changes.len();
             let end_lsn = tx.end_lsn;
 
-            // Порядок нерушим: сначала sink, потом durable, только потом ack.
+            // Порядок нерушим: сначала sink, потом барьер, потом durable, только потом ack.
             sink.write_transaction(&tx).await?;
-            tracker.note_durable(end_lsn);
-            tracker.try_ack(end_lsn)?;
+            tracker.note_processed(end_lsn);
 
-            // Подтверждаем end_lsn, НЕ commit_lsn: commit_lsn указывает на
-            // начало записи коммита, и рестарт перечитал бы ту же транзакцию.
-            stream.shared_lsn_feedback.update_flushed_lsn(end_lsn.0);
-            stream.shared_lsn_feedback.update_applied_lsn(end_lsn.0);
+            // Отметить durable имеет право только успешный барьер, а не приём записи.
+            // Барьер вызывается на каждой транзакции — группировка по таймеру
+            // появится в задаче 4.
+            if let Some(durable) = sink.flush().await? {
+                tracker.note_durable(durable);
+                tracker.try_ack(durable)?;
 
-            // Обязательство Q25(в): без явного вызова подтверждение уходит
-            // с задержкой 18–22 с по внутреннему расписанию крейта.
-            stream
-                .send_feedback()
-                .await
-                .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
+                // Подтверждаем durable, НЕ commit_lsn: commit_lsn указывает на
+                // начало записи коммита, и рестарт перечитал бы ту же транзакцию.
+                stream.shared_lsn_feedback.update_flushed_lsn(durable.0);
+                stream.shared_lsn_feedback.update_applied_lsn(durable.0);
 
-            debug!(xid = tx.xid, changes, lsn = %end_lsn, "transaction_committed");
+                // Обязательство Q25(в): без явного вызова подтверждение уходит
+                // с задержкой 18–22 с по внутреннему расписанию крейта.
+                stream
+                    .send_feedback()
+                    .await
+                    .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
+
+                debug!(xid = tx.xid, changes, lsn = %durable, "transaction_committed");
+            }
         }
     }
 }

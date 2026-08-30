@@ -2,16 +2,20 @@ use std::io::Write;
 
 use super::{Durability, Sink};
 use crate::error::PgcdcError;
+use crate::lsn::Lsn;
 use crate::transaction::Transaction;
 
 /// JSONL на stdout: одна строка на изменение. Только для разработки —
 /// durability у трубы нет, и это объявлено честно.
 #[derive(Debug, Default)]
-pub struct StdoutSink;
+pub struct StdoutSink {
+    /// Наибольшая принятая позиция с прошлого барьера.
+    pending: Option<Lsn>,
+}
 
 impl StdoutSink {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -25,11 +29,16 @@ impl Sink for StdoutSink {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         write_changes(&mut out, tx)?;
-        // Один flush на транзакцию: атомарность записи — свойство транзакции,
-        // а не отдельной строки.
+        self.pending = Some(tx.end_lsn);
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError> {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
         out.flush()
             .map_err(|e| PgcdcError::Sink(format!("flush: {e}")))?;
-        Ok(())
+        Ok(self.pending.take())
     }
 }
 

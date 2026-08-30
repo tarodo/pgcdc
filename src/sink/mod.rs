@@ -3,15 +3,16 @@ pub mod stdout;
 pub use stdout::StdoutSink;
 
 use crate::error::PgcdcError;
+use crate::lsn::Lsn;
 use crate::transaction::Transaction;
 
-/// Что sink может обещать про запись. Kafka с `acks=all` встанет сюда же
-/// как `Fsync`, а труба честно останется `BestEffort`.
+/// Что sink обещает про запись ПОСЛЕ успешного `flush`.
+/// К возврату `write_transaction` это отношения не имеет.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
-    /// Данные доведены до диска: подтверждать LSN безопасно.
+    /// После `flush` данные доведены до диска: подтверждать позицию безопасно.
     Fsync,
-    /// Байты отданы ядру, но их судьба неизвестна. Для разработки.
+    /// После `flush` байты отданы ядру, но их судьба неизвестна. Для разработки.
     BestEffort,
 }
 
@@ -19,9 +20,16 @@ pub enum Durability {
 pub trait Sink: Send {
     fn durability(&self) -> Durability;
 
-    /// Получает транзакцию целиком и обязан либо записать её всю,
-    /// либо вернуть ошибку. Частичная запись — это ошибка.
+    /// Принять транзакцию целиком. Возврат `Ok` означает «принято», а НЕ «durable»:
+    /// между приёмом и барьером существует окно, и подтверждать позицию внутри него
+    /// запрещено инвариантом 1.
     async fn write_transaction(&mut self, tx: &Transaction) -> Result<(), PgcdcError>;
+
+    /// Довести до носителя всё, что было принято с прошлого барьера.
+    /// Возвращает наибольшую позицию, ставшую durable, либо `None`, если
+    /// принимать было нечего. Только после `Ok(Some(lsn))` вызывающий имеет
+    /// право отметить `lsn` как durable.
+    async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError>;
 }
 
 #[cfg(test)]
@@ -59,6 +67,8 @@ mod tests {
     /// а не поведение терминала.
     struct BufferSink {
         lines: Vec<String>,
+        /// Наибольшая принятая позиция с прошлого барьера.
+        pending: Option<Lsn>,
     }
 
     #[async_trait::async_trait]
@@ -70,7 +80,11 @@ mod tests {
             for ch in &tx.changes {
                 self.lines.push(serde_json::to_string(ch).unwrap());
             }
+            self.pending = Some(tx.end_lsn);
             Ok(())
+        }
+        async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError> {
+            Ok(self.pending.take())
         }
     }
 
@@ -98,7 +112,10 @@ mod tests {
             commit_timestamp: pg_micros_to_utc(841_423_351_314_489),
         });
 
-        let mut s = BufferSink { lines: Vec::new() };
+        let mut s = BufferSink {
+            lines: Vec::new(),
+            pending: None,
+        };
         s.write_transaction(&two_changes).await.unwrap();
         assert_eq!(
             s.lines.len(),
@@ -119,5 +136,70 @@ mod tests {
         // Труба не даёт durability в принципе, и делать вид иначе — хуже,
         // чем признать это (DECISIONS Q6).
         assert_eq!(StdoutSink::new().durability(), Durability::BestEffort);
+    }
+
+    /// Считает вызовы и запоминает, что было принято, но ещё не доведено.
+    struct CountingSink {
+        accepted: Vec<Lsn>,
+        flushed: Vec<Lsn>,
+        flush_calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for CountingSink {
+        fn durability(&self) -> Durability {
+            Durability::Fsync
+        }
+        async fn write_transaction(&mut self, tx: &Transaction) -> Result<(), PgcdcError> {
+            self.accepted.push(tx.end_lsn);
+            Ok(())
+        }
+        async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError> {
+            self.flush_calls += 1;
+            let last = self.accepted.last().copied();
+            self.flushed.append(&mut self.accepted);
+            Ok(last)
+        }
+    }
+
+    #[tokio::test]
+    async fn accepting_a_transaction_does_not_make_it_durable() {
+        // Это и есть смысл разделения: между приёмом и барьером существует окно,
+        // и подтверждать позицию внутри него нельзя.
+        let mut s = CountingSink {
+            accepted: vec![],
+            flushed: vec![],
+            flush_calls: 0,
+        };
+        s.write_transaction(&tx()).await.unwrap();
+        assert!(
+            s.flushed.is_empty(),
+            "запись сама по себе ничего не доводит"
+        );
+        assert_eq!(s.flush_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn flush_reports_the_highest_position_it_made_durable() {
+        let mut s = CountingSink {
+            accepted: vec![],
+            flushed: vec![],
+            flush_calls: 0,
+        };
+        s.write_transaction(&tx()).await.unwrap();
+        let durable = s.flush().await.unwrap();
+        assert_eq!(durable, Some(Lsn(0x1030)), "барьер отчитывается позицией");
+        assert_eq!(s.flushed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn flush_with_nothing_accepted_reports_no_new_position() {
+        // Важно для цикла: пустой тик не должен двигать durable.
+        let mut s = CountingSink {
+            accepted: vec![],
+            flushed: vec![],
+            flush_calls: 0,
+        };
+        assert_eq!(s.flush().await.unwrap(), None);
     }
 }
