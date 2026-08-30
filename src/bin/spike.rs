@@ -35,12 +35,40 @@ async fn main() -> Result<()> {
 
     let cancel = CancellationToken::new();
     let mut seq = 0usize;
+    let ack_mode = std::env::var("ACK_MODE").unwrap_or_else(|_| "none".to_string());
+    let force_feedback = std::env::var("FORCE_FEEDBACK").is_ok();
+    eprintln!("ack mode: {ack_mode}, force_feedback: {force_feedback}");
 
     loop {
         let raw = stream.next_raw_event(&cancel).await?;
         seq += 1;
         dump(seq, &raw);
-        // Подтверждение LSN намеренно НЕ отправляется, см. Task 3.
+
+        // Task 3, проба 2: подтверждаем LSN ТОЛЬКО по нашему решению — на COMMIT.
+        // Переключатель ACK_MODE (env) выбирает метод, чтобы выяснить, какой
+        // именно двигает confirmed_flush_lsn:
+        //   none    — не подтверждать (проба 1);
+        //   applied — update_applied_lsn (вариант из брифа);
+        //   flushed — update_flushed_lsn (flush-позиция, по ней Postgres чистит WAL).
+        if raw.data.first() == Some(&b'C') {
+            match ack_mode.as_str() {
+                "applied" => {
+                    stream.shared_lsn_feedback.update_applied_lsn(raw.wal_end.value());
+                    eprintln!("    -> acked(applied) {:?}", raw.wal_end);
+                }
+                "flushed" => {
+                    stream.shared_lsn_feedback.update_flushed_lsn(raw.wal_end.value());
+                    eprintln!("    -> acked(flushed) {:?}", raw.wal_end);
+                }
+                _ => {}
+            }
+            // Task 3, проба 2c: send_feedback() публичный — проверяем, можно ли
+            // доставить подтверждение немедленно, не дожидаясь keepalive'а.
+            if force_feedback {
+                stream.send_feedback().await?;
+                eprintln!("    -> send_feedback() forced");
+            }
+        }
     }
 }
 

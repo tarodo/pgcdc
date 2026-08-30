@@ -162,8 +162,244 @@ pub enum StreamingMode {
 
 ## 2. Контролируемость транспорта
 
-<заполняется в Task 3>
+Все четыре пробы прогнаны на живом PostgreSQL 16 (docker compose, `wal_sender_timeout = 1min`),
+слот `pgcdc_slot`, публикация `pgcdc_pub`, `proto_version = 1`, `StreamingMode::Off`.
+
+### 2.0 Что именно шлёт `send_feedback()` — разбор исходника
+
+Это главный вопрос задачи: когда крейт отправляет фидбек сам, КАКОЙ LSN он туда кладёт.
+
+```rust
+// src/stream.rs:1193
+pub async fn send_feedback(&mut self) -> Result<()> {
+    if self.state.last_received_lsn == 0 { return Ok(()); }
+    let (f, a) = self.shared_lsn_feedback.get_feedback_lsn();
+    let flushed_lsn = if f > 0 { f.min(self.state.last_received_lsn) } else { 0 };
+    let applied_lsn = if a > 0 { a.min(self.state.last_received_lsn) } else { 0 };
+    ...
+    self.connection.send_standby_status_update(
+        self.state.last_received_lsn,  // write_lsn  <- НЕ наш, позиция последнего ПРИНЯТОГО байта
+        flushed_lsn,                   // flush_lsn   <- только то, что положили мы
+        applied_lsn,                   // replay_lsn  <- только то, что положили мы
+        false,
+    ).await?;
+```
+
+Ответ: **вариант (a) для тех полей, которые решают судьбу слота, и вариант (b) для одного
+поля, которое ничего не решает.**
+
+- `flush_lsn` и `replay_lsn` берутся **исключительно** из `shared_lsn_feedback`, то есть из
+  того, что положил туда наш код. Если мы не звали `update_flushed_lsn`/`update_applied_lsn`,
+  туда уходит `0` (`InvalidXLogRecPtr`).
+- `write_lsn` — это `state.last_received_lsn`, то есть позиция последнего **принятого** WAL,
+  и она уходит на сервер всегда, помимо нашей воли. `last_received_lsn` обновляется в
+  `parse_xlogdata_header` (src/stream.rs:1056), общем для типизированного и сырого пути, и
+  в `process_keepalive_message`.
+
+Почему утечка `write_lsn` не ломает инвариант: PostgreSQL продвигает логический слот по
+**flush**-позиции standby status update (`ProcessStandbyReplyMessage` →
+`LogicalConfirmReceivedLocation(flushPtr)`), а не по write. Проверено эмпирически в пробе 1
+(write рос, flush был NULL, `confirmed_flush_lsn` стоял) и в пробе 2b (выставили только
+flush, `replay_lsn` остался NULL, слот при этом сдвинулся ровно на flush).
+
+Два места, где крейт зовёт `send_feedback()` сам:
+
+1. `next_wal_frame` → `maybe_send_feedback()` каждые `FEEDBACK_CHECK_EVENT_INTERVAL = 128`
+   итераций цикла (src/stream.rs:73, 669). Но `maybe_send_feedback` дополнительно
+   проверяет `should_send_feedback(feedback_interval)` (прошло ли 10 с) **и**
+   `lsn_has_changed(flushed, applied)`. Если мы ничего не подтверждали, значения `(0, 0)`
+   совпадают с уже записанными `last_sent_*`, `lsn_has_changed` возвращает `false`, и
+   отправки не происходит вообще.
+2. `process_keepalive_message` (src/stream.rs:1126) вызывает `send_feedback()` **напрямую**,
+   в обход всех проверок, если сервер прислал keepalive с `reply_requested = true`. Сервер
+   делает это каждые `wal_sender_timeout / 2` ≈ 30 с. Этот путь срабатывает всегда,
+   независимо от нашего кода.
+
+### 2.1 Проба 1 — слот без нашего подтверждения
+
+Порог в 128 сообщений был **реально достигнут**, а не «не сработал»: 200 отдельных
+`INSERT`-стейтментов (каждый — своя транзакция) плюс backlog от Task 2 дали **604**
+сообщения в одном прогоне, то есть счётчик пересёк 128 четыре раза (128, 256, 384, 512).
+Дополнительно был выдержан простой ~90 с, за который сервер трижды прислал keepalive с
+`reply_requested`, и крейт трижды отправил standby status update по своей инициативе.
+
+Факт отправки подтверждён серверной стороной, а не логами крейта:
+
+```
+до INSERT'ов:  pg_stat_replication: write=NULL       flush=NULL replay=NULL reply_time=NULL
+после 604 сообщений (4× порог 128):
+               pg_stat_replication: write=NULL       flush=NULL replay=NULL reply_time=NULL
+через ~30 с простоя (keepalive #1):
+               pg_stat_replication: write=0/197DD60  flush=NULL replay=NULL reply_time=16:12:38
+через ~60 с (keepalive #2):
+               pg_stat_replication: write=0/197DD98  flush=NULL replay=NULL reply_time=16:13:09
+через ~90 с (keepalive #3):
+               pg_stat_replication: write=0/1980C60  flush=NULL replay=NULL reply_time=16:14:09
+```
+
+Обратите внимание: путь «каждые 128 сообщений» ничего не отправил (write остался NULL после
+604 сообщений) — сработала защита `lsn_has_changed`. Отправлял только путь keepalive.
+
+```
+confirmed_flush_lsn до:     0/192FF10   (restart_lsn 0/192FED8)
+confirmed_flush_lsn после:  0/192FF10   (restart_lsn 0/192FED8)   — НЕ ИЗМЕНИЛСЯ
+pg_current_wal_lsn:         0/197DD60 → 0/1980C60 (WAL заведомо ушёл вперёд)
+```
+
+**Вывод:** крейт отправляет standby status update по своему расписанию, но в полях, по
+которым PostgreSQL двигает логический слот, уходит ровно то, что положили мы. Инвариант
+`acked <= durable` достижим.
+
+### 2.2 Проба 2 — подтверждение по нашей команде
+
+Подтверждение вставлено в цикл spike'а на `COMMIT` (первый байт payload'а `b'C'`),
+`raw.wal_end`. Метод выбирается переменной окружения `ACK_MODE`, чтобы ответить на вопрос
+брифа «какой именно метод сдвинул слот».
+
+| прогон | метод | acks | confirmed_flush до | confirmed_flush после | задержка | pg_stat_replication после |
+|---|---|---|---|---|---|---|
+| 2a | `update_applied_lsn` | 201 | `0/192FF10` | `0/197DD60` | ~18 с | write=`0/198ABC0` flush=`0/197DD60` replay=`0/197DD60` |
+| 2b | `update_flushed_lsn` | 60 | `0/197DD60` | `0/19B0A50` | ~22 с | write=`0/19B0A88` flush=`0/19B0A50` replay=NULL |
+| 2c | `update_applied_lsn` + явный `send_feedback()` | 10 | `0/19B0A50` | `0/19B1208` | мгновенно | write=flush=replay=`0/19B1208` |
+
+В каждом прогоне итоговый `confirmed_flush_lsn` совпал бит-в-бит с последним подтверждённым
+нами `wal_end`: 2a — `Lsn(26729824)` = `0/197DD60`; 2b — `Lsn(26937936)` = `0/19B0A50`;
+2c — `Lsn(26939912)` = `0/19B1208`.
+
+**Двигают слот оба метода.** `update_flushed_lsn` — минимально достаточный: в 2b
+`replay_lsn` остался NULL, а слот всё равно уехал ровно на flush-позицию. Это прямое
+подтверждение классической ловушки из брифа: PostgreSQL освобождает WAL по **flush**, а не
+по apply. `update_applied_lsn` тоже работает, потому что внутри он через
+`flushed_lsn.fetch_max(lsn)` тянет flush за собой (src/lsn.rs) — «applied данные неявно
+flushed».
+
+**Отдельная находка, важная для этапа 1: подтверждение доставляется НЕ вовремя.**
+Замеренная задержка 18–22 с — это не наш `feedback_interval = 10s`, а такт keepalive'ов
+сервера. Причина в устройстве `next_wal_frame`: `maybe_send_feedback()` вызывается только
+внутри цикла чтения кадров, то есть **только когда приходит новый кадр WAL**. Таймера у
+крейта нет. На простаивающем потоке наше подтверждение может пролежать неотправленным до
+`wal_sender_timeout / 2`. Обходной путь есть и проверен (2c): `send_feedback()` —
+публичный метод (`pub async fn send_feedback(&mut self) -> Result<()>`, src/stream.rs:1193),
+вызов его вручную после durable-записи доставляет подтверждение немедленно.
+
+### 2.3 Проба 3 — видимость разрыва соединения
+
+`docker compose restart postgres` при работающем spike'е:
+
+```
+replication started, waiting for events (Ctrl-C to stop)
+ack mode: none, force_feedback: false
+Error: Transient connection error: connection closed by server
+SPIKE EXITED WITH CODE: 1
+```
+
+`next_raw_event` вернул `Err`, ошибка ушла наверх через `?`, процесс завершился с кодом 1.
+Тихого переподключения нет. Это соответствует комментарию в исходнике над сырым путём:
+*«There is no auto-ack and no retry/recovery on this path (that is the point — you own
+restart semantics)»*.
+
+`RetryConfig` (src/retry.rs:36) отключать **не требуется** — на сыром пути он не
+используется вовсе. Для протокола его поля: `max_attempts: u32` (default 5),
+`initial_delay` (1s), `max_delay` (60s), `multiplier: f64` (2.0), `max_duration` (300s),
+`jitter: bool` (true). Поля `enabled` нет; выключение — `max_attempts: 0`.
+
+**Но:** авто-восстановление в крейте есть, просто на других путях. `check_connection_health()`
+(src/stream.rs:833) и `next_event_with_retry()` (src/stream.rs:957) зовут
+`recover_connection()` (src/stream.rs:834+), который переподключается по `RetryConfig`,
+**вызывает `ensure_replication_slot()`** и перезапускает репликацию с
+`state.last_received_lsn`. Ни один из этих методов использовать нельзя — они одновременно
+скрывают разрыв (не сбросим relation cache, DECISIONS Q19) и могут пересоздать слот.
+То же относится к `into_stream()` / `stream()` / `for_each_event()`.
+
+### 2.4 Проба 4 — поведение при отсутствующем слоте — ПРОВАЛ
+
+Спека §14 требует падать с ненулевым кодом и не создавать слот. Крейт делает ровно
+наоборот.
+
+```
+слот удалён:                    SELECT pg_drop_replication_slot('pgcdc_slot');  -> 0 rows in pg_replication_slots
+сгенерирован WAL:               INSERT ... (4000,'lost',...)   [pg_current_wal_lsn 0/19B12F0 -> 0/19B4938]
+запущен spike:                  "replication started, waiting for events"  — НЕ упал, код возврата не получен
+слот в pg_replication_slots:    pgcdc_slot | pgoutput | logical | active=t | temporary=f
+                                restart_lsn=0/19B4970  confirmed_flush_lsn=0/19B49A8
+строка id=4000 в потоке:        НЕ ПРИШЛА (0 сообщений в логе)
+строка id=4001, вставленная позже: пришла (4 сообщения B/R/I/C)
+```
+
+Слот пересоздан на **текущей** позиции WAL, транзакция между удалением слота и стартом
+процесса потеряна молча. Это ровно тот сценарий тихой потери данных, который запрещает
+DECISIONS Q19.
+
+Причина найдена в исходнике: spike **не вызывает** `ensure_replication_slot()`, но её
+вызывает `start()`:
+
+```rust
+// src/stream.rs:619
+pub async fn start(&mut self, start_lsn: Option<XLogRecPtr>) -> Result<()> {
+    self.initialize().await?;      // <--
+    ...
+}
+// src/stream.rs:483
+async fn initialize(&mut self) -> Result<()> {
+    let _system_id = self.connection.identify_system()?;
+    self.ensure_replication_slot().await?;   // <-- безусловно, отключить нечем
+    Ok(())
+}
+```
+
+Опции отключения нет: среди `with_*` билдеров `ReplicationStreamConfig` (`with_messages`,
+`with_binary`, `with_two_phase`, `with_origin`, `with_streaming_mode`, `with_slot_options`,
+`with_slot_type`, `with_protocol_version`, `with_feedback_interval`,
+`with_connection_timeout`, `with_health_check_interval`, `with_retry_config`,
+`with_stop_at_lsn`) и среди полей `ReplicationSlotOptions` (`temporary`, `two_phase`,
+`reserve_wal`, `snapshot`, `failover`) нет ничего вида `create_if_missing` / `auto_create` /
+`slot_must_exist` — grep по всему крейту не находит таких имён. Публичного метода, который
+выдаёт `START_REPLICATION` без `initialize()`, тоже нет.
+
+Дополнительно: `slot_options.snapshot` по умолчанию `Some("nothing")`, то есть слот
+создаётся без экспорта снапшота — начальное состояние таблиц не читается, и потеря WAL не
+компенсируется ничем.
 
 ## 3. Вердикт
 
-<заполняется в Task 3>
+**ГОДЕН С ОГОВОРКАМИ.**
+
+Центральный инвариант проекта — «не подтверждать LSN, пока вывод не записан durable» —
+**достижим**: крейт не двигает `confirmed_flush_lsn` сам (проба 1, порог 128 достигнут
+реально, keepalive-путь реально сработал), двигает его ровно на то значение, которое мы
+подтвердили (проба 2), и делает разрыв соединения видимым на сыром пути (проба 3).
+Проба 4 показала реальный дефект — молчаливое пересоздание слота с потерей данных, — но он
+лечится десятью строками нашего кода, а не сменой транспорта.
+
+### Обязательные обходные пути для этапа 1
+
+1. **Guard перед каждым `start()`.** На отдельном обычном (не replication) соединении
+   проверять `SELECT 1 FROM pg_replication_slots WHERE slot_name = $1` и, если слота нет,
+   завершаться с ненулевым кодом и внятной ошибкой — до вызова `start()`. Без этого
+   `start()` → `initialize()` → `ensure_replication_slot()` создаст слот заново и тихо
+   потеряет WAL. Guard нужен и при каждом нашем переподключении, не только на холодном
+   старте. Остаточное окно TOCTOU (слот удалён между проверкой и `START_REPLICATION`)
+   считаем пренебрежимым; дополнительно можно после старта сверить
+   `confirmed_flush_lsn` слота с нашей сохранённой durable-позицией и падать при расхождении.
+2. **Запрещённые API.** Не использовать `next_event_with_retry()`, `check_connection_health()`,
+   `into_stream()`, `stream()`, `for_each_event()` — все они ведут в `recover_connection()`,
+   который переподключается за нашей спиной и зовёт `ensure_replication_slot()`. Разрешён
+   только `next_raw_event()`; реконнект пишем сами, со сбросом relation cache.
+3. **Подтверждать явно и своевременно.** После durable-записи вызывать
+   `shared_lsn_feedback.update_flushed_lsn(lsn)` (минимально достаточно; `update_applied_lsn`
+   тоже годится и заодно выставляет replay) и **сразу после этого** — публичный
+   `stream.send_feedback().await`. Не полагаться на внутреннее расписание крейта: замерено
+   18–22 с задержки, а на простаивающем потоке подтверждение может не уйти вообще, пока не
+   придёт keepalive.
+4. **Знать про утечку `write_lsn`.** В каждом standby status update крейт шлёт
+   `state.last_received_lsn` в поле write, независимо от нас. На `confirmed_flush_lsn` это не
+   влияет (проверено), но `pg_stat_replication.write_lsn` будет завышать наш реальный
+   прогресс — не использовать его для мониторинга лага, смотреть на `flush_lsn` и
+   `confirmed_flush_lsn`. И слот не должен попадать в `synchronous_standby_names`, иначе
+   утёкший write_lsn начнёт освобождать ждущие `synchronous_commit`.
+
+### Что дальше
+
+Вердикт не блокирующий: Task 4 (фикстуры) можно начинать. Пункты 1–3 выше — вход в
+планирование этапа 1; альтернативные транспорты из DECISIONS Q2 (`pgwire-replication`, форк
+rust-postgres, свой транспорт) не требуются.
