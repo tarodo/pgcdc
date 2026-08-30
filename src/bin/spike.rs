@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use pg_walstream::{
-    CancellationToken, LogicalReplicationStream, RawXLogData, ReplicationStreamConfig,
-    RetryConfig, StreamingMode,
+    CancellationToken, LogicalReplicationStream, RawXLogData, ReplicationStreamConfig, RetryConfig,
+    StreamingMode,
 };
 
 const CONN: &str = "postgresql://postgres:postgres@localhost:5432/app?replication=database";
@@ -58,11 +58,15 @@ async fn main() -> Result<()> {
         if raw.data.first() == Some(&b'C') {
             match ack_mode.as_str() {
                 "applied" => {
-                    stream.shared_lsn_feedback.update_applied_lsn(raw.wal_end.value());
+                    stream
+                        .shared_lsn_feedback
+                        .update_applied_lsn(raw.wal_end.value());
                     eprintln!("    -> acked(applied) {:?}", raw.wal_end);
                 }
                 "flushed" => {
-                    stream.shared_lsn_feedback.update_flushed_lsn(raw.wal_end.value());
+                    stream
+                        .shared_lsn_feedback
+                        .update_flushed_lsn(raw.wal_end.value());
                     eprintln!("    -> acked(flushed) {:?}", raw.wal_end);
                 }
                 _ => {}
@@ -94,7 +98,13 @@ fn dump(seq: usize, raw: &RawXLogData) {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
         let ascii: String = chunk
             .iter()
-            .map(|b| if b.is_ascii_graphic() { *b as char } else { '.' })
+            .map(|b| {
+                if b.is_ascii_graphic() {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         eprintln!("{:04x}  {:<47}  |{ascii}|", i * 16, hex.join(" "));
     }
