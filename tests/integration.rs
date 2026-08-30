@@ -47,6 +47,26 @@ impl Sink for FailingSink {
     }
 }
 
+/// Принимает запись успешно, но барьер у него всегда падает. Существует
+/// отдельно от `FailingSink`, потому что тот падает внутри `write_transaction`
+/// и никогда не доходит до кода, который отмечает durable, — так что он не
+/// охраняет разделение «запись прошла» / «барьер прошёл», ради которого
+/// затевалась задача 2 (review Task 2, round 1, F2).
+struct FlushFailsSink;
+
+#[async_trait::async_trait]
+impl Sink for FlushFailsSink {
+    fn durability(&self) -> Durability {
+        Durability::Fsync
+    }
+    async fn write_transaction(&mut self, _tx: &Transaction) -> Result<(), PgcdcError> {
+        Ok(())
+    }
+    async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError> {
+        Err(PgcdcError::Sink("deliberate barrier failure".into()))
+    }
+}
+
 fn config(conn: &str) -> Config {
     Config {
         database_url: DatabaseUrl::new(conn.to_string()),
@@ -226,6 +246,63 @@ async fn sink_failure_stops_us_before_the_slot_advances() {
     assert_eq!(
         before, after,
         "слот не должен был сдвинуться: sink ничего не записал"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn barrier_failure_stops_us_before_the_slot_advances() {
+    // Дополняет sink_failure_stops_us_before_the_slot_advances: та проверяет
+    // отказ ВНУТРИ write_transaction, этот — отказ барьера ПОСЛЕ успешной
+    // записи. Без этого теста ветка кода, которую добавила задача 2 (durable
+    // отмечается только по возврату flush, а не write_transaction), ничем не
+    // защищена: FailingSink никогда её не достигает (review Task 2, round 1, F2).
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let before: String = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'pgcdc_slot'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    let cfg = config(&conn);
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(FlushFailsSink)).await
+    });
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        .await
+        .expect("run должен завершиться, а не висеть")
+        .expect("join");
+    let err = result.unwrap_err();
+    assert!(matches!(err, PgcdcError::Sink(_)), "получили {err:?}");
+    assert!(
+        err.is_fatal(),
+        "барьер, который не может подтвердить, — фатальная ошибка"
+    );
+
+    let after: String = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'pgcdc_slot'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    assert_eq!(
+        before, after,
+        "слот не должен был сдвинуться: барьер не довёл запись до диска"
     );
 }
 
