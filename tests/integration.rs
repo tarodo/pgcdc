@@ -324,3 +324,104 @@ async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
         "слот не создан — иначе мы маскировали бы потерю данных"
     );
 }
+
+#[tokio::test]
+async fn changing_a_key_column_produces_a_key_only_before_image() {
+    // Единственная форма UPDATE, которой нет в замороженном захвате: тег 'K'.
+    // Юнит-тест проверяет её синтетическими байтами, то есть нашим пониманием
+    // разметки; здесь её выдаёт настоящий PostgreSQL.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::setup_items_table(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let cfg = config(&conn);
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send))).await
+    });
+
+    client
+        .execute("INSERT INTO items VALUES (10, 'Widget', 5)", &[])
+        .await
+        .unwrap();
+    client
+        .execute("UPDATE items SET id = 11 WHERE id = 10", &[])
+        .await
+        .unwrap();
+
+    // Первая транзакция — INSERT, вторая — интересующий нас UPDATE.
+    let _insert_tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("insert должен приехать")
+        .expect("канал закрыт");
+    let update_tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("update должен приехать")
+        .expect("канал закрыт");
+
+    let ev = &update_tx.changes[0];
+    let json = serde_json::to_value(ev).unwrap();
+    assert_eq!(json["operation"], "update");
+    assert_eq!(
+        json["before_kind"], "key",
+        "ключ менялся — сервер шлёт тег 'K'"
+    );
+    assert_eq!(json["before"]["id"], "10", "старое значение ключа");
+    assert!(
+        json["before"].get("title").is_none(),
+        "неключевые колонки сервер не прислал, и в before их быть не должно: {json}"
+    );
+    assert_eq!(json["after"]["id"], "11");
+    assert_eq!(json["after"]["title"], "Widget");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn schema_change_resends_relation_and_the_cache_takes_the_new_one() {
+    // pgoutput пересылает RELATION при инвалидации записи — например после DDL.
+    // Захват этапа 0 такого случая не содержит, а замена записи в кэше
+    // от этого поведения прямо зависит.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::setup_items_table(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let cfg = config(&conn);
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send))).await
+    });
+
+    client
+        .execute("INSERT INTO items VALUES (1, 'before ddl', 1)", &[])
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("первый insert")
+        .expect("канал закрыт");
+    assert_eq!(first.changes[0].after.as_ref().unwrap().len(), 3);
+
+    client
+        .batch_execute("ALTER TABLE items ADD COLUMN note TEXT")
+        .await
+        .unwrap();
+    client
+        .execute("INSERT INTO items VALUES (2, 'after ddl', 2, 'hello')", &[])
+        .await
+        .unwrap();
+
+    let second = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("второй insert")
+        .expect("канал закрыт");
+    let after = second.changes[0].after.as_ref().unwrap();
+    assert_eq!(after.len(), 4, "кэш обязан был принять новую схему");
+    assert_eq!(after.get("note").unwrap(), "hello");
+
+    handle.abort();
+}

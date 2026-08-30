@@ -5,9 +5,12 @@
 
 ## Что уже работает
 
-Этап 1 — сквозной срез: `BEGIN`, `RELATION`, `INSERT`, `COMMIT` → JSON на stdout,
-подтверждение LSN только после успешной записи в sink. `UPDATE` и `DELETE` пока
-возвращают явную ошибку, а не игнорируются молча.
+Этап 2 — полный декодер: декодируются `BEGIN`, `COMMIT`, `RELATION`, `INSERT`, `UPDATE`,
+`DELETE` → JSON на stdout, подтверждение LSN только после успешной записи в sink. В
+событии есть `before` с различением «полная строка» (`before_kind: "full"`, REPLICA
+IDENTITY FULL) и «только ключ» (`before_kind: "key"`, изменился первичный ключ при
+DEFAULT-идентичности); несланные TOAST-значения называются в `unchanged_columns` и в
+`after` не появляются.
 
 ## Демо
 

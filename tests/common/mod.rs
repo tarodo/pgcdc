@@ -60,6 +60,18 @@ pub async fn setup_schema(client: &tokio_postgres::Client) {
         .expect("setup schema");
 }
 
+/// Таблица с REPLICA IDENTITY DEFAULT — нужна, чтобы получить тег 'K'.
+/// У `users` идентичность FULL, и она даёт только 'O'.
+pub async fn setup_items_table(client: &tokio_postgres::Client) {
+    client
+        .batch_execute(
+            "CREATE TABLE public.items (id BIGINT PRIMARY KEY, title TEXT, qty INT);
+             ALTER PUBLICATION pgcdc_pub ADD TABLE public.items;",
+        )
+        .await
+        .expect("setup items");
+}
+
 pub async fn create_slot(client: &tokio_postgres::Client, slot: &str) {
     client
         .query(
