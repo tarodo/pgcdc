@@ -52,8 +52,11 @@ impl Assembler {
         }
     }
 
-    /// Пуст ли буфер. От этого зависит правило keepalive (DECISIONS Q18):
-    /// подтверждать позицию из keepalive можно ТОЛЬКО при пустом буфере.
+    /// Пуст ли буфер. Пустота — часть условия из Q18, по которому keepalive
+    /// разрешено двигать слот, но НЕ единственная часть сама по себе: она
+    /// достаточна только пока запись, mark-durable и ack идут одним синхронным
+    /// шагом. Групповой ACK по таймеру это допущение ломает — см. DECISIONS.md
+    /// Q26(a): для этапа 3 условие — пустой буфер И processed == durable.
     pub fn is_empty(&self) -> bool {
         self.open.is_none()
     }
@@ -136,7 +139,8 @@ impl Assembler {
                     .ok_or(PgcdcError::UnknownRelation { relation_id })?;
                 let (before, before_kind) = match &old {
                     Some((OldTupleKind::Full, tuple)) => {
-                        let (row, _) = build_full_row(rel, tuple)?;
+                        let (row, unchanged) = build_full_row(rel, tuple)?;
+                        reject_unchanged_toast_in_full_old_tuple(&unchanged)?;
                         (Some(row), Some(BeforeKind::Full))
                     }
                     Some((OldTupleKind::Key, tuple)) => {
@@ -175,7 +179,8 @@ impl Assembler {
                     .ok_or(PgcdcError::UnknownRelation { relation_id })?;
                 let (before, before_kind) = match old_kind {
                     OldTupleKind::Full => {
-                        let (row, _) = build_full_row(rel, &old)?;
+                        let (row, unchanged) = build_full_row(rel, &old)?;
+                        reject_unchanged_toast_in_full_old_tuple(&unchanged)?;
                         (Some(row), Some(BeforeKind::Full))
                     }
                     OldTupleKind::Key => (Some(build_key_row(rel, &old)?), Some(BeforeKind::Key)),
@@ -276,6 +281,24 @@ fn check_arity(rel: &Relation, tuple: &TupleData) -> Result<(), PgcdcError> {
             tuple.columns.len(),
             rel.id,
             rel.columns.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Полный старый кортеж (тег `'O'`, UPDATE или DELETE) не должен нести маркер
+/// unchanged-TOAST. На PostgreSQL 16 это недостижимо: сервер разворачивает
+/// внешние (TOASTed) атрибуты в старую строку целиком до того, как её увидит
+/// плагин — это же и есть причина, по которой заморозенный `'u'`-захват
+/// (`tests/fixtures/0025_update.bin`) несёт полные 9600 байт именно в старом
+/// кортеже, а однобайтовый маркер — только в новом. Но недостижимость на
+/// сегодняшнем сервере — это допущение о его поведении, а не гарантия;
+/// молча терять колонку без списка, если оно всё же нарушится, — ровно тот
+/// вариант, который отвергнут в Q15. Поэтому проверяем как инвариант.
+fn reject_unchanged_toast_in_full_old_tuple(unchanged: &[String]) -> Result<(), PgcdcError> {
+    if !unchanged.is_empty() {
+        return Err(PgcdcError::Decode(format!(
+            "unexpected unchanged-TOAST markers in a full old tuple: {unchanged:?}"
         )));
     }
     Ok(())
@@ -556,7 +579,7 @@ mod tests {
 
     #[test]
     fn column_count_mismatch_is_a_decode_error() {
-        // build_row must reject a tuple whose column count disagrees with
+        // check_arity must reject a tuple whose column count disagrees with
         // the relation. Without that guard, zip would silently truncate to the
         // shorter side, producing quietly wrong rows instead of an error.
         let mut cache = RelationCache::new();
@@ -651,6 +674,11 @@ mod tests {
             "несланное TOAST-значение не попадает в after"
         );
         assert_eq!(ev.unchanged_columns, vec!["bio".to_string()]);
+        assert_eq!(
+            ev.lsn,
+            Lsn(0x200),
+            "C2: lsn — позиция самой строки (wal_start), а не Lsn(0)"
+        );
     }
 
     #[test]
@@ -830,8 +858,9 @@ mod tests {
     fn delete_with_full_old_tuple_keeps_real_nulls() {
         // F2: collapsing this arm to build_key_row + BeforeKind::Key would
         // both mislabel before_kind and silently drop a genuinely-NULL
-        // column (0009_delete.bin carries bio = NULL as a real 'n' under
-        // an 'O' tag, and that null is meaningful).
+        // column: this test's old tuple carries title = NULL as a real 'n'
+        // under an 'O' tag on the three-column items relation, and that
+        // null is meaningful.
         let mut cache = RelationCache::new();
         let mut a = Assembler::new(1000);
         a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
@@ -934,5 +963,148 @@ mod tests {
             matches!(&err, PgcdcError::Decode(msg) if msg.contains("title")),
             "получили {err:?}"
         );
+    }
+
+    #[test]
+    fn update_full_old_tuple_rejects_unchanged_toast_marker() {
+        // C1: this arm used to do `let (row, _) = build_full_row(...)`, throwing
+        // away the unchanged-TOAST list. Unreachable on PostgreSQL 16 — the server
+        // flattens external attributes into the old-tuple WAL image before the
+        // plugin sees it — but that is an assumption about server behaviour, not
+        // a guarantee, so it must be an enforced invariant, not silent trust.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1000);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(items_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        let err = a
+            .handle(
+                PgOutputMessage::Update {
+                    relation_id: 16392,
+                    old: Some((
+                        OldTupleKind::Full,
+                        TupleData {
+                            columns: vec![
+                                ColumnValue::Text("10".into()),
+                                ColumnValue::UnchangedToast,
+                                ColumnValue::Text("7".into()),
+                            ],
+                        },
+                    )),
+                    new: TupleData {
+                        columns: vec![
+                            ColumnValue::Text("10".into()),
+                            ColumnValue::Text("Widget".into()),
+                            ColumnValue::Text("8".into()),
+                        ],
+                    },
+                },
+                Lsn(0x200),
+                &mut cache,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, PgcdcError::Decode(msg) if msg.contains("title")),
+            "получили {err:?}"
+        );
+    }
+
+    #[test]
+    fn delete_full_old_tuple_rejects_unchanged_toast_marker() {
+        // C1: same guard, DELETE's Full arm. Before the fix it silently dropped
+        // the unchanged-TOAST list the same way the UPDATE arm did.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1000);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(items_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        let err = a
+            .handle(
+                PgOutputMessage::Delete {
+                    relation_id: 16392,
+                    old_kind: OldTupleKind::Full,
+                    old: TupleData {
+                        columns: vec![
+                            ColumnValue::Text("10".into()),
+                            ColumnValue::UnchangedToast,
+                            ColumnValue::Text("7".into()),
+                        ],
+                    },
+                },
+                Lsn(0x200),
+                &mut cache,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, PgcdcError::Decode(msg) if msg.contains("title")),
+            "получили {err:?}"
+        );
+    }
+
+    #[test]
+    fn update_respects_the_max_events_limit() {
+        // C2: the max_events guard is duplicated per match arm. A test that only
+        // ever sends INSERT (transaction_larger_than_the_limit_fails_loudly)
+        // exercises none of the copy living in the Update arm — deleting that
+        // copy would leave the whole suite green without this test.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(items_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        let update_msg = || PgOutputMessage::Update {
+            relation_id: 16392,
+            old: None,
+            new: TupleData {
+                columns: vec![
+                    ColumnValue::Text("10".into()),
+                    ColumnValue::Text("Widget".into()),
+                    ColumnValue::Text("7".into()),
+                ],
+            },
+        };
+        a.handle(update_msg(), Lsn(0x200), &mut cache).unwrap();
+        let err = a.handle(update_msg(), Lsn(0x210), &mut cache).unwrap_err();
+        assert!(matches!(err, PgcdcError::TransactionTooLarge { limit: 1 }));
+    }
+
+    #[test]
+    fn delete_respects_the_max_events_limit() {
+        // C2: same guard, DELETE arm's own copy.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(items_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        let delete_msg = || PgOutputMessage::Delete {
+            relation_id: 16392,
+            old_kind: OldTupleKind::Key,
+            old: TupleData {
+                columns: vec![
+                    ColumnValue::Text("10".into()),
+                    ColumnValue::Null,
+                    ColumnValue::Null,
+                ],
+            },
+        };
+        a.handle(delete_msg(), Lsn(0x200), &mut cache).unwrap();
+        let err = a.handle(delete_msg(), Lsn(0x210), &mut cache).unwrap_err();
+        assert!(matches!(err, PgcdcError::TransactionTooLarge { limit: 1 }));
     }
 }

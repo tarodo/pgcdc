@@ -3,7 +3,7 @@
 Ручной разбор `tests/fixtures/*.bin` (Task 5 этапа 0) против
 [PostgreSQL 16, Logical Replication Message Formats](https://www.postgresql.org/docs/16/protocol-logicalrep-message-formats.html).
 
-Этот документ — **спецификация**, по которой этап 2 пишет тесты декодера **до** реализации.
+Этот документ — **спецификация**, по которой этап 2 писал тесты декодера **до** реализации.
 Всё, что здесь написано, подтверждено байтами из фикстур, кроме явно помеченного
 «из документации, не подтверждено» и раздела «Не разобрано» в конце.
 
@@ -827,11 +827,18 @@ TupleData
 
 **Что уже закрыто, что осталось.** Декодер (`src/postgres/pgoutput.rs`) на этапе 1
 приземлился и закрывает пункты 1–4, 6, 9–13 этого чек-листа для `BEGIN` / `RELATION` /
-`INSERT` / `COMMIT`. Открытыми для этапа 2 остаются пункты 5, 7, 8 — все они про то,
-чего в этапе 1 нет: `UPDATE`, `DELETE`, before-image (`before_kind`) и превращение
-маркера unchanged-TOAST (`'u'`) в `unchanged_columns`. Формулировки ниже в этом
-разделе («этап 2 пишет тесты декодера») были написаны до этапа 1 и всё ещё точны
-для этих трёх пунктов — но не значат, что декодера не существует вовсе.
+`INSERT` / `COMMIT`. Пункты 5, 7, 8 были открытыми для этапа 2 — все они про то,
+чего в этапе 1 не было: `UPDATE`, `DELETE`, before-image (`before_kind`) и превращение
+маркера unchanged-TOAST (`'u'`) в `unchanged_columns`. Этап 2 закрыл все три:
+
+- **Пункт 5** (тег кортежа в UPDATE опционален, в DELETE обязателен) — закрыт
+  `src/postgres/pgoutput.rs::decodes_update_without_an_old_tuple` (опциональность
+  на UPDATE) и `src/postgres/pgoutput.rs::delete_without_a_tuple_tag_is_an_error`
+  (обязательность на DELETE).
+- **Пункт 7** (`'n'` под `'K'` значит «не прислано», под `'O'`/`'N'` значит NULL) —
+  закрыт `src/transaction.rs::key_tuple_omits_columns_the_server_did_not_send`.
+- **Пункт 8** (`'u'` → колонка в `unchanged_columns`, ключа в `after` нет) —
+  закрыт `src/transaction.rs::full_tuple_keeps_real_nulls_and_reports_unchanged_toast`.
 
 ---
 

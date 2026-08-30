@@ -21,7 +21,14 @@ impl DatabaseUrl {
     }
 
     fn redacted(&self) -> String {
-        // Ищем `://user:password@` и заменяем пароль звёздочками.
+        // Ищем `://user:password@` и заменяем пароль звёздочками. Пароль
+        // может также приехать параметром запроса (`?password=...`) — это
+        // не выдумка, драйверы принимают обе формы, — поэтому вторым
+        // проходом чистим и его (C3 разбора всей ветки).
+        redact_query_password(&self.redact_credentials())
+    }
+
+    fn redact_credentials(&self) -> String {
         let Some(scheme_end) = self.0.find("://") else {
             return self.0.clone();
         };
@@ -52,6 +59,32 @@ impl DatabaseUrl {
             Err(PgcdcError::InvalidDatabaseUrl)
         }
     }
+}
+
+/// Заменяет значение параметра запроса `password` на звёздочки, если он есть.
+/// Работает поверх уже обработанной (или необработанной, если `@` не нашлось)
+/// строки — `redacted()` — единственный вызывающий, отдельная функция просто
+/// потому, что тут своя, не связанная с учётными данными в URL-authority логика.
+fn redact_query_password(url: &str) -> String {
+    let Some(q) = url.find('?') else {
+        return url.to_string();
+    };
+    let (before, query) = url.split_at(q);
+    let mut changed = false;
+    let redacted_pairs: Vec<String> = query[1..]
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if key == "password" => {
+                changed = true;
+                format!("{key}=****")
+            }
+            _ => pair.to_string(),
+        })
+        .collect();
+    if !changed {
+        return url.to_string();
+    }
+    format!("{before}?{}", redacted_pairs.join("&"))
 }
 
 impl fmt::Display for DatabaseUrl {
@@ -168,6 +201,18 @@ mod tests {
         );
         assert!(format!("{url}").contains("db.example"));
         assert_eq!(url.expose(), "postgres://cdc:hunter2@db.example:5432/app");
+
+        // C3: пароль может приехать и параметром запроса, а не в credentials
+        // segment. `validate()` смотрит только на схему и такой URL пропустит —
+        // редактирование обязано отдельно закрыть эту форму.
+        let query_form = DatabaseUrl::new("postgres://cdc@db.example/app?password=hunter2".into());
+        assert!(!format!("{query_form:?}").contains("hunter2"));
+        assert!(!format!("{query_form}").contains("hunter2"));
+        assert!(
+            format!("{query_form}").contains("password=****"),
+            "параметр остаётся в форме, но без значения: {query_form}"
+        );
+        assert!(format!("{query_form}").contains("cdc@db.example"));
     }
 
     #[test]

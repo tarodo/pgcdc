@@ -28,10 +28,23 @@ pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
         .await
         .expect("start postgres");
 
-    let port = container
-        .get_host_port_ipv4(5432.tcp())
-        .await
-        .expect("port");
+    // C4: wait-strategy проверяет, что Postgres принимает соединения, а не что
+    // проброс порта Docker уже отвечает на запрос — это отдельная гонка, которая
+    // ловилась примерно раз в десять прогонов. Ограниченный ретрай без sleep
+    // в цикле ожидания: tokio::time::sleep — не блокирующий поток sleep.
+    let port = {
+        let mut attempt = 0;
+        loop {
+            match container.get_host_port_ipv4(5432.tcp()).await {
+                Ok(port) => break port,
+                Err(_) if attempt < 20 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(err) => panic!("port after {attempt} retries: {err}"),
+            }
+        }
+    };
     let conn = format!("postgres://postgres:postgres@127.0.0.1:{port}/app");
     (container, conn)
 }
