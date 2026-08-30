@@ -359,4 +359,34 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(a.is_empty(), "RELATION не открывает транзакцию");
     }
+
+    #[test]
+    fn column_count_mismatch_is_a_decode_error() {
+        // build_row must reject a tuple whose column count disagrees with
+        // the relation. Without that guard, zip would silently truncate to the
+        // shorter side, producing quietly wrong rows instead of an error.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1000);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(users_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        // users_relation has 2 columns, but we feed only 1
+        let mismatched_insert = PgOutputMessage::Insert {
+            relation_id: 16385,
+            tuple: TupleData {
+                columns: vec![ColumnValue::Text("1".into())],
+            },
+        };
+        let err = a
+            .handle(mismatched_insert, Lsn(0x200), &mut cache)
+            .unwrap_err();
+        // Verify the error carries both counts so the message stays diagnostic
+        assert!(
+            matches!(err, PgcdcError::Decode(msg) if msg.contains("1 columns") && msg.contains("2"))
+        );
+    }
 }
