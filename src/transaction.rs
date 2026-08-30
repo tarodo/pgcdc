@@ -104,6 +104,12 @@ impl Assembler {
                 open.changes.push(pending);
                 Ok(None)
             }
+            // Декодер эти сообщения уже понимает, сборщик — ещё нет (задача 3).
+            // Явная ошибка, а не молчаливый пропуск: потерять row-сообщение хуже,
+            // чем упасть.
+            PgOutputMessage::Update { .. } | PgOutputMessage::Delete { .. } => Err(
+                PgcdcError::Decode("update/delete assembly not implemented yet".into()),
+            ),
             PgOutputMessage::Commit {
                 commit_lsn,
                 end_lsn,
@@ -376,6 +382,26 @@ mod tests {
             .is_none());
         assert_eq!(cache.len(), 1);
         assert!(a.is_empty(), "RELATION не открывает транзакцию");
+    }
+
+    #[test]
+    fn update_is_decoded_but_not_yet_assembled() {
+        // Временный тест: задача 3 заменяет ветку и удаляет его.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1000);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        let err = a
+            .handle(
+                PgOutputMessage::Update {
+                    relation_id: 16385,
+                    old: None,
+                    new: TupleData { columns: vec![] },
+                },
+                Lsn(0x200),
+                &mut cache,
+            )
+            .unwrap_err();
+        assert!(matches!(err, PgcdcError::Decode(_)));
     }
 
     #[test]

@@ -95,6 +95,16 @@ pub struct TupleData {
     pub columns: Vec<ColumnValue>,
 }
 
+/// Что именно сервер прислал в старом кортеже. Различие несущее: при `Key`
+/// неключевые колонки приходят с тегом `'n'`, и это «не прислано», а не NULL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OldTupleKind {
+    /// Тег `'K'` — только колонки replica identity.
+    Key,
+    /// Тег `'O'` — полная старая строка (REPLICA IDENTITY FULL).
+    Full,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PgOutputMessage {
     Begin {
@@ -112,6 +122,16 @@ pub enum PgOutputMessage {
     Insert {
         relation_id: u32,
         tuple: TupleData,
+    },
+    Update {
+        relation_id: u32,
+        old: Option<(OldTupleKind, TupleData)>,
+        new: TupleData,
+    },
+    Delete {
+        relation_id: u32,
+        old_kind: OldTupleKind,
+        old: TupleData,
     },
 }
 
@@ -168,6 +188,53 @@ pub fn decode(payload: &[u8]) -> Result<PgOutputMessage, PgcdcError> {
             PgOutputMessage::Insert {
                 relation_id,
                 tuple: read_tuple(&mut r)?,
+            }
+        }
+        'U' => {
+            let relation_id = r.u32()?;
+            // Байт в позиции 5 решает всё: 'O'/'K' — дальше старый кортеж,
+            // 'N' — старого нет и это уже новый. Третьего не дано.
+            let tag = r.u8()?;
+            let (old, new_tag) = match tag {
+                b'O' => (Some((OldTupleKind::Full, read_tuple(&mut r)?)), r.u8()?),
+                b'K' => (Some((OldTupleKind::Key, read_tuple(&mut r)?)), r.u8()?),
+                b'N' => (None, b'N'),
+                other => {
+                    return Err(PgcdcError::Decode(format!(
+                        "UPDATE expects tuple tag 'O', 'K' or 'N', got {:?}",
+                        other as char
+                    )))
+                }
+            };
+            if new_tag != b'N' {
+                return Err(PgcdcError::Decode(format!(
+                    "UPDATE expects new tuple tag 'N', got {:?}",
+                    new_tag as char
+                )));
+            }
+            PgOutputMessage::Update {
+                relation_id,
+                old,
+                new: read_tuple(&mut r)?,
+            }
+        }
+        'D' => {
+            let relation_id = r.u32()?;
+            // В отличие от UPDATE тег обязателен: «ничего» не бывает.
+            let old_kind = match r.u8()? {
+                b'K' => OldTupleKind::Key,
+                b'O' => OldTupleKind::Full,
+                other => {
+                    return Err(PgcdcError::Decode(format!(
+                        "DELETE expects tuple tag 'K' or 'O', got {:?}",
+                        other as char
+                    )))
+                }
+            };
+            PgOutputMessage::Delete {
+                relation_id,
+                old_kind,
+                old: read_tuple(&mut r)?,
             }
         }
         other => return Err(PgcdcError::UnsupportedMessage { kind: other }),
@@ -372,20 +439,156 @@ mod tests {
         assert_eq!(tuple.columns.len(), 4);
     }
 
-    const UPDATE: &[u8] = include_bytes!("../../tests/fixtures/0006_update.bin");
-    const DELETE: &[u8] = include_bytes!("../../tests/fixtures/0009_delete.bin");
+    #[test]
+    fn other_message_kinds_are_still_explicitly_unsupported() {
+        // TRUNCATE, TYPE, ORIGIN и всё неизвестное по-прежнему обязаны давать
+        // явную ошибку, а не молчаливый пропуск (спека §8).
+        for kind in [b'T', b'Y', b'O', b'M', b'S'] {
+            let payload = [kind, 0x00, 0x00, 0x00, 0x00];
+            assert!(
+                matches!(decode(&payload), Err(PgcdcError::UnsupportedMessage { .. })),
+                "тип {:?} должен быть явно неподдержан",
+                kind as char
+            );
+        }
+    }
+
+    const DELETE_FULL: &[u8] = include_bytes!("../../tests/fixtures/0009_delete.bin");
+    const DELETE_KEY: &[u8] = include_bytes!("../../tests/fixtures/0019_delete.bin");
 
     #[test]
-    fn update_and_delete_are_explicitly_unsupported_in_this_stage() {
-        // Этап 1 их не обрабатывает — но обязан сказать об этом явно, а не пропустить.
-        assert!(matches!(
-            decode(UPDATE),
-            Err(PgcdcError::UnsupportedMessage { kind: 'U' })
-        ));
-        assert!(matches!(
-            decode(DELETE),
-            Err(PgcdcError::UnsupportedMessage { kind: 'D' })
-        ));
+    fn decodes_delete_with_full_old_tuple() {
+        let PgOutputMessage::Delete {
+            relation_id,
+            old_kind,
+            old,
+        } = decode(DELETE_FULL).unwrap()
+        else {
+            panic!("ожидался Delete")
+        };
+        assert_eq!(relation_id, 16385);
+        assert_eq!(old_kind, OldTupleKind::Full);
+        assert_eq!(old.columns.len(), 4);
+        assert_eq!(old.columns[1], ColumnValue::Text("Bob".into()));
+    }
+
+    #[test]
+    fn decodes_delete_with_key_only_tuple_carrying_a_slot_per_column() {
+        // ncols = 3, не 1: в 'K'-кортеже запись на КАЖДУЮ колонку таблицы,
+        // просто неключевые заполнены 'n'.
+        let PgOutputMessage::Delete { old_kind, old, .. } = decode(DELETE_KEY).unwrap() else {
+            panic!("ожидался Delete")
+        };
+        assert_eq!(old_kind, OldTupleKind::Key);
+        assert_eq!(old.columns.len(), 3);
+        assert_eq!(old.columns[0], ColumnValue::Text("10".into()));
+        assert_eq!(old.columns[1], ColumnValue::Null);
+        assert_eq!(old.columns[2], ColumnValue::Null);
+    }
+
+    #[test]
+    fn delete_without_a_tuple_tag_is_an_error() {
+        // У DELETE тег обязателен: удалённую строку надо чем-то идентифицировать.
+        let bad = [0x44u8, 0x00, 0x00, 0x40, 0x08, 0x4E, 0x00, 0x00];
+        assert!(matches!(decode(&bad), Err(PgcdcError::Decode(_))));
+    }
+
+    const UPDATE_FULL: &[u8] = include_bytes!("../../tests/fixtures/0006_update.bin");
+    const UPDATE_NO_OLD: &[u8] = include_bytes!("../../tests/fixtures/0016_update.bin");
+    const UPDATE_TOAST: &[u8] = include_bytes!("../../tests/fixtures/0025_update.bin");
+
+    /// UPDATE с тегом 'K' — DEFAULT-идентичность и изменившийся ключ.
+    /// В захвате этой формы нет (docs/pgoutput-notes.md §14 п.3), поэтому байты
+    /// собраны вручную по разметке §10 и §7: 'U', OID 16392 (items),
+    /// 'K', старый кортеж {id:"10", n, n}, 'N', новый кортеж {"11","Widget","7"}.
+    /// В tests/fixtures/ такие байты класть нельзя — там только реальные захваты.
+    const SYNTHETIC_UPDATE_KEY: &[u8] = &[
+        0x55, 0x00, 0x00, 0x40, 0x08, // 'U', OID 16392
+        0x4B, 0x00, 0x03, // 'K', ncols=3
+        0x74, 0x00, 0x00, 0x00, 0x02, 0x31, 0x30, // t(2)="10"
+        0x6E, 0x6E, // 'n', 'n' — заглушки неключевых колонок
+        0x4E, 0x00, 0x03, // 'N', ncols=3
+        0x74, 0x00, 0x00, 0x00, 0x02, 0x31, 0x31, // t(2)="11"
+        0x74, 0x00, 0x00, 0x00, 0x06, 0x57, 0x69, 0x64, 0x67, 0x65, 0x74, // t(6)="Widget"
+        0x74, 0x00, 0x00, 0x00, 0x01, 0x37, // t(1)="7"
+    ];
+
+    #[test]
+    fn decodes_update_with_full_old_tuple() {
+        let PgOutputMessage::Update {
+            relation_id,
+            old,
+            new,
+        } = decode(UPDATE_FULL).unwrap()
+        else {
+            panic!("ожидался Update")
+        };
+        assert_eq!(relation_id, 16385);
+        let (kind, old_tuple) = old.expect("при REPLICA IDENTITY FULL старый кортеж есть");
+        assert_eq!(kind, OldTupleKind::Full);
+        assert_eq!(old_tuple.columns[1], ColumnValue::Text("Alice".into()));
+        assert_eq!(new.columns[1], ColumnValue::Text("Bob".into()));
+    }
+
+    #[test]
+    fn decodes_update_without_an_old_tuple() {
+        // Offset 5 — 'N', а не 'O'/'K'. Один байт отличает «есть before» от «нет before»;
+        // отличать по длине сообщения или по счёту тегов нельзя.
+        assert_eq!(UPDATE_NO_OLD[5], b'N');
+        let PgOutputMessage::Update {
+            relation_id,
+            old,
+            new,
+        } = decode(UPDATE_NO_OLD).unwrap()
+        else {
+            panic!("ожидался Update")
+        };
+        assert_eq!(relation_id, 16392);
+        assert!(
+            old.is_none(),
+            "ключ не менялся — старой версии строки нет вовсе"
+        );
+        assert_eq!(
+            new.columns,
+            vec![
+                ColumnValue::Text("10".into()),
+                ColumnValue::Text("Widget".into()),
+                ColumnValue::Text("7".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_update_with_key_only_old_tuple() {
+        let PgOutputMessage::Update { old, new, .. } = decode(SYNTHETIC_UPDATE_KEY).unwrap() else {
+            panic!("ожидался Update")
+        };
+        let (kind, old_tuple) = old.expect("тег 'K' даёт старый кортеж");
+        assert_eq!(kind, OldTupleKind::Key);
+        assert_eq!(
+            old_tuple.columns.len(),
+            3,
+            "в 'K'-кортеже запись на каждую колонку"
+        );
+        assert_eq!(old_tuple.columns[0], ColumnValue::Text("10".into()));
+        assert_eq!(old_tuple.columns[1], ColumnValue::Null, "заглушка, не NULL");
+        assert_eq!(new.columns[0], ColumnValue::Text("11".into()));
+    }
+
+    #[test]
+    fn decodes_update_with_unchanged_toast_marker() {
+        // Асимметрия: старый кортеж несёт bio целиком (9600 байт), новый — один байт 'u'.
+        let PgOutputMessage::Update { old, new, .. } = decode(UPDATE_TOAST).unwrap() else {
+            panic!("ожидался Update")
+        };
+        let (kind, old_tuple) = old.expect("FULL");
+        assert_eq!(kind, OldTupleKind::Full);
+        let ColumnValue::Text(old_bio) = &old_tuple.columns[3] else {
+            panic!("старый bio обязан приехать текстом")
+        };
+        assert_eq!(old_bio.len(), 9600);
+        assert_eq!(new.columns[3], ColumnValue::UnchangedToast);
+        assert_eq!(new.columns[1], ColumnValue::Text("Caroline".into()));
     }
 
     #[test]
