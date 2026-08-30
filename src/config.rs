@@ -52,11 +52,27 @@ impl fmt::Debug for DatabaseUrl {
     }
 }
 
+/// libpq принимает `key=value`-строки (`host=... user=... password=...`), но ни
+/// `redacted()` выше, ни `replication_url` в `postgres/replication.rs` не умеют
+/// с ними работать: первая не находит `://` и возвращает пароль как есть, вторая
+/// приклеивает `?replication=database` к строке без `?`/`&`-грамматики. Принять
+/// такую форму и потом не суметь её ни спрятать, ни расширить — хуже, чем
+/// отказать сразу, поэтому здесь отвергается всё, что не выглядит как URL.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "database URL must be a URL, e.g. postgres://user:password@host:5432/dbname \
+     (libpq `key=value` connection strings are not supported)"
+)]
+pub struct InvalidDatabaseUrl;
+
 /// clap требует именно `FromStr`: одного `From<String>` для `#[arg]` недостаточно,
 /// и без этой реализации derive не соберётся.
 impl std::str::FromStr for DatabaseUrl {
-    type Err = std::convert::Infallible;
+    type Err = InvalidDatabaseUrl;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.contains("://") {
+            return Err(InvalidDatabaseUrl);
+        }
         Ok(Self::new(s.to_owned()))
     }
 }
@@ -116,6 +132,36 @@ mod tests {
     fn url_without_a_password_is_unchanged() {
         let url = DatabaseUrl::new("postgres://cdc@db.example:5432/app".into());
         assert!(format!("{url}").contains("cdc@db.example"));
+    }
+
+    #[test]
+    fn libpq_key_value_form_is_rejected() {
+        // Живой прогон ревьюера: этот вид строки проходит preflight guard
+        // (tokio-postgres его понимает) и утекает через Debug/Display, а
+        // replication_url ломает его наложением `?replication=database`.
+        // Отказ на этапе парсинга должен наступить раньше, чем что-либо из
+        // этого случится.
+        use std::str::FromStr;
+        let err = DatabaseUrl::from_str(
+            "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=app",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("URL"),
+            "сообщение должно направить к форме URL"
+        );
+        assert!(
+            !msg.contains("host=127.0.0.1"),
+            "сообщение об ошибке не должно эхом повторять введённую строку"
+        );
+    }
+
+    #[test]
+    fn url_form_is_accepted() {
+        use std::str::FromStr;
+        let url = DatabaseUrl::from_str("postgres://cdc:hunter2@db.example:5432/app").unwrap();
+        assert_eq!(url.expose(), "postgres://cdc:hunter2@db.example:5432/app");
     }
 
     #[test]

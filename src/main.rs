@@ -9,7 +9,12 @@ use tracing::error;
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            // pg_walstream логирует на INFO создание/наличие слота — при default
+            // фильтре это в нашем же stderr читалось бы как противоречие заявленной
+            // гарантии "мы никогда не создаём слоты". Глушим его INFO, оставляя
+            // WARN/ERROR из библиотеки видимыми.
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,pg_walstream=warn".into()),
         )
         .with_writer(std::io::stderr)
         .init();

@@ -123,7 +123,7 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
 }
 
 #[tokio::test]
-async fn nothing_is_emitted_for_a_rolled_back_transaction() {
+async fn postgres_does_not_send_rolled_back_transactions() {
     // Проверяет НАШЕ понимание протокола, а не наш код: logical decoding
     // физически не отдаёт откаченные транзакции. Если тест покраснеет,
     // значит мир устроен не так, как мы думаем.
@@ -214,6 +214,58 @@ async fn sink_failure_stops_us_before_the_slot_advances() {
     assert_eq!(
         before, after,
         "слот не должен был сдвинуться: sink ничего не записал"
+    );
+}
+
+#[tokio::test]
+async fn stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error() {
+    // I2: "JSONL на stdout, логи на stderr" — поведенчески верно, но ничего не
+    // упало бы при регрессии. `--help` для этого не годится: он не проходит ни
+    // одной ветки, которая логирует. Отсутствующий слот — детерминированный и
+    // быстрый способ гарантированно попасть в ветку логирования: guard падает
+    // до первого события репликации, без ожидания INSERT и без гонок по времени.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    // Слот намеренно не создаём.
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"));
+    cmd.env("PGCDC_DATABASE_URL", &conn)
+        .env("PGCDC_PUBLICATION", "pgcdc_pub")
+        .env("PGCDC_SLOT", "pgcdc_slot")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || cmd.output()),
+    )
+    .await
+    .expect("бинарь должен завершиться за 20 секунд")
+    .expect("spawn_blocking join")
+    .expect("запуск pgcdc");
+
+    assert!(
+        !output.status.success(),
+        "отсутствующий слот обязан быть фатальным для реального бинаря"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout должен быть валидным UTF-8");
+    assert!(
+        stdout.is_empty(),
+        "stdout обязан остаться пустым при фатальной ошибке старта, получили: {stdout:?}"
+    );
+    // Пустых строк тут не будет, но это ассерт-на-будущее: если когда-нибудь в
+    // stdout протечёт нежурнальный текст, он не пройдёт как JSON и тест покраснеет.
+    for line in stdout.lines() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|e| panic!("строка stdout не является JSON: {line:?}: {e}"));
+    }
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr должен быть валидным UTF-8");
+    assert!(
+        stderr.contains("slot") || stderr.contains("слот"),
+        "stderr должен сообщить об отсутствующем слоте, получили: {stderr}"
     );
 }
 

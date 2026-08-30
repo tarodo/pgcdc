@@ -78,6 +78,18 @@ impl Assembler {
                 Ok(None)
             }
             PgOutputMessage::Insert { relation_id, tuple } => {
+                // Порядок проверок значим (M12 разбора всей ветки): без открытой
+                // транзакции ошибка обязана называться так, а не «неизвестное
+                // отношение», даже если relation тоже не в кэше. Лимит — следующая
+                // по дешевизне проверка, до похода в кэш и построения строки.
+                let open = self.open.as_mut().ok_or_else(|| {
+                    PgcdcError::Decode("row message outside a transaction".into())
+                })?;
+                if open.changes.len() >= self.max_events {
+                    return Err(PgcdcError::TransactionTooLarge {
+                        limit: self.max_events,
+                    });
+                }
                 let rel = cache
                     .get(relation_id)
                     .ok_or(PgcdcError::UnknownRelation { relation_id })?;
@@ -89,14 +101,6 @@ impl Assembler {
                     after,
                     lsn: wal_start,
                 };
-                let open = self.open.as_mut().ok_or_else(|| {
-                    PgcdcError::Decode("row message outside a transaction".into())
-                })?;
-                if open.changes.len() >= self.max_events {
-                    return Err(PgcdcError::TransactionTooLarge {
-                        limit: self.max_events,
-                    });
-                }
                 open.changes.push(pending);
                 Ok(None)
             }
@@ -296,6 +300,20 @@ mod tests {
         assert!(
             after.get("name").unwrap().is_null(),
             "SQL NULL становится JSON null"
+        );
+    }
+
+    #[test]
+    fn row_outside_a_transaction_wins_over_unknown_relation() {
+        // Без BEGIN ошибка обязана быть "row message outside a transaction",
+        // а не UnknownRelation, даже если relation тоже не в кэше (M12: порядок
+        // проверок в ветке Insert — open, затем лимит, затем поиск relation).
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1000);
+        let err = a.handle(insert(), Lsn(0x200), &mut cache).unwrap_err();
+        assert!(
+            matches!(&err, PgcdcError::Decode(msg) if msg.contains("outside a transaction")),
+            "получили {err:?}"
         );
     }
 

@@ -33,6 +33,11 @@ INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', NULL);
 {"schema":"public","table":"users","operation":"insert","before":null,"before_kind":null,"after":{"id":"1","name":"Alice","email":"alice@example.com","bio":null},"unchanged_columns":[],"transaction_id":737,"lsn":"0/192FFC0","commit_lsn":"0/19300D0","commit_timestamp":"2026-08-30T16:42:31.314489Z"}
 ```
 
+Значения `transaction_id`, `lsn`, `commit_lsn` и `commit_timestamp` здесь — из
+захваченной фикстуры; у вас на реальном прогоне они будут другими. Демо использует
+фиксированный первичный ключ (`id = 1`), поэтому повторный запуск нужно предварять
+`docker compose down -v` — иначе `INSERT` упадёт на дубликате ключа.
+
 Логи идут в stderr, полезная нагрузка — в stdout, поэтому вывод можно безопасно
 направлять в конвейер.
 
@@ -40,6 +45,12 @@ INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', NULL);
 
 Дубликаты после сбоя допустимы; тихая потеря — нет. Позиция WAL не подтверждается
 PostgreSQL раньше, чем sink отчитался об успешной записи.
+
+Не судите о прогрессе процесса по `pg_stat_replication.write_lsn`: библиотека
+транспорта пересылает в нём позицию «получено по сети», которая обгоняет то, что
+реально доведено до диска — ориентируйтесь на `confirmed_flush_lsn` слота. По той
+же причине не добавляйте этот слот в `synchronous_standby_names`: утёкший вперёд
+`write_lsn` начал бы освобождать ожидающие `synchronous_commit` раньше времени.
 
 ## Документация
 

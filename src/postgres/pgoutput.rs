@@ -191,7 +191,7 @@ fn read_tuple(r: &mut Reader<'_>) -> Result<TupleData, PgcdcError> {
         let value = match tag {
             b'n' => ColumnValue::Null,
             b'u' => ColumnValue::UnchangedToast,
-            b't' | b'b' => {
+            b't' => {
                 let len = r.i32()?;
                 if len < 0 {
                     return Err(PgcdcError::Decode(format!(
@@ -202,6 +202,13 @@ fn read_tuple(r: &mut Reader<'_>) -> Result<TupleData, PgcdcError> {
                 let text = std::str::from_utf8(bytes)
                     .map_err(|e| PgcdcError::Decode(format!("invalid utf8 in column {i}: {e}")))?;
                 ColumnValue::Text(text.to_owned())
+            }
+            // Раскладка 'b' (Int32 длина + данные) взята из документации и байтами не
+            // подтверждена (docs/pgoutput-notes.md §14.2): опция `binary` нигде не
+            // включалась, ни одной фикстуры с этим тегом нет. Декодировать её как текст
+            // было бы непроверенным кодом; типизированная ошибка честнее.
+            b'b' => {
+                return Err(PgcdcError::Decode("binary format not supported".into()));
             }
             other => {
                 return Err(PgcdcError::Decode(format!(
@@ -397,5 +404,21 @@ mod tests {
     #[test]
     fn empty_payload_is_an_error() {
         assert!(matches!(decode(&[]), Err(PgcdcError::Decode(_))));
+    }
+
+    #[test]
+    fn binary_tagged_column_is_a_typed_decode_error() {
+        // Тег 'b' не встречается ни в одной фикстуре (опция binary не запрашивалась),
+        // поэтому байты здесь синтетические. decode обязан вернуть типизированную
+        // ошибку, а не молча прочитать значение как текст (docs/pgoutput-notes.md §14.2).
+        let mut payload = vec![b'I'];
+        payload.extend_from_slice(&1u32.to_be_bytes()); // relation_id
+        payload.push(b'N'); // тег кортежа INSERT
+        payload.extend_from_slice(&1i16.to_be_bytes()); // ncols
+        payload.push(b'b'); // decode должен упасть здесь, не читая длину/данные
+        assert!(matches!(
+            decode(&payload),
+            Err(PgcdcError::Decode(msg)) if msg.contains("binary format not supported")
+        ));
     }
 }

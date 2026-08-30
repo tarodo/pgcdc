@@ -46,7 +46,12 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
         Duration::from_secs(30),
         Duration::from_secs(60),
         RetryConfig::default(),
-    );
+    )
+    // Наш декодер понимает только текстовые значения (pgoutput.rs) и не подписан
+    // на pg_logical_emit_message — оба уже выключены значениями по умолчанию
+    // крейта, но фиксируем это явно здесь, а не полагаемся молча на них.
+    .with_binary(false)
+    .with_messages(false);
 
     let url = replication_url(config.database_url.expose());
     let mut stream = LogicalReplicationStream::new(&url, stream_config)
