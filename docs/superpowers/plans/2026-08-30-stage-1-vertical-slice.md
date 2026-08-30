@@ -1833,7 +1833,7 @@ cargo clippy --lib 2>&1 | tail -5
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 cd /Users/roman/Projects/HP/rust_cdc
 git add Cargo.toml Cargo.lock src/lsn.rs src/sink src/lib.rs
-git commit -m "feat(sink): add sink trait, stdout sink, lsn tracker"
+git commit -m "feat(sink): add sink trait and lsn tracker"
 ```
 
 ---
@@ -2176,7 +2176,7 @@ cd /Users/roman/Projects/HP/rust_cdc
 cargo fmt --check && echo "fmt clean"
 cargo clippy --all-targets 2>&1 | tail -5
 git add Cargo.toml Cargo.lock src/postgres tests/common tests/guard.rs
-git commit -m "feat(guard): add two-mode replication slot preflight"
+git commit -m "feat(guard): add slot preflight checks"
 ```
 
 ---
