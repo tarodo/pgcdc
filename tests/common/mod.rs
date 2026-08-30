@@ -1,0 +1,71 @@
+#![allow(dead_code)]
+
+use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+
+/// Свежий PostgreSQL на каждый тест. Слот репликации — глобальный объект
+/// с состоянием, и на общем инстансе тесты дрались бы за него и зависели
+/// от порядка запуска (DECISIONS Q10).
+pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
+    let container = GenericImage::new("postgres", "16-alpine")
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "app")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_replication_slots=10",
+            "-c",
+            "max_wal_senders=10",
+        ])
+        .start()
+        .await
+        .expect("start postgres");
+
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .expect("port");
+    let conn = format!("postgres://postgres:postgres@127.0.0.1:{port}/app");
+    (container, conn)
+}
+
+pub async fn connect(conn_str: &str) -> tokio_postgres::Client {
+    let (client, connection) = tokio_postgres::connect(conn_str, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
+/// Схема демо из docker/init.sql, но создаваемая из кода теста,
+/// чтобы контролировать стартовую позицию слота.
+pub async fn setup_schema(client: &tokio_postgres::Client) {
+    client
+        .batch_execute(
+            "CREATE TABLE public.users (id BIGINT PRIMARY KEY, name TEXT, email TEXT, bio TEXT);
+             ALTER TABLE public.users REPLICA IDENTITY FULL;
+             ALTER TABLE public.users ALTER COLUMN bio SET STORAGE EXTERNAL;
+             CREATE PUBLICATION pgcdc_pub FOR TABLE public.users;",
+        )
+        .await
+        .expect("setup schema");
+}
+
+pub async fn create_slot(client: &tokio_postgres::Client, slot: &str) {
+    client
+        .query(
+            "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&slot],
+        )
+        .await
+        .expect("create slot");
+}

@@ -14,3 +14,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["std", "clo
 thiserror = "2.0.20"
 async-trait = "0.1.92"
 tracing = "0.1.44"
+tokio-postgres = "0.7.18"
+
+[dev-dependencies]
+testcontainers = "0.28.0"
