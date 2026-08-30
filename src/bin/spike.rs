@@ -28,8 +28,13 @@ async fn main() -> Result<()> {
 
     let mut stream = LogicalReplicationStream::new(CONN, config).await?;
 
-    // ВАЖНО: ensure_replication_slot() НЕ вызывается. Слот должен уже существовать.
-    // Автосоздание маскирует потерю данных (DECISIONS Q19).
+    // ВНИМАНИЕ: мы не зовём ensure_replication_slot() напрямую, но это НИЧЕГО не даёт.
+    // start() всё равно доходит до неё через initialize() (stream.rs:491), безусловно и
+    // без опции отключения. Если слота нет, он будет молча ПЕРЕСОЗДАН на текущей позиции
+    // WAL, и всё закоммиченное до старта процесса потеряется без единой ошибки — это
+    // измерено в пробе 4 (docs/spike-findings.md §2.4). Боевой код обязан сам делать
+    // предполётную проверку слота ДО этого вызова: см. docs/spike-findings.md §3,
+    // обходной путь 1 (DECISIONS Q19).
     stream.start(None).await?;
     eprintln!("replication started, waiting for events (Ctrl-C to stop)");
 
