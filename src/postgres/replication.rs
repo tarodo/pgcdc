@@ -80,29 +80,51 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
     let mut assembler = Assembler::new(config.max_transaction_events);
     let mut tracker = LsnTracker::new();
 
+    // Барьер на каждой транзакции означает fsync на каждую транзакцию —
+    // потолок порядка сотни транзакций в секунду. Группируем по таймеру, не
+    // трогая порядок операций внутри одного прохода: sink, потом барьер,
+    // потом durable, только потом ack, только потом feedback.
+    let ack_interval = Duration::from_millis(config.ack_interval_ms);
+    let mut last_flush = tokio::time::Instant::now();
+
     loop {
+        // Ограниченное чтение здесь безопасно именно потому, что прод
+        // работает на многопоточном рантайме: транспорт выбирает драйвер по
+        // флейвору рантайма, и на многопоточном буфер чтения живёт на
+        // соединении, а не в сброшенной future, — отменённое чтение не
+        // теряет кадров. На однопоточном рантайме драйвер другой и теряет
+        // кадры при отмене, поэтому все интеграционные тесты переведены на
+        // `flavor = "multi_thread"` в задаче 1.
+        //
         // Разрешён ТОЛЬКО next_raw_event: остальные пять API ведут в
         // recover_connection, который рестартует с last_received_lsn —
         // принятой, а не durable позиции (Q25(б)).
-        let raw = stream
-            .next_raw_event(&cancel)
-            .await
-            .map_err(|e| PgcdcError::Connection(format!("next_raw_event: {e}")))?;
+        let read = tokio::time::timeout(ack_interval, stream.next_raw_event(&cancel)).await;
 
-        tracker.note_received(Lsn(raw.wal_end.0));
+        match read {
+            Ok(Ok(raw)) => {
+                tracker.note_received(Lsn(raw.wal_end.0));
 
-        let msg = decode(&raw.data)?;
-        if let Some(tx) = assembler.handle(msg, Lsn(raw.wal_start.0), &mut cache)? {
-            let changes = tx.changes.len();
-            let end_lsn = tx.end_lsn;
+                let msg = decode(&raw.data)?;
+                if let Some(tx) = assembler.handle(msg, Lsn(raw.wal_start.0), &mut cache)? {
+                    let changes = tx.changes.len();
+                    let end_lsn = tx.end_lsn;
 
-            // Порядок нерушим: сначала sink, потом барьер, потом durable, только потом ack.
-            sink.write_transaction(&tx).await?;
-            tracker.note_processed(end_lsn);
+                    // Порядок нерушим: сначала sink, потом барьер, потом durable, только потом ack.
+                    sink.write_transaction(&tx).await?;
+                    tracker.note_processed(end_lsn);
+                    debug!(xid = tx.xid, changes, lsn = %end_lsn, "transaction_accepted");
+                }
+            }
+            Ok(Err(e)) => return Err(PgcdcError::Connection(format!("next_raw_event: {e}"))),
+            // Тик: читать было нечего. Не ошибка — повод дойти до барьера.
+            Err(_elapsed) => {}
+        }
+
+        if last_flush.elapsed() >= ack_interval {
+            last_flush = tokio::time::Instant::now();
 
             // Отметить durable имеет право только успешный барьер, а не приём записи.
-            // Барьер вызывается на каждой транзакции — группировка по таймеру
-            // появится в задаче 4.
             if let Some(durable) = sink.flush().await? {
                 tracker.note_durable(durable);
                 tracker.try_ack(durable)?;
@@ -119,7 +141,7 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
                     .await
                     .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
 
-                debug!(xid = tx.xid, changes, lsn = %durable, "transaction_committed");
+                debug!(lsn = %durable, "group_acknowledged");
             }
         }
     }

@@ -75,6 +75,7 @@ fn config(conn: &str) -> Config {
         output: OutputKind::Stdout,
         output_path: None,
         max_transaction_events: 100_000,
+        ack_interval_ms: 200,
     }
 }
 
@@ -539,6 +540,53 @@ async fn schema_change_resends_relation_and_the_cache_takes_the_new_one() {
     let after = second.changes[0].after.as_ref().unwrap();
     assert_eq!(after.len(), 4, "кэш обязан был принять новую схему");
     assert_eq!(after.get("note").unwrap(), "hello");
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn several_transactions_are_acknowledged_as_one_group() {
+    // Группировка не должна ни терять транзакции, ни подтверждать позицию
+    // раньше, чем барьер её довёл.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let mut cfg = config(&conn);
+    cfg.ack_interval_ms = 500;
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+    });
+
+    for id in 1..=5 {
+        client
+            .execute(
+                "INSERT INTO users VALUES ($1, 'x', NULL, NULL)",
+                &[&(id as i64)],
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+            .await
+            .expect("все пять транзакций должны приехать")
+            .expect("канал закрыт");
+        seen.push(tx.end_lsn);
+    }
+    assert_eq!(seen.len(), 5, "группировка не теряет транзакции");
+
+    // Слот обязан догнать последнюю доведённую позицию.
+    let last = seen.last().copied().unwrap();
+    let confirmed = common::wait_for_slot_at_least(&client, "pgcdc_slot", last).await;
+    assert!(
+        confirmed >= last,
+        "слот догнал последнюю группу: {confirmed} < {last}"
+    );
 
     handle.abort();
 }

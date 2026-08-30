@@ -143,6 +143,12 @@ pub struct Config {
 
     #[arg(long, env = "PGCDC_MAX_TRANSACTION_EVENTS", default_value = "100000")]
     pub max_transaction_events: usize,
+
+    /// Как часто вызывается барьер durability и уходит подтверждение.
+    /// Задержка подтверждения на корректность не влияет: инвариант 1
+    /// сохраняется, а дубликаты после сбоя контракт разрешает.
+    #[arg(long, env = "PGCDC_ACK_INTERVAL_MS", default_value = "200")]
+    pub ack_interval_ms: u64,
 }
 
 #[cfg(test)]

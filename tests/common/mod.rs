@@ -94,3 +94,42 @@ pub async fn create_slot(client: &tokio_postgres::Client, slot: &str) {
         .await
         .expect("create slot");
 }
+
+/// Ждёт, пока `confirmed_flush_lsn` слота не догонит `target`.
+/// Опрос ограничен: если не догнал, тест падает с фактической позицией,
+/// а не висит.
+pub async fn wait_for_slot_at_least(
+    client: &tokio_postgres::Client,
+    slot: &str,
+    target: pgcdc::lsn::Lsn,
+) -> pgcdc::lsn::Lsn {
+    let mut last = pgcdc::lsn::Lsn(0);
+    for _ in 0..100 {
+        let row = client
+            .query_one(
+                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .expect("query slot");
+        let text: Option<String> = row.get(0);
+        if let Some(t) = text {
+            if let Some(lsn) = parse_lsn(&t) {
+                last = lsn;
+                if lsn >= target {
+                    return lsn;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("слот не догнал {target}, остановился на {last}");
+}
+
+/// PostgreSQL печатает позицию как две шестнадцатеричные половины через слэш.
+pub fn parse_lsn(text: &str) -> Option<pgcdc::lsn::Lsn> {
+    let (hi, lo) = text.split_once('/')?;
+    let hi = u64::from_str_radix(hi, 16).ok()?;
+    let lo = u64::from_str_radix(lo, 16).ok()?;
+    Some(pgcdc::lsn::Lsn((hi << 32) | lo))
+}
