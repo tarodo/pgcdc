@@ -165,6 +165,21 @@ fn is_reconnect(durable: Lsn) -> bool {
     durable > Lsn(0)
 }
 
+/// Была ли только что закончившаяся сессия продуктивной для целей сброса
+/// бэкоффа реконнекта. Читает ПОДТВЕРЖДЁННУЮ трекером позицию (`acked`), а
+/// не принятую (`received`), намеренно: и групповой барьер, и keepalive-
+/// продвижение на простаивающей публикации двигают `acked`, а `received`
+/// реагирует только на приход кадра данных. Вынесена в отдельную функцию,
+/// принимающую сам трекер, а не голые `Lsn`, ровно затем, чтобы это чтение
+/// можно было закрепить юнит-тестом на этом уровне: живое доказательство,
+/// что расхождение реально, — спокойный прогон, где сводка показала `acked`
+/// продвинутым при `received` на нуле, keepalive подтвердил WAL, не приняв
+/// ни одного кадра (review Task 2, round 1, F1; review Task 3, round 1,
+/// F3).
+fn session_was_productive(tracker: &LsnTracker, acked_before: Lsn) -> bool {
+    tracker.acked() > acked_before
+}
+
 /// Пауза перед следующей попыткой подключения. Обёрнута в тип, а не голый
 /// `Duration`, живущий внутри бесконечного цикла `run()` с настоящими
 /// `sleep`, — ради тестируемости: в таком виде мутация "убрать сброс" не
@@ -293,6 +308,16 @@ pub async fn run(
     // после первого обрыва процесс перестал бы реагировать на сигнал.
     let shutdown = spawn_shutdown_listener();
 
+    // Тем же приёмом, что и `shutdown`: отсчёт до сводки создаётся один раз
+    // ДО внешнего цикла и передаётся одной и той же ссылкой в каждую сессию.
+    // Счётчики, которые сводка печатает, процессные и переживают реконнект;
+    // если заводить отсчёт заново внутри `stream_once` на каждой сессии,
+    // процесс, переподключающийся чаще `METRICS_REPORT_INTERVAL`, никогда не
+    // проживёт достаточно долго внутри одной сессии, чтобы сводка вообще
+    // вышла (review Task 3, round 1, F1) — именно в этой ситуации она нужнее
+    // всего, потому что `reconnects`/`errors` в строке существуют ради неё.
+    let mut last_report = tokio::time::Instant::now();
+
     loop {
         // I1: первое из двух мест, где внешний цикл реконнекта смотрит на
         // флаг завершения (второе — нарезанная пауза бэкоффа чуть ниже).
@@ -320,7 +345,16 @@ pub async fn run(
 
         let acked_before = state.tracker.acked();
 
-        match stream_once(&config, &mut sink, &mut state, &shutdown, &metrics).await {
+        match stream_once(
+            &config,
+            &mut sink,
+            &mut state,
+            &shutdown,
+            &metrics,
+            &mut last_report,
+        )
+        .await
+        {
             Ok(SessionOutcome::ShutdownRequested) => return Ok(()),
             Ok(SessionOutcome::Disconnected) => {}
             // Восстановимые ошибки ведут в реконнект, фатальные — наружу.
@@ -332,11 +366,12 @@ pub async fn run(
             Err(e) => return Err(e),
         }
 
-        // Признак продуктивности — сдвинулась ПОДТВЕРЖДЁННАЯ позиция, а не
-        // принятая: и групповое подтверждение, и keepalive-продвижение на
-        // простаивающей публикации двигают acked, а вот received трогает
-        // только приход кадра данных (review Task 2, round 1, F1).
-        let productive = state.tracker.acked() > acked_before;
+        // Признак продуктивности вынесен в `session_was_productive` (review
+        // Task 3, round 1, F3): решение о том, что считать продуктивностью,
+        // читает acked, а не received (review Task 2, round 1, F1), и это
+        // чтение закреплено юнит-тестом на уровне самой функции, а не только
+        // косвенно через интеграционный сценарий.
+        let productive = session_was_productive(&state.tracker, acked_before);
         if productive {
             attempt = 0;
         }
@@ -399,6 +434,7 @@ async fn stream_once(
     state: &mut SessionState,
     shutdown: &Arc<AtomicBool>,
     metrics: &Arc<Metrics>,
+    last_report: &mut tokio::time::Instant,
 ) -> Result<SessionOutcome, PgcdcError> {
     // Захватываем ДО preflight, а не проверяем `state.durable()` заново
     // позже: решение "это реконнект" принимается на входе в функцию и не
@@ -483,7 +519,6 @@ async fn stream_once(
     // потом durable, только потом ack, только потом feedback.
     let ack_interval = Duration::from_millis(config.ack_interval_ms);
     let mut last_flush = tokio::time::Instant::now();
-    let mut last_report = tokio::time::Instant::now();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -499,7 +534,7 @@ async fn stream_once(
         // запись→processed→(таймер)барьер→durable→ack→feedback, потому что
         // только читает снимок и ни на что не влияет (§16, DECISIONS Q23).
         if last_report.elapsed() >= METRICS_REPORT_INTERVAL {
-            last_report = tokio::time::Instant::now();
+            *last_report = tokio::time::Instant::now();
             let s = metrics.snapshot();
             info!(
                 events = s.events_total,
@@ -609,6 +644,34 @@ mod tests {
     }
 
     #[test]
+    fn session_is_productive_when_acked_advances_via_keepalive_without_new_frames() {
+        // Живое доказательство расхождения (review Task 3, round 1, F3): в
+        // спокойном прогоне сводка показала подтверждённую позицию
+        // продвинутой при принятой на нуле — keepalive подтвердил WAL, не
+        // приняв ни одного кадра. Признак обязан считать эту сессию
+        // продуктивной, а мутация, подменяющая acked на received внутри
+        // `session_was_productive`, этот тест провалит.
+        let mut t = LsnTracker::new();
+        let acked_before = t.acked();
+        t.note_durable(Lsn(0x1000));
+        t.try_ack(Lsn(0x1000)).unwrap();
+        assert_eq!(t.received(), Lsn(0), "ни один кадр не был принят");
+        assert!(session_was_productive(&t, acked_before));
+    }
+
+    #[test]
+    fn session_is_not_productive_when_only_received_moves() {
+        // Обратная сторона того же расхождения: кадр пришёл (received ушёл
+        // вперёд), но барьер его ещё не подтвердил — по acked сессия
+        // непродуктивна, и признак обязан согласиться с acked, а не с
+        // received.
+        let mut t = LsnTracker::new();
+        let acked_before = t.acked();
+        t.note_received(Lsn(0x1000));
+        assert!(!session_was_productive(&t, acked_before));
+    }
+
+    #[test]
     fn backoff_resets_to_initial_after_a_productive_session() {
         let mut b = ReconnectBackoff::new(Duration::from_millis(100), Duration::from_millis(1000));
         // Взбираемся к потолку серией непродуктивных попыток.
@@ -620,6 +683,26 @@ mod tests {
             Duration::from_millis(100),
             "продуктивная сессия обязана сбросить паузу на начальную"
         );
+    }
+
+    #[test]
+    fn backoff_keeps_growing_across_unproductive_attempts() {
+        // Закрывает разрыв, который переживал прежний набор тестов (review
+        // Task 3, round 1, F2): мутация «сделать сброс безусловным» —
+        // `next_delay` всегда обнуляет `current` вне зависимости от
+        // `productive` — оставляла зелёными оба существующих теста на
+        // бэкофф, потому что ни один из них не смотрит на промежуточные
+        // значения при `productive = false`. Под этой мутацией каждый вызов
+        // с `productive = false` тоже возвращал бы начальную задержку
+        // (100мс) навсегда — вечная долбёжка мёртвого сервера каждые сто
+        // миллисекунд вместо экспоненты. Этот тест читает именно
+        // промежуточные значения серии непродуктивных попыток на уровне
+        // метода типа, а не свободной функции `next_backoff`.
+        let mut b = ReconnectBackoff::new(Duration::from_millis(100), Duration::from_millis(1000));
+        assert_eq!(b.next_delay(false), Duration::from_millis(100));
+        assert_eq!(b.next_delay(false), Duration::from_millis(200));
+        assert_eq!(b.next_delay(false), Duration::from_millis(400));
+        assert_eq!(b.next_delay(false), Duration::from_millis(800));
     }
 
     #[test]

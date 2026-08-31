@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -19,6 +20,12 @@ async fn main() -> ExitCode {
                 .unwrap_or_else(|_| "info,pg_walstream=warn".into()),
         )
         .with_writer(std::io::stderr)
+        // Раскраска только для реального терминала: без этой проверки
+        // ANSI-коды безусловно уходят и в перенаправленный в файл вывод, и в
+        // трубу любого сборщика логов (review Task 3, round 1, F4) — этот
+        // этап называется «обвязка», и такой вывод обязан оставаться
+        // машиночитаемым.
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     let config = Config::parse();
