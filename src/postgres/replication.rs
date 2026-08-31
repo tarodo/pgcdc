@@ -291,10 +291,18 @@ fn is_busy_race_reason(reason: &str) -> bool {
 /// 30000мс, `Config`) взято с запасом ~240× над худшим наблюдением полного
 /// цикла реконнекта и ~8500× над сырым временем освобождения слота.
 ///
-/// Счётчик ОБЯЗАН сбрасываться на каждом успешном старте сессии
-/// (`classify_start_outcome`, ветка `Ok`) — иначе долгоживущий процесс
-/// однажды упадёт из-за СУММЫ несвязанных между собой гонок, накопленной за
-/// месяцы работы, а не из-за одного затянувшегося эпизода.
+/// Счётчик ОБЯЗАН сбрасываться на ЛЮБОМ наблюдении, которое не является
+/// гонкой "занят" — не только на успешном старте сессии
+/// (`classify_start_outcome`, ветка `Ok`), но и на отказе другой природы
+/// внутри той же функции, и на любом отказе `stream_once`, случившемся ДО
+/// того, как классификация вообще состоялась: preflight слота, сверка
+/// реконнекта, открытие соединения (`reset_patience_on_early_failure`).
+/// Иначе долгоживущий процесс однажды упадёт из-за СУММЫ несвязанных между
+/// собой эпизодов — например, гонки в момент ноль и другой гонки много позже,
+/// разделённых часами недоступности сервера по совсем другой причине, — а не
+/// из-за одного затянувшегося эпизода (I1, review round after task 4 finale:
+/// раньше сбрасывалось ТОЛЬКО в Ok-ветке, и любой отказ, не дошедший до
+/// классификации старта, часов не трогал).
 struct SlotBusyPatience {
     first_seen: Option<Instant>,
 }
@@ -352,8 +360,40 @@ fn classify_start_outcome(
                 budget_ms: budget.as_millis() as u64,
             });
         }
+        // Гонка ещё в бюджете: единственная ветка, которая обязана НЕ
+        // трогать патиенс — иначе эпизод никогда бы не накопил достаточно
+        // времени, чтобы вообще сработать.
+        return Err(classify_start_error(slot, e));
     }
+    // I1: отказ другой природы (не гонка "занят") закрывает открытый эпизод —
+    // иначе он продолжил бы копиться во время отказа, никак с гонкой не
+    // связанного, и сложился бы с последующим, тоже не связанным эпизодом
+    // гонки в один фатальный выход.
+    patience.reset();
     Err(classify_start_error(slot, e))
+}
+
+/// Общий хвост для ЛЮБОГО отказа `stream_once`, случившегося ДО того, как
+/// `classify_start_outcome` успела классифицировать `stream.start()`:
+/// preflight-проверка слота, сверка реконнекта, открытие самого соединения.
+/// Ни один из этих отказов не может быть гонкой "занят" — SQLSTATE 55006
+/// возвращает только ответ сервера на сам `START_REPLICATION`, — поэтому
+/// такой отказ безусловно закрывает открытый эпизод терпения (I1, review
+/// round after task 4 finale): без этого часы, накопленные прошлой гонкой,
+/// продолжали бы идти всё то время, пока сервер недоступен по совсем другой
+/// причине, и сложились бы с никак не связанным следующим эпизодом гонки в
+/// один фатальный выход, которого по отдельности ни один из эпизодов не
+/// заслужил. `Ok` здесь нарочно не трогает патиенс: успех preflight/сверки/
+/// открытия соединения ещё не значит, что сессия стартовала — это решает
+/// только `classify_start_outcome` дальше по `stream_once`.
+fn reset_patience_on_early_failure<T>(
+    result: Result<T, PgcdcError>,
+    patience: &mut SlotBusyPatience,
+) -> Result<T, PgcdcError> {
+    if result.is_err() {
+        patience.reset();
+    }
+    result
 }
 
 /// Была ли только что закончившаяся сессия продуктивной для целей сброса
@@ -645,7 +685,15 @@ async fn stream_once(
     // Обязательство Q25(а): guard ДО start(), потому что start() безусловно
     // зовёт ensure_replication_slot() и при отсутствующем слоте молча создаст
     // новый на текущей позиции WAL, потеряв всё закоммиченное раньше.
-    let info_slot = preflight_slot(config.database_url.expose(), &config.slot).await?;
+    // I1: обёрнуто в reset_patience_on_early_failure, а не голый `?` — отказ
+    // здесь физически не может быть гонкой "занят" (тот код приходит только
+    // в ответ на START_REPLICATION дальше), поэтому обязан безусловно
+    // закрывать любой открытый эпизод терпения, а не оставлять его часы
+    // тикать, пока сервер недоступен по совсем другой причине.
+    let info_slot = reset_patience_on_early_failure(
+        preflight_slot(config.database_url.expose(), &config.slot).await,
+        slot_busy_patience,
+    )?;
     info!(
         slot = %config.slot,
         restart_lsn = ?info_slot.restart_lsn.map(|l| l.to_string()),
@@ -662,7 +710,12 @@ async fn stream_once(
     // инвариант 2 (DECISIONS §1) вместе со строкой транспортных
     // обязательств спайка (DECISIONS Q25).
     if reconnecting {
-        if let Some(warning) = check_reconnect(&config.slot, &info_slot, state.durable())? {
+        // I1: тем же приёмом, что и preflight выше — сверка реконнекта не
+        // может вернуть гонку "занят", только SlotAhead или ничего.
+        if let Some(warning) = reset_patience_on_early_failure(
+            check_reconnect(&config.slot, &info_slot, state.durable()),
+            slot_busy_patience,
+        )? {
             warn!("{warning}");
         }
     }
@@ -684,9 +737,14 @@ async fn stream_once(
     .with_messages(false);
 
     let url = replication_url(config.database_url.expose());
-    let mut stream = LogicalReplicationStream::new(&url, stream_config)
-        .await
-        .map_err(|e| PgcdcError::Connection(format!("open replication stream: {e}")))?;
+    // I1: тем же приёмом — открытие TCP-соединения тоже не может вернуть
+    // гонку "занят", она приходит только в ответ на сам START_REPLICATION.
+    let mut stream = reset_patience_on_early_failure(
+        LogicalReplicationStream::new(&url, stream_config)
+            .await
+            .map_err(|e| PgcdcError::Connection(format!("open replication stream: {e}"))),
+        slot_busy_patience,
+    )?;
 
     // start_lsn = None означает 0/0: сервер возьмёт confirmed_flush_lsn слота.
     // Слот — единственный источник истины (DECISIONS Q4, Q19).
@@ -1079,6 +1137,148 @@ mod tests {
             "сброс обязан был начать эпизод 2 заново: {err:?}"
         );
         assert!(!err.is_fatal());
+    }
+
+    #[test]
+    fn a_non_busy_failure_inside_classify_start_outcome_also_resets_the_patience() {
+        // I1: раньше сбрасывалось ТОЛЬКО в Ok-ветке. Отказ другой природы
+        // (например, оборвавшаяся связь во время самого START_REPLICATION)
+        // тоже обязан закрыть открытый эпизод — иначе он продолжил бы
+        // копиться и сложился бы с никак не связанным следующим эпизодом
+        // гонки в один фатальный выход.
+        let mut patience = SlotBusyPatience::new();
+        let budget = Duration::from_millis(1000);
+        let t0 = Instant::now();
+
+        // Эпизод 1: одно наблюдение гонки, бюджет ещё далёк.
+        let err = classify_start_outcome(
+            "pgcdc_slot",
+            Err(busy_race_error()),
+            &mut patience,
+            budget,
+            t0,
+        )
+        .unwrap_err();
+        assert!(!err.is_fatal());
+
+        // Отказ другой природы 900мс спустя — НЕ гонка "занят". Обязан
+        // закрыть эпизод 1, а не пройти мимо патиенса.
+        let err = classify_start_outcome(
+            "pgcdc_slot",
+            Err(ReplicationError::transient_connection(
+                "connection reset by peer",
+            )),
+            &mut patience,
+            budget,
+            t0 + Duration::from_millis(900),
+        )
+        .unwrap_err();
+        assert!(!err.is_fatal(), "отказ другой природы сам не фатален");
+
+        // Эпизод 2 начинается 1800мс после t0 — без сброса унаследовал бы
+        // first_seen = t0 и уже превысил бы бюджет (1800мс >= 1000мс).
+        let err = classify_start_outcome(
+            "pgcdc_slot",
+            Err(busy_race_error()),
+            &mut patience,
+            budget,
+            t0 + Duration::from_millis(1800),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PgcdcError::Connection(_)),
+            "отказ другой природы обязан был начать эпизод 2 заново: {err:?}"
+        );
+        assert!(!err.is_fatal());
+    }
+
+    #[test]
+    fn reset_patience_on_early_failure_closes_an_open_episode_on_err() {
+        let mut patience = SlotBusyPatience::new();
+        let budget = Duration::from_millis(1000);
+        let t0 = Instant::now();
+        assert!(patience.observe_busy(t0, budget).is_none(), "эпизод открыт");
+
+        let unreachable: Result<(), PgcdcError> =
+            Err(PgcdcError::Connection("preflight connect: refused".into()));
+        reset_patience_on_early_failure(unreachable, &mut patience).unwrap_err();
+
+        // Без сброса это наблюдение (ровно на границе бюджета от t0)
+        // сработало бы — тем же приёмом, что и `SlotBusyPatience::reset`.
+        assert!(patience
+            .observe_busy(t0 + Duration::from_millis(1000), budget)
+            .is_none());
+    }
+
+    #[test]
+    fn reset_patience_on_early_failure_leaves_an_open_episode_alone_on_ok() {
+        // Успех preflight/сверки/открытия соединения ещё не значит, что
+        // сессия стартовала — закрывать эпизод здесь на Ok было бы неверно:
+        // решение "старт успешен" принимает только classify_start_outcome.
+        let mut patience = SlotBusyPatience::new();
+        let budget = Duration::from_millis(1000);
+        let t0 = Instant::now();
+        assert!(patience.observe_busy(t0, budget).is_none());
+
+        reset_patience_on_early_failure(Ok(()), &mut patience).unwrap();
+
+        let waited = patience
+            .observe_busy(t0 + Duration::from_millis(1000), budget)
+            .expect("эпизод обязан был остаться открытым");
+        assert_eq!(waited, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn a_busy_episode_does_not_survive_an_unrelated_pre_start_failure_in_between() {
+        // I1 reproduction (дословно из ревью): гонка "занят" в момент ноль;
+        // затем сервер недоступен — каждая попытка падает РАНЬШЕ, чем
+        // доходит до classify_start_outcome (preflight слота или открытие
+        // соединения, а не ответ на START_REPLICATION); затем сервер
+        // вернулся, и наш же прежний walsender снова держит слот 76мс
+        // (измеренная медиана, см. SlotBusyPatience). Второй эпизод не
+        // должен унаследовать часы первого — суммирования быть не должно.
+        let mut patience = SlotBusyPatience::new();
+        let budget = Duration::from_millis(1000);
+        let t0 = Instant::now();
+
+        // Эпизод 1: гонка "занят" в момент ноль, бюджет ещё далёк.
+        let err = classify_start_outcome(
+            "pgcdc_slot",
+            Err(busy_race_error()),
+            &mut patience,
+            budget,
+            t0,
+        )
+        .unwrap_err();
+        assert!(!err.is_fatal());
+
+        // Сервер недоступен: отказ до классификации старта (preflight/
+        // открытие соединения), 5 секунд спустя — то же самое, что стоит
+        // на пути stream_once ДО classify_start_outcome.
+        let unreachable: Result<(), PgcdcError> =
+            Err(PgcdcError::Connection("preflight connect: refused".into()));
+        reset_patience_on_early_failure(unreachable, &mut patience).unwrap_err();
+
+        // Эпизод 2: сервер снова отвечает гонкой "занят" ещё 76мс спустя.
+        // Суммарно от t0 прошло бы 5076мс — далеко за бюджетом, и БЕЗ
+        // сброса это наблюдение эскалировало бы в SlotBusyTimedOut ошибочно:
+        // процесс, который восстановился бы со следующей попытки, умер бы.
+        let err = classify_start_outcome(
+            "pgcdc_slot",
+            Err(busy_race_error()),
+            &mut patience,
+            budget,
+            t0 + Duration::from_millis(5000) + Duration::from_millis(76),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PgcdcError::Connection(_)),
+            "второй эпизод не должен унаследовать часы первого: {err:?}"
+        );
+        assert!(
+            !err.is_fatal(),
+            "несвязанные эпизоды не должны суммироваться в фатальный выход"
+        );
     }
 
     #[test]
