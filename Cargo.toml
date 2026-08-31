@@ -6,7 +6,7 @@ rust-version = "1.95"
 
 [dependencies]
 pg_walstream = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
@@ -18,6 +18,7 @@ clap = { version = "4.6.6", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+libc = "0.2.189"
 testcontainers = "0.28.0"
 # "process" только для тестов (F9: осиротевший дочерний процесс на таймауте
 # теста нужно уметь убить через async Child/kill_on_drop) — прод-бинарь его

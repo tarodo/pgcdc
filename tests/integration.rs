@@ -961,3 +961,119 @@ async fn file_output_binary_writes_durable_json_lines() {
     assert_eq!(json["after"]["id"], "1");
     assert_eq!(json["after"]["name"], "Alice");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminated_process_exits_zero_after_draining() {
+    // Штатная остановка обязана давать ноль. Иначе супервизор будет
+    // бесконечно перезапускать процесс, который остановили намеренно.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let out = std::env::temp_dir().join(format!("pgcdc-sigterm-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+        .args([
+            "--database-url",
+            &conn,
+            "--publication",
+            "pgcdc_pub",
+            "--slot",
+            "pgcdc_slot",
+            "--output",
+            "file",
+            "--output-path",
+            out.to_str().unwrap(),
+        ])
+        .spawn()
+        .expect("запустить бинарь");
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    // Ждём, пока строка окажется в файле, — значит процесс дошёл до барьера.
+    let mut seen = false;
+    for _ in 0..200 {
+        if std::fs::read_to_string(&out)
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false)
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(seen, "строка не появилась в файле за 20 секунд");
+
+    // SIGTERM, а не kill: проверяем именно штатное завершение.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .unwrap()
+        .expect("wait");
+    assert_eq!(status.code(), Some(0), "штатная остановка даёт ноль");
+
+    let _ = std::fs::remove_file(&out);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_over_the_limit_is_fatal_and_the_slot_stays_put() {
+    // Лимит не чинит цикл рестартов на гигантской транзакции — он меняет
+    // диагностику с «убит по памяти» на внятное сообщение (DECISIONS Q7).
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let before: String = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'pgcdc_slot'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    let mut cfg = config(&conn);
+    cfg.max_transaction_events = 2;
+    let (tx_send, _rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+    });
+
+    client
+        .execute(
+            "INSERT INTO users SELECT g, 'x', NULL, NULL FROM generate_series(1, 10) g",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        .await
+        .expect("run должен завершиться, а не висеть")
+        .expect("join");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, PgcdcError::TransactionTooLarge { limit: 2 }),
+        "получили {err:?}"
+    );
+    assert!(
+        err.is_fatal(),
+        "превышение лимита — фатальная ошибка, а не повод для ретрая"
+    );
+
+    let after: String = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'pgcdc_slot'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(before, after, "фатальная ошибка не двигает слот");
+}

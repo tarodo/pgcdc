@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use pg_walstream::{
@@ -79,10 +81,32 @@ pub(crate) enum SessionOutcome {
     /// Соединение оборвалось. Внешний цикл решает, переподключаться ли.
     Disconnected,
     /// Пришёл сигнал завершения и текущая группа доведена до барьера.
-    ///
-    /// Пока не конструируется: сигнал завершения появится в задаче 3 этапа.
-    #[allow(dead_code)]
     ShutdownRequested,
+}
+
+/// Ставит флаг по SIGTERM или SIGINT. Флаг проверяется в начале каждого прохода
+/// цикла; поскольку чтение и так ограничено по времени, задержка реакции не
+/// превышает `ack_interval`. Это проще, чем городить select вокруг чтения, и
+/// не трогает порядок операций, проверенный мутационно.
+fn spawn_shutdown_listener() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let f = flag.clone();
+    tokio::spawn(async move {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "cannot install SIGTERM handler");
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        f.store(true, Ordering::Relaxed);
+    });
+    flag
 }
 
 /// Удвоение с потолком. `saturating_mul` вместо `*` — чтобы удвоение у верха
@@ -142,6 +166,44 @@ impl ReconnectBackoff {
     }
 }
 
+/// Доводит принятое sink'ом до барьера, отмечает durable, подтверждает
+/// трекером и отправляет feedback серверу. Общий код для группового таймера
+/// и для завершения по сигналу: без извлечения в отдельную функцию эти два
+/// места разошлись бы, а мутационное покрытие, снятое против таймерной
+/// ветки, не защищало бы вторую копию (см. бриф задачи 3).
+async fn flush_and_acknowledge(
+    sink: &mut Box<dyn Sink>,
+    state: &mut SessionState,
+    stream: &mut LogicalReplicationStream,
+) -> Result<(), PgcdcError> {
+    // Отметить durable имеет право только успешный барьер, а не приём записи.
+    if let Some(durable) = sink.flush().await? {
+        state.tracker.note_durable(durable);
+        state.tracker.try_ack(durable)?;
+        let acked = state.tracker.acked();
+
+        // Отчитываемся позицией трекера (acked), а не тем, что вернул
+        // барьер: сегодня они совпадают, но с реконнектом внутри
+        // процесса (следующий этап) replay уже подтверждённой
+        // транзакции может вернуть из flush позицию позади слота —
+        // отправить её в feedback значило бы откатить сервер назад.
+        // Подтверждаем acked, НЕ commit_lsn: commit_lsn указывает на
+        // начало записи коммита, и рестарт перечитал бы ту же транзакцию.
+        stream.shared_lsn_feedback.update_flushed_lsn(acked.0);
+        stream.shared_lsn_feedback.update_applied_lsn(acked.0);
+
+        // Обязательство Q25(в): без явного вызова подтверждение уходит
+        // с задержкой 18–22 с по внутреннему расписанию крейта.
+        stream
+            .send_feedback()
+            .await
+            .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
+
+        debug!(lsn = %acked, "group_acknowledged");
+    }
+    Ok(())
+}
+
 pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcError> {
     // Первым делом — до любого подключения и любого лога, где могла бы всплыть строка.
     config.database_url.validate()?;
@@ -154,10 +216,15 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
     );
     let mut attempt: u32 = 0;
 
+    // Флаг создаётся один раз ДО внешнего цикла и передаётся одной и той же
+    // ссылкой в каждую сессию: если создавать его заново на каждом реконнекте,
+    // после первого обрыва процесс перестал бы реагировать на сигнал.
+    let shutdown = spawn_shutdown_listener();
+
     loop {
         let acked_before = state.tracker.acked();
 
-        match stream_once(&config, &mut sink, &mut state).await {
+        match stream_once(&config, &mut sink, &mut state, &shutdown).await {
             Ok(SessionOutcome::ShutdownRequested) => return Ok(()),
             Ok(SessionOutcome::Disconnected) => {}
             // Восстановимые ошибки ведут в реконнект, фатальные — наружу.
@@ -196,6 +263,7 @@ async fn stream_once(
     config: &Config,
     sink: &mut Box<dyn Sink>,
     state: &mut SessionState,
+    shutdown: &Arc<AtomicBool>,
 ) -> Result<SessionOutcome, PgcdcError> {
     // Захватываем ДО preflight, а не проверяем `state.durable()` заново
     // позже: решение "это реконнект" принимается на входе в функцию и не
@@ -280,6 +348,14 @@ async fn stream_once(
     let mut last_flush = tokio::time::Instant::now();
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            // Довести принятое до барьера и подтвердить, прежде чем выйти.
+            // Выйти раньше значило бы потерять уже принятые транзакции.
+            flush_and_acknowledge(sink, state, &mut stream).await?;
+            info!("shutdown_requested");
+            return Ok(SessionOutcome::ShutdownRequested);
+        }
+
         // Ограниченное чтение здесь безопасно, потому что прод работает на
         // многопоточном рантайме: транспорт выбирает Inline-драйвер по
         // флейвору рантайма, и его буфер чтения живёт на соединении, а не в
@@ -326,32 +402,7 @@ async fn stream_once(
 
         if last_flush.elapsed() >= ack_interval {
             last_flush = tokio::time::Instant::now();
-
-            // Отметить durable имеет право только успешный барьер, а не приём записи.
-            if let Some(durable) = sink.flush().await? {
-                state.tracker.note_durable(durable);
-                state.tracker.try_ack(durable)?;
-                let acked = state.tracker.acked();
-
-                // Отчитываемся позицией трекера (acked), а не тем, что вернул
-                // барьер: сегодня они совпадают, но с реконнектом внутри
-                // процесса (следующий этап) replay уже подтверждённой
-                // транзакции может вернуть из flush позицию позади слота —
-                // отправить её в feedback значило бы откатить сервер назад.
-                // Подтверждаем acked, НЕ commit_lsn: commit_lsn указывает на
-                // начало записи коммита, и рестарт перечитал бы ту же транзакцию.
-                stream.shared_lsn_feedback.update_flushed_lsn(acked.0);
-                stream.shared_lsn_feedback.update_applied_lsn(acked.0);
-
-                // Обязательство Q25(в): без явного вызова подтверждение уходит
-                // с задержкой 18–22 с по внутреннему расписанию крейта.
-                stream
-                    .send_feedback()
-                    .await
-                    .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
-
-                debug!(lsn = %acked, "group_acknowledged");
-            }
+            flush_and_acknowledge(sink, state, &mut stream).await?;
         }
 
         // Продвижение по keepalive: если мы ничего не должны sink'у, вся позиция,
