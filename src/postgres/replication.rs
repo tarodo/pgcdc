@@ -166,11 +166,48 @@ impl ReconnectBackoff {
     }
 }
 
-/// Доводит принятое sink'ом до барьера, отмечает durable, подтверждает
-/// трекером и отправляет feedback серверу. Общий код для группового таймера
-/// и для завершения по сигналу: без извлечения в отдельную функцию эти два
-/// места разошлись бы, а мутационное покрытие, снятое против таймерной
-/// ветки, не защищало бы вторую копию (см. бриф задачи 3).
+/// Хвост, общий для обоих способов доказать durable-позицию: барьер
+/// (`Sink::flush`) и keepalive-продвижение доказывают её по-разному, но раз
+/// позиция решена, дальше оба места отмечают её, подтверждают трекером и
+/// отправляют feedback — дословно одинаковыми четырьмя шагами. Барьер
+/// НЕ входит сюда и не может: только вызывающий решает, что считать
+/// durable, эта функция лишь записывает решение (review Task 3, round 1,
+/// F1 — иначе keepalive-путь мог бы незаметно приобрести барьер).
+///
+/// Возвращает ПОДТВЕРЖДЁННУЮ трекером позицию (acked), а не переданный
+/// `durable`: сегодня они совпадают, но с реконнектом внутри процесса
+/// (следующий этап) replay уже подтверждённой транзакции может отличаться —
+/// отправить в feedback не то, что подтвердил трекер, значило бы откатить
+/// сервер назад. Подтверждаем acked, НЕ commit_lsn: commit_lsn указывает на
+/// начало записи коммита, и рестарт перечитал бы ту же транзакцию.
+async fn acknowledge_durable(
+    state: &mut SessionState,
+    stream: &mut LogicalReplicationStream,
+    durable: Lsn,
+) -> Result<Lsn, PgcdcError> {
+    state.tracker.note_durable(durable);
+    state.tracker.try_ack(durable)?;
+    let acked = state.tracker.acked();
+
+    stream.shared_lsn_feedback.update_flushed_lsn(acked.0);
+    stream.shared_lsn_feedback.update_applied_lsn(acked.0);
+
+    // Обязательство Q25(в): без явного вызова подтверждение уходит
+    // с задержкой 18–22 с по внутреннему расписанию крейта.
+    stream
+        .send_feedback()
+        .await
+        .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
+
+    Ok(acked)
+}
+
+/// Доводит принятое sink'ом до барьера и, если было что подтверждать,
+/// прогоняет результат через общий хвост `acknowledge_durable`. Общий код
+/// для группового таймера и для завершения по сигналу: без извлечения в
+/// отдельную функцию эти два места разошлись бы, а мутационное покрытие,
+/// снятое против таймерной ветки, не защищало бы вторую копию (см. бриф
+/// задачи 3).
 async fn flush_and_acknowledge(
     sink: &mut Box<dyn Sink>,
     state: &mut SessionState,
@@ -178,27 +215,7 @@ async fn flush_and_acknowledge(
 ) -> Result<(), PgcdcError> {
     // Отметить durable имеет право только успешный барьер, а не приём записи.
     if let Some(durable) = sink.flush().await? {
-        state.tracker.note_durable(durable);
-        state.tracker.try_ack(durable)?;
-        let acked = state.tracker.acked();
-
-        // Отчитываемся позицией трекера (acked), а не тем, что вернул
-        // барьер: сегодня они совпадают, но с реконнектом внутри
-        // процесса (следующий этап) replay уже подтверждённой
-        // транзакции может вернуть из flush позицию позади слота —
-        // отправить её в feedback значило бы откатить сервер назад.
-        // Подтверждаем acked, НЕ commit_lsn: commit_lsn указывает на
-        // начало записи коммита, и рестарт перечитал бы ту же транзакцию.
-        stream.shared_lsn_feedback.update_flushed_lsn(acked.0);
-        stream.shared_lsn_feedback.update_applied_lsn(acked.0);
-
-        // Обязательство Q25(в): без явного вызова подтверждение уходит
-        // с задержкой 18–22 с по внутреннему расписанию крейта.
-        stream
-            .send_feedback()
-            .await
-            .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
-
+        let acked = acknowledge_durable(state, stream, durable).await?;
         debug!(lsn = %acked, "group_acknowledged");
     }
     Ok(())
@@ -256,6 +273,19 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
         state.reset_for_reconnect();
     }
 }
+
+/// Верхняя граница ожидания в чтении — и тем самым верхняя граница задержки
+/// реакции на флаг завершения. НЕ связывать с `ack_interval_ms`: тот задаёт
+/// расписание барьера и не должен диктовать, как быстро процесс замечает
+/// сигнал. Раньше чтение было ограничено самим `ack_interval`, поэтому флаг
+/// проверялся не чаще периодического барьера — при проде на несколько
+/// секунд это делало задержку штатной остановки равной длине интервала
+/// подтверждения, и супервизор с коротким grace period убивал процесс
+/// раньше, чем тот вообще замечал сигнал (review Task 3, round 2, F2). При
+/// значении по умолчанию (`ack_interval_ms = 200`) цикл и так просыпался с
+/// этой частотой — константа ничего не удорожает, только отвязывает частоту
+/// пробуждения от периода барьера.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Одна сессия репликации: preflight, подключение, цикл. Возвращается при
 /// обрыве соединения или при штатном завершении.
@@ -371,7 +401,13 @@ async fn stream_once(
         // Разрешён ТОЛЬКО next_raw_event: остальные пять API ведут в
         // recover_connection, который рестартует с last_received_lsn —
         // принятой, а не durable позиции (Q25(б)).
-        let read = tokio::time::timeout(ack_interval, stream.next_raw_event(&cancel)).await;
+        //
+        // Таймаут — SHUTDOWN_POLL_INTERVAL, а не ack_interval: барьер копит
+        // события по своему расписанию (elapsed-проверка ниже), а это
+        // ограничение существует только для того, чтобы не проспать флаг
+        // завершения дольше положенного.
+        let read =
+            tokio::time::timeout(SHUTDOWN_POLL_INTERVAL, stream.next_raw_event(&cancel)).await;
 
         match read {
             Ok(Ok(raw)) => {
@@ -416,15 +452,8 @@ async fn stream_once(
             state.tracker.durable(),
         ) && server_lsn > state.tracker.acked()
         {
-            state.tracker.note_durable(server_lsn);
-            state.tracker.try_ack(server_lsn)?;
-            stream.shared_lsn_feedback.update_flushed_lsn(server_lsn.0);
-            stream.shared_lsn_feedback.update_applied_lsn(server_lsn.0);
-            stream
-                .send_feedback()
-                .await
-                .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
-            debug!(lsn = %server_lsn, "advanced_from_keepalive");
+            let acked = acknowledge_durable(state, &mut stream, server_lsn).await?;
+            debug!(lsn = %acked, "advanced_from_keepalive");
         }
     }
 }

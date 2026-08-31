@@ -1077,3 +1077,234 @@ async fn a_transaction_over_the_limit_is_fatal_and_the_slot_stays_put() {
         .get(0);
     assert_eq!(before, after, "фатальная ошибка не двигает слот");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
+    // Round 1, F2: `a_terminated_process_exits_zero_after_draining` остаётся
+    // зелёным даже без барьера в самой ветке завершения, потому что при
+    // интервале по умолчанию (200мс) периодический барьер почти наверняка
+    // успевает сработать раньше, чем мы вообще отправим сигнал. Этот тест
+    // закрывает именно эту дыру: интервал барьера задран настолько, что
+    // периодическая ветка заведомо не успевает сработать за время
+    // предпроверки.
+    //
+    // Проверка НЕ по содержимому файла: `FileSink` пишет через
+    // `BufWriter<File>`, и при обычном (не панике) выходе из процесса Rust
+    // сам делает для него best-effort `flush()` в `Drop` — без вызова
+    // барьера ветки завершения строка всё равно окажется в файле, просто
+    // без fsync и без подтверждения слоту. Первая попытка написать этот
+    // тест так и проверяла — файл непуст после SIGTERM — и осталась
+    // зелёной ПОСЛЕ мутации, убирающей барьер: `Drop` замаскировал
+    // отсутствие вызова. Источник истины, который не подделать через
+    // `Drop`, только один — `confirmed_flush_lsn` слота на сервере: он
+    // продвигается исключительно вызовом `send_feedback`, а тот в ветке
+    // завершения происходит только внутри `flush_and_acknowledge`.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let out = std::env::temp_dir().join(format!(
+        "pgcdc-sigterm-barrier-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&out);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+        .args([
+            "--database-url",
+            &conn,
+            "--publication",
+            "pgcdc_pub",
+            "--slot",
+            "pgcdc_slot",
+            "--output",
+            "file",
+            "--output-path",
+            out.to_str().unwrap(),
+            // На порядок больше, чем любое разумное время между INSERT и
+            // проверкой слота ниже: если барьер таймера всё-таки сработает
+            // в этом окне, тест ничего не докажет о ветке завершения.
+            "--ack-interval-ms",
+            "10000",
+        ])
+        .spawn()
+        .expect("запустить бинарь");
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    // Позиция WAL сразу после коммита — нижняя граница того, что процесс
+    // обязан будет подтвердить слоту, когда всё-таки подтвердит эту
+    // транзакцию (через периодический барьер или через барьер завершения).
+    let target: String = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let target = common::parse_lsn(&target).expect("распарсить LSN");
+
+    // Даём процессу время принять и разобрать строку (это быстро, целиком в
+    // памяти и в буфере писателя — не требует барьера), но заведомо меньше
+    // ack_interval_ms, так что периодическая ветка гарантированно не
+    // сработала ни разу к этому моменту.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let before_signal: String = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'pgcdc_slot'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let before_signal = common::parse_lsn(&before_signal).expect("распарсить LSN");
+    assert!(
+        before_signal < target,
+        "слот продвинулся до {target} ДО сигнала (сейчас {before_signal}) — периодический \
+         барьер успел сработать, тест не изолирует ветку завершения"
+    );
+
+    // SIGTERM: если барьер живёт в ветке завершения (как и должно быть),
+    // слот обязан подтвердить транзакцию уже ПОСЛЕ сигнала.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .unwrap()
+        .expect("wait");
+    assert_eq!(status.code(), Some(0), "штатная остановка даёт ноль");
+
+    let after_signal = common::wait_for_slot_at_least(&client, "pgcdc_slot", target).await;
+    assert!(
+        after_signal >= target,
+        "слот не подтвердил транзакцию после штатной остановки: {after_signal} < {target}"
+    );
+
+    let _ = std::fs::remove_file(&out);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
+    // Проверяет только то, что заявлено в имени: после реконнекта SIGTERM
+    // по-прежнему доводит процесс до штатного завершения с кодом 0.
+    //
+    // Round 2, F3: этот тест раньше претендовал на большее — что он ловит
+    // перенос `spawn_shutdown_listener()` внутрь цикла реконнекта (создание
+    // слушателя заново на каждую сессию). Это неверно: у
+    // `tokio::signal::unix::signal` и `ctrl_c()` доставка сигнала идёт
+    // КАЖДОМУ зарегистрированному слушателю данного вида, а не только
+    // последнему созданному, — так что даже слушатель, пересозданный
+    // заново на второй сессии, всё равно получил бы SIGTERM и тест остался
+    // бы зелёным независимо от места вызова. Слушатель по-прежнему живёт
+    // над внешним циклом (пересоздавать его на каждый реконнект — течь по
+    // задаче на сессию), но это тест на поведение (сигнал работает и после
+    // реконнекта), а не на размещение кода.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let out = std::env::temp_dir().join(format!(
+        "pgcdc-reconnect-sigterm-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&out);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+        .args([
+            "--database-url",
+            &conn,
+            "--publication",
+            "pgcdc_pub",
+            "--slot",
+            "pgcdc_slot",
+            "--output",
+            "file",
+            "--output-path",
+            out.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("запустить бинарь");
+
+    // Читаем stderr дочернего процесса построчно в фоновом потоке: нам
+    // нужно ДОКАЗАТЬ, что реконнект произошёл, до отправки сигнала, а не
+    // просто понадеяться на время. `postgres_connection_restored` логируется
+    // только на успешном повторном подключении (stream_once, review Task 2).
+    let stderr = child.stderr.take().expect("stderr был запрошен как piped");
+    let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lines_writer = lines.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            lines_writer.lock().unwrap().push(line);
+        }
+    });
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'before', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    // Ждём первую строку в файле — доказательство, что процесс дошёл до
+    // барьера на первой сессии.
+    let mut seen = false;
+    for _ in 0..200 {
+        if std::fs::read_to_string(&out)
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false)
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(seen, "первая строка не появилась в файле за 20 секунд");
+
+    // Обрываем репликационное соединение со стороны сервера — процесс
+    // обязан переподключиться сам (задача 2), а не упасть.
+    common::terminate_replication_backend(&client).await;
+
+    // Ждём лог восстановления соединения: без него ниже мы бы просто
+    // проверяли обычный сигнальный сценарий ещё раз, ничего не говоря про
+    // реконнект.
+    let mut reconnected = false;
+    for _ in 0..200 {
+        if lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("postgres_connection_restored"))
+        {
+            reconnected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        reconnected,
+        "не увидели лог восстановления соединения за 20 секунд, видели: {:?}",
+        lines.lock().unwrap()
+    );
+
+    // SIGTERM ПОСЛЕ реконнекта: если флаг живёт внутри цикла реконнекта, а
+    // не над ним, эта сессия его никогда не увидит, и wait() ниже провисит
+    // до убийства процесса тестовым раннером — что и требовалось доказать.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .unwrap()
+        .expect("wait");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "штатная остановка после реконнекта тоже обязана давать ноль"
+    );
+
+    let _ = std::fs::remove_file(&out);
+}
