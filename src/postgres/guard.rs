@@ -7,11 +7,16 @@ pub struct SlotInfo {
     pub confirmed_flush_lsn: Option<Lsn>,
 }
 
-/// Холодный старт. Проверка только существования: сравнивать
-/// `confirmed_flush_lsn` не с чем, персистентной durable-позиции у нас нет и
-/// не будет (DECISIONS Q4). Слот отсутствует — падаем, НЕ создаём: автосоздание
-/// маскирует потерю данных, и это измерено в docs/spike-findings.md §2.4.
-pub async fn preflight_cold_start(conn_str: &str, slot: &str) -> Result<SlotInfo, PgcdcError> {
+/// Guard слота: вызывается на КАЖДОЙ сессии репликации (`stream_once` в
+/// `replication.rs`) — и на холодном старте, и на каждом реконнекте, а не
+/// только один раз при первом запуске. Здесь проверяется только
+/// существование слота; на холодном старте сравнивать `confirmed_flush_lsn`
+/// не с чем — персистентной durable-позиции у нас нет и не будет (DECISIONS
+/// Q4), — а на реконнекте возвращённые отсюда позиции сверяет вызывающий
+/// через `check_reconnect`. Слот отсутствует — падаем, НЕ создаём:
+/// автосоздание маскирует потерю данных, и это измерено в
+/// docs/spike-findings.md §2.4.
+pub async fn preflight_slot(conn_str: &str, slot: &str) -> Result<SlotInfo, PgcdcError> {
     let (client, connection) = tokio_postgres::connect(conn_str, tokio_postgres::NoTls)
         .await
         .map_err(|e| PgcdcError::Connection(format!("preflight connect: {e}")))?;

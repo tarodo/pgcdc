@@ -183,16 +183,33 @@ pub async fn drop_slot_once_inactive(client: &tokio_postgres::Client, slot: &str
 /// Подписчик tracing, копящий текст поля `message` каждого события в общий
 /// буфер. Не использует `tracing-subscriber` — минимальная ручная реализация
 /// достаточна и не требует новой зависимости.
+///
+/// M8: буфер общий на весь тестовый бинарь (диспетчер tracing глобален для
+/// процесса), поэтому события ВСЕХ параллельно идущих тестов попадают в один
+/// список. Само по себе сообщение — например, `"postgres_connection_restored"`
+/// — не привязано к тесту, который его вызвал; если это же сообщение когда-
+/// нибудь начнёт логировать другой успешно реконнектящийся тест, совпадение
+/// по одному тексту станет случайным. Поэтому визитор также запоминает поле
+/// `slot`, когда оно есть у события (`info!(slot = %..., "сообщение")` — так
+/// залогированы и preflight, и старт, и восстановление соединения), и
+/// склеивает его с сообщением как `"сообщение slot=значение"` — вызывающий
+/// может сверять и то, и другое, а не полагаться на уникальность одного текста.
 struct CapturingSubscriber {
     events: Arc<Mutex<Vec<String>>>,
 }
 
-struct MessageVisitor(String);
+#[derive(Default)]
+struct MessageVisitor {
+    message: String,
+    slot: Option<String>,
+}
 
 impl tracing::field::Visit for MessageVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.0 = format!("{value:?}");
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "slot" => self.slot = Some(format!("{value:?}")),
+            _ => {}
         }
     }
 }
@@ -207,9 +224,13 @@ impl tracing::Subscriber for CapturingSubscriber {
     fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
-        let mut visitor = MessageVisitor(String::new());
+        let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);
-        self.events.lock().unwrap().push(visitor.0);
+        let combined = match visitor.slot {
+            Some(slot) => format!("{} slot={slot}", visitor.message),
+            None => visitor.message,
+        };
+        self.events.lock().unwrap().push(combined);
     }
     fn enter(&self, _span: &tracing::span::Id) {}
     fn exit(&self, _span: &tracing::span::Id) {}
@@ -237,6 +258,45 @@ pub fn capture_log_events() -> Arc<Mutex<Vec<String>>> {
             events
         })
         .clone()
+}
+
+/// Guard вокруг `std::process::Child`: убивает процесс при паде, если он ещё
+/// жив. `std::process::Child`, в отличие от `tokio::process::Child` с
+/// `kill_on_drop(true)`, ничего не делает при `Drop` — обычный дочерний
+/// процесс переживает свой хендл. Тесты убивают дочерний бинарь явно перед
+/// концом сценария, но между `spawn()` и этим явным `kill()` лежат `.await` и
+/// `unwrap()`/`assert!`, которые могут запаниковать раньше; без этого guard'а
+/// паника в середине теста осиротила бы процесс, который (теперь, когда он
+/// умеет ретраить реконнект бесконечно) продолжил бы долбиться в контейнер
+/// Postgres даже после того, как тот исчез вместе с тестом (M7).
+pub struct KillOnDrop(pub std::process::Child);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // `try_wait` первым делом: если тест уже сам дождался процесса
+        // (обычный путь), реаппинг уже случился, и слепой повторный
+        // `kill`/`wait` рисковал бы бить по чужому процессу, если ОС успела
+        // переиспользовать pid. Убиваем и дожидаемся только когда процесс
+        // подтверждённо ещё жив — именно тот случай, который и нужно
+        // прикрыть (паника до явного kill в тесте).
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
 /// PostgreSQL печатает позицию как две шестнадцатеричные половины через слэш.

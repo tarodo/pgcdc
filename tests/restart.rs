@@ -6,11 +6,18 @@ mod common;
 ///
 /// Убить процесс мы обязаны сразу после того, как слот ПОДТВЕРДИЛ позицию, а
 /// не после того, как строки стали видны в выходном файле. `FileSink` держит
-/// байты в `BufWriter` и отдаёт их ОС только внутри самого барьера
-/// durability — значит «строка видна в файле» уже означает «настоящий
-/// fsync честной ветки таймера успел отработать», и убийство после этого
-/// момента не может поймать мутацию задачи 4 (шаг 3: подтверждение позиции
-/// ДО барьера). Ждать надо ровно то, что эта мутация подделывает —
+/// байты в `BufWriter`, и в общем случае это НЕ значит, что он отдаёт их ОС
+/// только внутри барьера durability: `Drop` при обычном (не по SIGKILL)
+/// выходе процесса делает best-effort `flush()`, а сам `BufWriter` сбрасывает
+/// буфер самостоятельно, если тот заполнился до вызова барьера, — см.
+/// комментарий у `a_terminated_process_drains_before_the_periodic_barrier_would`
+/// в `tests/integration.rs`. Здесь оба исключения не работают: SIGKILL не
+/// запускает деструкторы, а объём этого теста (несколько строк JSON) далеко
+/// не заполняет `BufWriter` по умолчанию, чтобы тот сбросился сам, — значит
+/// именно здесь «строка видна в файле» всё же означает «настоящий fsync
+/// честной ветки таймера успел отработать», и убийство после этого момента
+/// не может поймать мутацию задачи 4 (шаг 3: подтверждение позиции ДО
+/// барьера). Ждать надо ровно то, что эта мутация подделывает —
 /// `confirmed_flush_lsn` слота, а не побочный эффект в файле.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_committed_row_is_lost_across_a_hard_restart() {
@@ -23,24 +30,26 @@ async fn no_committed_row_is_lost_across_a_hard_restart() {
     let _ = std::fs::remove_file(&out);
 
     let spawn = |path: &std::path::Path| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
-            .args([
-                "--database-url",
-                &conn,
-                "--publication",
-                "pgcdc_pub",
-                "--slot",
-                "pgcdc_slot",
-                "--output",
-                "file",
-                "--output-path",
-                path.to_str().unwrap(),
-                // Короткий барьер, чтобы тест не ждал долго.
-                "--ack-interval-ms",
-                "100",
-            ])
-            .spawn()
-            .expect("запустить бинарь")
+        common::KillOnDrop(
+            std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+                .args([
+                    "--database-url",
+                    &conn,
+                    "--publication",
+                    "pgcdc_pub",
+                    "--slot",
+                    "pgcdc_slot",
+                    "--output",
+                    "file",
+                    "--output-path",
+                    path.to_str().unwrap(),
+                    // Короткий барьер, чтобы тест не ждал долго.
+                    "--ack-interval-ms",
+                    "100",
+                ])
+                .spawn()
+                .expect("запустить бинарь"),
+        )
     };
 
     // Первый прогон: строки 1..5.

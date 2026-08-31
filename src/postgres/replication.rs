@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::error::PgcdcError;
 use crate::lsn::{Lsn, LsnTracker};
-use crate::postgres::guard::{check_reconnect, preflight_cold_start};
+use crate::postgres::guard::{check_reconnect, preflight_slot};
 use crate::postgres::pgoutput::decode;
 use crate::schema::RelationCache;
 use crate::sink::Sink;
@@ -84,10 +84,18 @@ pub(crate) enum SessionOutcome {
     ShutdownRequested,
 }
 
-/// Ставит флаг по SIGTERM или SIGINT. Флаг проверяется в начале каждого прохода
-/// цикла; поскольку чтение и так ограничено по времени, задержка реакции не
-/// превышает `ack_interval`. Это проще, чем городить select вокруг чтения, и
-/// не трогает порядок операций, проверенный мутационно.
+/// Ставит флаг по SIGTERM или SIGINT. Флаг читается в двух местах, и оба
+/// ограничены одной и той же величиной — `SHUTDOWN_POLL_INTERVAL`, а не
+/// `ack_interval_ms` (тот управляет только расписанием барьера) и не длиной
+/// паузы реконнекта: внутри сессии им ограничено само чтение
+/// (`stream_once`); во внешнем цикле (`run`) флаг читается в начале каждого
+/// прохода, а пауза бэкоффа между попытками нарезана на куски того же
+/// размера вместо одного длинного `sleep` — иначе сигнал, пришедший
+/// посреди паузы длиной до `reconnect_max_ms`, был бы замечен только по её
+/// истечении (I1: без этого сигнал во время ретраев на недостижимой БД не
+/// замечался вовсе, поскольку preflight внутри сессионного цикла проваливался
+/// раньше первой проверки флага). Это проще, чем городить select вокруг
+/// чтения, и не трогает порядок операций, проверенный мутационно.
 fn spawn_shutdown_listener() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     let f = flag.clone();
@@ -185,6 +193,12 @@ async fn acknowledge_durable(
     stream: &mut LogicalReplicationStream,
     durable: Lsn,
 ) -> Result<Lsn, PgcdcError> {
+    // Порядок держит инвариант 1 в этой точке вызова по построению:
+    // `note_durable` только что подняла durable как минимум до `durable`,
+    // так что `try_ack(durable)` ниже отказать здесь не может — guard
+    // внутри `try_ack` не выполняет живую работу на ЭТОМ пути. Он остаётся
+    // защитой не для этого места, а для будущего вызывающего, который
+    // позовёт `try_ack`, пропустив отметку durable.
     state.tracker.note_durable(durable);
     state.tracker.try_ack(durable)?;
     let acked = state.tracker.acked();
@@ -239,6 +253,18 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
     let shutdown = spawn_shutdown_listener();
 
     loop {
+        // I1: единственное место, где внешний цикл реконнекта вообще
+        // смотрит на флаг завершения. Без этой проверки сигнал, пришедший
+        // пока БД недостижима, не был бы замечен никогда: `stream_once`
+        // валится на preflight раньше, чем доходит до собственной проверки
+        // флага внутри сессии, — а обёртывающий цикл до сих пор его не
+        // читал вовсе. Здесь нет ни сессии, ни данных, которые sink принял
+        // бы и не довёл до барьера, — доводить до барьера нечего, поэтому
+        // выход с успехом корректен без единого вызова flush_and_acknowledge.
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
         let acked_before = state.tracker.acked();
 
         match stream_once(&config, &mut sink, &mut state, &shutdown).await {
@@ -267,7 +293,22 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
             backoff_ms = delay.as_millis() as u64,
             "reconnecting"
         );
-        tokio::time::sleep(delay).await;
+
+        // I1: пауза нарезана на куски по SHUTDOWN_POLL_INTERVAL вместо
+        // одного sleep(delay) — иначе сигнал, пришедший посреди паузы
+        // длиной вплоть до reconnect_max_ms (по умолчанию 30с), был бы
+        // замечен только по её истечении. Как и сама проверка выше, эта
+        // пауза не хранит ничего, что нужно было бы довести до барьера, —
+        // выход посреди неё с успехом корректен.
+        let mut remaining = delay;
+        while remaining > Duration::ZERO {
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let chunk = remaining.min(SHUTDOWN_POLL_INTERVAL);
+            tokio::time::sleep(chunk).await;
+            remaining = remaining.saturating_sub(chunk);
+        }
 
         // Кэш и сборщик сбрасываются, позиции переносятся.
         state.reset_for_reconnect();
@@ -304,7 +345,7 @@ async fn stream_once(
     // Обязательство Q25(а): guard ДО start(), потому что start() безусловно
     // зовёт ensure_replication_slot() и при отсутствующем слоте молча создаст
     // новый на текущей позиции WAL, потеряв всё закоммиченное раньше.
-    let info_slot = preflight_cold_start(config.database_url.expose(), &config.slot).await?;
+    let info_slot = preflight_slot(config.database_url.expose(), &config.slot).await?;
     info!(
         slot = %config.slot,
         restart_lsn = ?info_slot.restart_lsn.map(|l| l.to_string()),
@@ -317,7 +358,9 @@ async fn stream_once(
     // стоит. Слот ВПЕРЁД нашей durable-точки означает, что кто-то подтвердил
     // WAL, который мы не довели до sink, — падаем. Слот ПОЗАДИ — ожидаемый
     // исход обрыва: последний feedback мог не дойти. Пишем предупреждение и
-    // продолжаем, промежуток перечитается дубликатами (DECISIONS R11 этапа 0).
+    // продолжаем, промежуток перечитается дубликатами — это разрешает
+    // инвариант 2 (DECISIONS §1) вместе со строкой транспортных
+    // обязательств спайка (DECISIONS Q25).
     if reconnecting {
         if let Some(warning) = check_reconnect(&config.slot, &info_slot, state.durable())? {
             warn!("{warning}");

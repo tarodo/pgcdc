@@ -99,6 +99,131 @@ fn config(conn: &str) -> Config {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn reconnect_bounds_above_the_ceiling_fail_before_any_connection() {
+    // M6: `validate_reconnect_bounds()` было добавлено в `run()` в прошлом
+    // раунде, но без теста, бьющего именно по вызову внутри `run()`, — сам
+    // по себе вызов можно было бы стереть, и весь набор остался бы зелёным
+    // (юнит-тесты в `config.rs` проверяют только сам метод в изоляции). Проверка
+    // стоит ДО preflight и до всякого подключения, поэтому контейнер не нужен
+    // вовсе: адрес ниже никогда не будет резолвиться или использоваться, если
+    // вызов на месте.
+    let mut cfg = config("postgres://u:p@127.0.0.1:1/db");
+    cfg.reconnect_initial_ms = 5000;
+    cfg.reconnect_max_ms = 1000;
+
+    // Если вызов удалить, run() уйдёт в preflight на недостижимый адрес и
+    // будет ретраить внутри таймаута ниже — таймаут истечёт, и `expect`
+    // запаникует: мутация ловится, а не проходит незамеченной.
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        pgcdc::postgres::replication::run(cfg, Box::new(FailingSink)),
+    )
+    .await
+    .expect("проверка границ обязана вернуть ошибку немедленно, не дожидаясь сети")
+    .unwrap_err();
+    assert!(
+        matches!(err, PgcdcError::InvalidReconnectBounds { .. }),
+        "получили {err:?}"
+    );
+    assert!(err.is_fatal());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
+    // I1: раньше сигнал, пришедший пока БД недостижима, не замечался вовсе —
+    // ни внешний цикл реконнекта не читал флаг завершения, ни пауза бэкоффа
+    // не была прерываемой. Ревьюер воспроизвёл это вживую: бинарь на мёртвом
+    // порту, SIGTERM, жив ещё пять секунд спустя, и только SIGKILL что-то
+    // менял. Порт 1 никогда не слушает ни на одной обычной машине, поэтому
+    // preflight будет валиться немедленно и предсказуемо — контейнер
+    // Postgres здесь не нужен вовсе.
+    let mut child = common::KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+            .args([
+                "--database-url",
+                "postgres://u:p@127.0.0.1:1/db",
+                "--publication",
+                "pgcdc_pub",
+                "--slot",
+                "pgcdc_slot",
+                // Короткие и близкие друг к другу границы бэкоффа: несколько
+                // попыток реконнекта укладываются в секунды, а не в полминуты
+                // потолка по умолчанию.
+                "--reconnect-initial-ms",
+                "50",
+                "--reconnect-max-ms",
+                "200",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("запустить бинарь"),
+    );
+
+    let stderr = child.stderr.take().expect("stderr был запрошен как piped");
+    let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lines_writer = lines.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            lines_writer.lock().unwrap().push(line);
+        }
+    });
+
+    // Доказательство, а не догадка: ждём минимум ДВЕ строки "reconnecting" —
+    // одна доказывала бы только первую попытку, две доказывают, что процесс
+    // реально зациклился, а не просто попробовал и остановился.
+    let mut retries_seen = 0usize;
+    for _ in 0..200 {
+        retries_seen = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains("reconnecting"))
+            .count();
+        if retries_seen >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        retries_seen >= 2,
+        "не увидели минимум два ретрая за 10 секунд, видели: {:?}",
+        lines.lock().unwrap()
+    );
+
+    // SIGTERM посреди бесконечного ретрая на мёртвом порту: буферизованных
+    // данных на этом пути нет — сессия так ни разу и не открылась, — поэтому
+    // единственно верный исход - быстрый выход с кодом 0, а не зависание до
+    // SIGKILL.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+
+    // Опрос через try_wait(), а не блокирующий wait() внутри spawn_blocking:
+    // если этот тест ловит регресс I1 и процесс НЕ реагирует на SIGTERM,
+    // блокирующий wait() повис бы навсегда, а Drop рантайма tokio ждёт
+    // завершения именно blocking-задач — тест повесил бы весь тестовый
+    // бинарь вместо того, чтобы просто покраснеть. try_wait() поток не
+    // блокирует, так что таймаут ниже отрабатывает в обоих случаях.
+    let mut status = None;
+    for _ in 0..100 {
+        if let Ok(Some(s)) = child.try_wait() {
+            status = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let status =
+        status.expect("SIGTERM обязан остановить процесс за 5 секунд, а не только SIGKILL");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "нечего было доводить до барьера — реконнект на недостижимой БД обязан завершаться нулём"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn insert_travels_end_to_end_and_arrives_as_one_event() {
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
@@ -730,10 +855,18 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
-    common::create_slot(&client, "pgcdc_slot").await;
+    // M8: имя слота здесь уникально для этого теста, а не общее "pgcdc_slot",
+    // которым пользуется большинство соседей, — `log_events` копит сообщения
+    // ВСЕХ параллельно идущих тестов в одном процессе (общий глобальный
+    // буфер), и без уникального маркера в самом сообщении совпадение по
+    // тексту "postgres_connection_restored" ниже стало бы случайным поводом,
+    // а не доказательством, что реконнект произошёл именно здесь.
+    let slot = "pgcdc_slot_recover_no_loss";
+    common::create_slot(&client, slot).await;
 
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
-    let cfg = config(&conn);
+    let mut cfg = config(&conn);
+    cfg.slot = slot.into();
     let handle = tokio::spawn(async move {
         pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
     });
@@ -763,7 +896,7 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
     // первого flush, `state.durable()` останется нулём, is_reconnect()
     // никогда не станет true, и весь блок проверки реконнекта останется
     // непройденным этим тестом — ровно риск из review Task 2, round 1, F3.
-    common::wait_for_slot_at_least(&client, "pgcdc_slot", first.end_lsn).await;
+    common::wait_for_slot_at_least(&client, slot, first.end_lsn).await;
 
     // Сервер обрывает наше репликационное соединение.
     common::terminate_replication_backend(&client).await;
@@ -800,20 +933,25 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
     // выполнился и recovery действительно залогирован, а не просто
     // "строка как-то приехала". Удаление всего блока проверки реконнекта
     // не тронуло бы ни одно из предыдущих утверждений в этом тесте.
+    //
+    // M8: сообщение обязано нести ИМЕННО наш `slot` — `log_events` общий на
+    // весь тестовый бинарь, и другой тест, доживший до успешного реконнекта,
+    // залогировал бы то же сообщение с ДРУГИМ именем слота. Сегодня
+    // единственный сосед-реконнект (`a_slot_advanced_past_our_durable_position_is_fatal_on_reconnect`)
+    // падает на check_reconnect раньше этого лога, так что без маркера
+    // совпадение по одному тексту сообщения ещё было бы (случайно) верным;
+    // с маркером оно перестаёт зависеть от этой хрупкой предпосылки.
+    let expected_log = format!("postgres_connection_restored slot={slot}");
     assert!(
-        log_events
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|m| m == "postgres_connection_restored"),
-        "событие восстановления соединения не залогировано"
+        log_events.lock().unwrap().contains(&expected_log),
+        "событие восстановления соединения не залогировано для слота {slot}"
     );
 
     // F4: слот, пропавший во время обрыва, обязан быть фатальным немедленно,
     // а не ретраиться бесконечно — иначе процесс сидел бы в цикле реконнекта,
     // пока данные, которые он должен был захватить, не состарились в WAL.
     common::terminate_replication_backend(&client).await;
-    common::drop_slot_once_inactive(&client, "pgcdc_slot").await;
+    common::drop_slot_once_inactive(&client, slot).await;
 
     let result = tokio::time::timeout(Duration::from_secs(20), handle)
         .await
@@ -915,17 +1053,19 @@ async fn file_output_binary_writes_durable_json_lines() {
     path.push(format!("pgcdc-integration-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
-        .env("PGCDC_DATABASE_URL", &conn)
-        .env("PGCDC_PUBLICATION", "pgcdc_pub")
-        .env("PGCDC_SLOT", "pgcdc_slot")
-        .env("PGCDC_OUTPUT", "file")
-        .env("PGCDC_OUTPUT_PATH", &path)
-        .env("PGCDC_ACK_INTERVAL_MS", "50")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("запустить бинарь");
+    let mut child = common::KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+            .env("PGCDC_DATABASE_URL", &conn)
+            .env("PGCDC_PUBLICATION", "pgcdc_pub")
+            .env("PGCDC_SLOT", "pgcdc_slot")
+            .env("PGCDC_OUTPUT", "file")
+            .env("PGCDC_OUTPUT_PATH", &path)
+            .env("PGCDC_ACK_INTERVAL_MS", "50")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("запустить бинарь"),
+    );
 
     client
         .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
@@ -974,21 +1114,23 @@ async fn a_terminated_process_exits_zero_after_draining() {
     let out = std::env::temp_dir().join(format!("pgcdc-sigterm-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&out);
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
-        .args([
-            "--database-url",
-            &conn,
-            "--publication",
-            "pgcdc_pub",
-            "--slot",
-            "pgcdc_slot",
-            "--output",
-            "file",
-            "--output-path",
-            out.to_str().unwrap(),
-        ])
-        .spawn()
-        .expect("запустить бинарь");
+    let mut child = common::KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+            .args([
+                "--database-url",
+                &conn,
+                "--publication",
+                "pgcdc_pub",
+                "--slot",
+                "pgcdc_slot",
+                "--output",
+                "file",
+                "--output-path",
+                out.to_str().unwrap(),
+            ])
+            .spawn()
+            .expect("запустить бинарь"),
+    );
 
     client
         .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
@@ -1129,32 +1271,34 @@ async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
     ));
     let _ = std::fs::remove_file(&out);
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
-        .args([
-            "--database-url",
-            &conn,
-            "--publication",
-            "pgcdc_pub",
-            "--slot",
-            "pgcdc_slot",
-            "--output",
-            "file",
-            "--output-path",
-            out.to_str().unwrap(),
-            // На порядок больше, чем время до сигнала ниже: если барьер
-            // таймера всё-таки сработает в этом окне, тест ничего не
-            // докажет о ветке завершения.
-            "--ack-interval-ms",
-            "10000",
-        ])
-        // debug — чтобы увидеть transaction_accepted (логируется на этом
-        // уровне сразу после приёма транзакции sink'ом); pg_walstream
-        // приглушён отдельно, чтобы не тонуть в его собственном debug-шуме.
-        .env("RUST_LOG", "pgcdc=debug,pg_walstream=warn")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("запустить бинарь");
+    let mut child = common::KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+            .args([
+                "--database-url",
+                &conn,
+                "--publication",
+                "pgcdc_pub",
+                "--slot",
+                "pgcdc_slot",
+                "--output",
+                "file",
+                "--output-path",
+                out.to_str().unwrap(),
+                // На порядок больше, чем время до сигнала ниже: если барьер
+                // таймера всё-таки сработает в этом окне, тест ничего не
+                // докажет о ветке завершения.
+                "--ack-interval-ms",
+                "10000",
+            ])
+            // debug — чтобы увидеть transaction_accepted (логируется на этом
+            // уровне сразу после приёма транзакции sink'ом); pg_walstream
+            // приглушён отдельно, чтобы не тонуть в его собственном debug-шуме.
+            .env("RUST_LOG", "pgcdc=debug,pg_walstream=warn")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("запустить бинарь"),
+    );
 
     let stderr = child.stderr.take().expect("stderr был запрошен как piped");
     let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
@@ -1264,23 +1408,25 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
     ));
     let _ = std::fs::remove_file(&out);
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
-        .args([
-            "--database-url",
-            &conn,
-            "--publication",
-            "pgcdc_pub",
-            "--slot",
-            "pgcdc_slot",
-            "--output",
-            "file",
-            "--output-path",
-            out.to_str().unwrap(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("запустить бинарь");
+    let mut child = common::KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+            .args([
+                "--database-url",
+                &conn,
+                "--publication",
+                "pgcdc_pub",
+                "--slot",
+                "pgcdc_slot",
+                "--output",
+                "file",
+                "--output-path",
+                out.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("запустить бинарь"),
+    );
 
     // Читаем stderr дочернего процесса построчно в фоновом потоке: нам
     // нужно ДОКАЗАТЬ, что реконнект произошёл, до отправки сигнала, а не
