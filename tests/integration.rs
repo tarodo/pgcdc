@@ -152,7 +152,7 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
                 "--reconnect-initial-ms",
                 "50",
                 "--reconnect-max-ms",
-                "200",
+                "3000",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -172,9 +172,14 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
         }
     });
 
-    // Доказательство, а не догадка: ждём минимум ДВЕ строки "reconnecting" —
-    // одна доказывала бы только первую попытку, две доказывают, что процесс
-    // реально зациклился, а не просто попробовал и остановился.
+    // Доказательство, а не догадка: ждём, пока бэкофф не долезет до потолка
+    // (50 → 100 → 200 → 400 → 800 → 1600 → 3000 — семь строк "reconnecting").
+    // Раньше порог был "минимум две", но при потолке, равном интервалу опроса
+    // (200мс), пауза этого размера всегда укладывается в один кусок нарезки —
+    // нарезанная и цельная паузы неотличимы. Проверка ниже обязана застать
+    // СИГНАЛ ровно тогда, когда в работе паузa вплоть до потолка (3000мс,
+    // что в разы больше SHUTDOWN_POLL_INTERVAL) — только так тест различает
+    // нарезку и цельный sleep(delay) (round 1 стадии 5, F1).
     let mut retries_seen = 0usize;
     for _ in 0..200 {
         retries_seen = lines
@@ -183,14 +188,14 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
             .iter()
             .filter(|l| l.contains("reconnecting"))
             .count();
-        if retries_seen >= 2 {
+        if retries_seen >= 7 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        retries_seen >= 2,
-        "не увидели минимум два ретрая за 10 секунд, видели: {:?}",
+        retries_seen >= 7,
+        "не увидели семь ретраев (бэкофф до потолка) за 10 секунд, видели: {:?}",
         lines.lock().unwrap()
     );
 
@@ -206,8 +211,15 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
     // завершения именно blocking-задач — тест повесил бы весь тестовый
     // бинарь вместо того, чтобы просто покраснеть. try_wait() поток не
     // блокирует, так что таймаут ниже отрабатывает в обоих случаях.
+    //
+    // Бюджет — 1.5с, а не прежние 5с: сигнал только что застал паузу
+    // длиной вплоть до 3000мс в работе. Нарезанная пауза замечает флаг не
+    // позже чем через SHUTDOWN_POLL_INTERVAL (200мс) — 1.5с оставляют ей
+    // щедрый запас; а вот цельный sleep(delay) обязан продержать процесс
+    // почти все оставшиеся ~3с и в этот бюджет не уложится — иначе смысла
+    // в его сужении нет, тест снова не отличит нарезку от целого sleep.
     let mut status = None;
-    for _ in 0..100 {
+    for _ in 0..30 {
         if let Ok(Some(s)) = child.try_wait() {
             status = Some(s);
             break;
@@ -215,7 +227,7 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let status =
-        status.expect("SIGTERM обязан остановить процесс за 5 секунд, а не только SIGKILL");
+        status.expect("SIGTERM обязан остановить процесс за 1.5 секунды, а не только SIGKILL");
     assert_eq!(
         status.code(),
         Some(0),
@@ -1502,6 +1514,61 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
         Some(0),
         "штатная остановка после реконнекта тоже обязана давать ноль"
     );
+
+    let _ = std::fs::remove_file(&out);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sigint_also_stops_the_process_cleanly() {
+    // Чек-лист заявляет обработку SIGINT наравне с SIGTERM, но теста на неё
+    // не было; SIGTERM закрыт отдельным тестом, а SIGINT до сих пор держался
+    // только на том, что слушатель объединяет оба сигнала в один select.
+    // Проверяем, что объединение работает.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let out = std::env::temp_dir().join(format!("pgcdc-sigint-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+
+    let mut child = common::KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+            .args([
+                "--database-url",
+                &conn,
+                "--publication",
+                "pgcdc_pub",
+                "--slot",
+                "pgcdc_slot",
+                "--output",
+                "file",
+                "--output-path",
+                out.to_str().unwrap(),
+            ])
+            .spawn()
+            .expect("запустить бинарь"),
+    );
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    let target: String = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let target = common::parse_lsn(&target).expect("распарсить LSN");
+    common::wait_for_slot_at_least(&client, "pgcdc_slot", target).await;
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .unwrap()
+        .expect("wait");
+    assert_eq!(status.code(), Some(0), "SIGINT тоже даёт ноль");
 
     let _ = std::fs::remove_file(&out);
 }
