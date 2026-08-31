@@ -1099,6 +1099,25 @@ async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
     // `Drop`, только один — `confirmed_flush_lsn` слота на сервере: он
     // продвигается исключительно вызовом `send_feedback`, а тот в ветке
     // завершения происходит только внутри `flush_and_acknowledge`.
+    //
+    // Round 3, F1: раньше вместо ожидания доказательства здесь стоял
+    // фиксированный `sleep`. Ревьюер вскрыл настоящую причину флейка: при
+    // 150мс дочерний процесс ещё не успевал даже установить обработчик
+    // сигнала, при 700мс проходило впритык (~0.4с запаса) — под двадцатью
+    // параллельными контейнерами такого бюджета не хватает, и SIGTERM
+    // уходит ДО того, как транзакция вообще была принята и разобрана. В
+    // этом случае барьеру просто нечего флашить, и слот не двигается — та
+    // же сигнатура отказа, что и у мутации, убирающей вызов барьера из
+    // ветки завершения, но по другой причине. Часы заменены на
+    // доказательство: пишем stderr дочернего процесса под debug-логами и
+    // ждём строку `transaction_accepted` — она логируется сразу после
+    // `sink.write_transaction`, то есть до всякого барьера, и означает,
+    // что транзакция гарантированно лежит в sink'е и барьеру будет что
+    // флашить. SIGTERM уходит только после этого. Проверка ниже
+    // (`before_signal < target`) не ослаблена ей в пару: если бы мы
+    // прождали ещё дольше — вплоть до срабатывания периодического барьера
+    // — она бы упала сама, доказывая, что тест перестал изолировать ветку
+    // завершения.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1122,14 +1141,32 @@ async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
             "file",
             "--output-path",
             out.to_str().unwrap(),
-            // На порядок больше, чем любое разумное время между INSERT и
-            // проверкой слота ниже: если барьер таймера всё-таки сработает
-            // в этом окне, тест ничего не докажет о ветке завершения.
+            // На порядок больше, чем время до сигнала ниже: если барьер
+            // таймера всё-таки сработает в этом окне, тест ничего не
+            // докажет о ветке завершения.
             "--ack-interval-ms",
             "10000",
         ])
+        // debug — чтобы увидеть transaction_accepted (логируется на этом
+        // уровне сразу после приёма транзакции sink'ом); pg_walstream
+        // приглушён отдельно, чтобы не тонуть в его собственном debug-шуме.
+        .env("RUST_LOG", "pgcdc=debug,pg_walstream=warn")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("запустить бинарь");
+
+    let stderr = child.stderr.take().expect("stderr был запрошен как piped");
+    let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lines_writer = lines.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            lines_writer.lock().unwrap().push(line);
+        }
+    });
 
     client
         .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
@@ -1146,11 +1183,26 @@ async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
         .get(0);
     let target = common::parse_lsn(&target).expect("распарсить LSN");
 
-    // Даём процессу время принять и разобрать строку (это быстро, целиком в
-    // памяти и в буфере писателя — не требует барьера), но заведомо меньше
-    // ack_interval_ms, так что периодическая ветка гарантированно не
-    // сработала ни разу к этому моменту.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Ждём доказательство, а не время: `transaction_accepted` означает,
+    // что транзакция уже принята sink'ом и лежит там, ожидая барьера.
+    let mut accepted = false;
+    for _ in 0..200 {
+        if lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("transaction_accepted"))
+        {
+            accepted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        accepted,
+        "не увидели transaction_accepted за 20 секунд, видели: {:?}",
+        lines.lock().unwrap()
+    );
 
     let before_signal: String = client
         .query_one(
@@ -1292,9 +1344,8 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
         lines.lock().unwrap()
     );
 
-    // SIGTERM ПОСЛЕ реконнекта: если флаг живёт внутри цикла реконнекта, а
-    // не над ним, эта сессия его никогда не увидит, и wait() ниже провисит
-    // до убийства процесса тестовым раннером — что и требовалось доказать.
+    // SIGTERM ПОСЛЕ реконнекта: см. комментарий над функцией — это тест на
+    // поведение (сигнал по-прежнему работает), а не на размещение кода.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let status = tokio::task::spawn_blocking(move || child.wait())
         .await
