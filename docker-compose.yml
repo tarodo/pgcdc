@@ -23,3 +23,22 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+
+  # Демо-профиль: не запускается обычным `docker compose up -d`, только
+  # `docker compose --profile demo up -d pgcdc`. Слот и публикация уже
+  # существуют к моменту старта — их создаёт docker/init.sql при первом
+  # старте postgres, до того как этот сервис вообще получает шанс
+  # подключиться. Это принципиально: если бы слота не было, крейт молча
+  # создал бы его на текущей позиции WAL, и события, зафиксированные до
+  # старта pgcdc, не пришли бы (docs/spike-findings.md).
+  pgcdc:
+    profiles: ["demo"]
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGCDC_DATABASE_URL: postgres://postgres:postgres@postgres:5432/app
+      PGCDC_PUBLICATION: pgcdc_pub
+      PGCDC_SLOT: pgcdc_slot
+      PGCDC_OUTPUT: stdout

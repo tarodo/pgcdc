@@ -25,6 +25,16 @@ SIGTERM/SIGINT — принятое доводится до барьера, по
 
 ## Демо
 
+Два равноценных способа запустить движок против demo-базы: с хоста через `cargo run`
+(удобно при разработке) или целиком в Docker через профиль `demo` (показывает готовый
+образ). Оба используют один и тот же `docker/init.sql`: слот `pgcdc_slot` и публикация
+`pgcdc_pub` создаются при первом старте контейнера `postgres`, **до** того как pgcdc
+вообще пытается подключиться. Это не второстепенная деталь: если слота ещё нет, крейт
+транспорта молча создаст его на текущей позиции WAL, и все события, зафиксированные до
+этого момента, никогда не придут — см. `docs/spike-findings.md`.
+
+### Вариант A: `cargo run` с хоста
+
 ```bash
 docker compose up -d --wait
 
@@ -41,19 +51,48 @@ cargo run -- \
 INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', NULL);
 ```
 
-Ожидаемый вывод:
+Демо использует фиксированный первичный ключ (`id = 1`), поэтому повторный запуск нужно
+предварять `docker compose down -v` — иначе `INSERT` упадёт на дубликате ключа.
 
-```json
-{"schema":"public","table":"users","operation":"insert","before":null,"before_kind":null,"after":{"id":"1","name":"Alice","email":"alice@example.com","bio":null},"unchanged_columns":[],"transaction_id":737,"lsn":"0/192FFC0","commit_lsn":"0/19300D0","commit_timestamp":"2026-08-30T16:42:31.314489Z"}
+### Вариант B: профиль `demo` в Docker Compose
+
+Обычный `docker compose up -d` поднимает только `postgres` — сервис pgcdc скрыт за
+профилем `demo` и запускается только явно:
+
+```bash
+docker compose down -v
+docker compose up -d --wait
+docker compose --profile demo build
+docker compose --profile demo up -d pgcdc
 ```
 
-Значения `transaction_id`, `lsn`, `commit_lsn` и `commit_timestamp` здесь — из
-захваченной фикстуры; у вас на реальном прогоне они будут другими. Демо использует
-фиксированный первичный ключ (`id = 1`), поэтому повторный запуск нужно предварять
-`docker compose down -v` — иначе `INSERT` упадёт на дубликате ключа.
+Затем из другого терминала:
 
-Логи идут в stderr, полезная нагрузка — в stdout, поэтому вывод можно безопасно
-направлять в конвейер.
+```bash
+export PGPASSWORD=postgres
+psql -h 127.0.0.1 -U postgres -d app -c "INSERT INTO users VALUES (1,'Alice','alice@example.com',NULL);"
+psql -h 127.0.0.1 -U postgres -d app -c "UPDATE users SET name='Bob' WHERE id=1;"
+psql -h 127.0.0.1 -U postgres -d app -c "DELETE FROM users WHERE id=1;"
+```
+
+Фактический вывод (`docker compose logs pgcdc`) с реального прогона — три строки JSON на
+stdout, вставка/обновление/удаление, и структурные строки на stderr вокруг них:
+
+```json
+{"schema":"public","table":"users","operation":"insert","before":null,"before_kind":null,"after":{"id":"1","name":"Alice","email":"alice@example.com","bio":null},"unchanged_columns":[],"transaction_id":748,"lsn":"0/1973EE8","commit_lsn":"0/1973FE0","commit_timestamp":"2026-08-31T09:12:26.946113Z"}
+{"schema":"public","table":"users","operation":"update","before":{"id":"1","name":"Alice","email":"alice@example.com","bio":null},"before_kind":"full","after":{"id":"1","name":"Bob","email":"alice@example.com","bio":null},"unchanged_columns":[],"transaction_id":749,"lsn":"0/1974028","commit_lsn":"0/19740B0","commit_timestamp":"2026-08-31T09:12:26.973402Z"}
+{"schema":"public","table":"users","operation":"delete","before":{"id":"1","name":"Bob","email":"alice@example.com","bio":null},"before_kind":"full","after":null,"unchanged_columns":[],"transaction_id":750,"lsn":"0/19740E0","commit_lsn":"0/1974140","commit_timestamp":"2026-08-31T09:12:26.997366Z"}
+```
+
+Значения `transaction_id`, `lsn`, `commit_lsn` и `commit_timestamp` у вас на реальном
+прогоне будут другими. Уберите за собой:
+
+```bash
+docker compose --profile demo down -v
+```
+
+Логи идут в stderr, полезная нагрузка — в stdout, поэтому вывод контейнера или процесса
+можно безопасно направлять в конвейер без фильтрации.
 
 ## Гарантии
 
@@ -89,6 +128,42 @@ SIGKILL) возможны дубликаты вокруг границы пад�
 восстановление опирается только на него, а не на то, что успел сделать умирающий
 процесс. Это проверяется тестом
 `no_committed_row_is_lost_across_a_hard_restart` (`tests/restart.rs`).
+
+## Наблюдаемость
+
+Процесс ведёт восемь счётчиков (`src/metrics.rs`, `struct Metrics`, всё на `AtomicU64`,
+без внешнего фасада вроде `metrics-rs` — см. DECISIONS Q23):
+
+| Счётчик | Что значит |
+|---|---|
+| `events_total` | сколько изменений строк отдано в sink (по коммиту транзакции) |
+| `transactions_total` | сколько транзакций закоммичено и отдано в sink |
+| `bytes_received_total` | сколько байт сырых `XLogData`-кадров принято по сети |
+| `reconnects_total` | сколько раз запускался цикл переподключения после обрыва |
+| `errors_total` | сколько восстановимых ошибок соединения перехвачено |
+| `last_received_lsn` | последний принятый WAL LSN (монотонно, не откатывается назад) |
+| `last_acknowledged_lsn` | последний ПОДТВЕРЖДЁННЫЙ Postgres LSN — записывается ровно в одном месте, сразу после барьера durability, и наблюдает наше собственное решение, а не позицию слота |
+| `transaction_buffer_size` | сколько изменений накоплено в открытой, ещё не закоммиченной транзакции — датчик, а не позиция: обязан падать до нуля на коммите и на реконнекте |
+
+Сводная строка со всеми восемью значениями выходит на уровне **INFO** раз в десять
+секунд (`metrics_report`, событие `METRICS_REPORT_INTERVAL` в
+`src/postgres/replication.rs`) — не конфигурируется, это громкость, а не поведение.
+Пример:
+
+```text
+INFO pgcdc::postgres::replication: metrics_report events=3 transactions=3 bytes=395 reconnects=0 errors=0 last_received_lsn=0/1974170 last_acknowledged_lsn=0/19741A8 buffer=0
+```
+
+Пособытийные строки (`transaction_accepted`, `group_acknowledged`,
+`advanced_from_keepalive`) идут на уровне **DEBUG** — на потоке с тысячами транзакций
+в секунду строка на каждую транзакцию сделала бы лог и узким местом, и мусором
+(DECISIONS Q23; правка к §16 базовой спеки). Включаются через `RUST_LOG=debug` или
+`RUST_LOG=pgcdc=debug`.
+
+**Полезная нагрузка строк — содержимое колонок `before`/`after` — нигде в логах не
+появляется.** Счётчики и позиции логировать можно, содержимое данных — нет (§16
+базовой спеки). Это касается и сводной строки, и пособытийных: обе несут только
+числа, LSN и идентификаторы транзакций.
 
 ## Документация
 
