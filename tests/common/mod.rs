@@ -141,6 +141,33 @@ pub async fn terminate_replication_backend(client: &tokio_postgres::Client) {
         .expect("terminate walsender");
 }
 
+/// Ждёт, пока слот не станет активным — то есть walsender только что
+/// запущенного процесса действительно подключился. Обрыв, посланный раньше
+/// этого момента, никого не находит и молча ничего не делает: запрос
+/// `terminate_replication_backend` фильтрует по `backend_type = 'walsender'`,
+/// а между `spawn()` бинаря и первым `START_REPLICATION` реально проходит
+/// заметное время (разбор аргументов, установление TCP, preflight-запрос) —
+/// не единицы миллисекунд, за которые тестовый код успевает вызвать обрыв.
+/// Без этой синхронизации в сценарии из двух обрывов первый обрыв пропадает
+/// впустую, и весь тест видит только одну серию бэкоффа вместо двух.
+pub async fn wait_until_slot_active(client: &tokio_postgres::Client, slot: &str) {
+    for _ in 0..100 {
+        let row = client
+            .query_one(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .expect("query slot");
+        let active: bool = row.get(0);
+        if active {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("слот {slot} не стал активным за 5 секунд");
+}
+
 /// Ждёт, пока слот не перестанет числиться активным (то есть walsender
 /// действительно отключился) — нужно перед `pg_replication_slot_advance`,
 /// которая на активном слоте отказывает.
@@ -296,6 +323,85 @@ impl Drop for KillOnDrop {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+}
+
+/// Порождает бинарь с перехваченным stderr, обёрнутый в существующий страж,
+/// чтобы падение теста не оставило процесс, который будет вечно
+/// переподключаться уже после того, как контейнер исчезнет.
+pub fn spawn_with_stderr(args: &[&str]) -> KillOnDrop {
+    KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+            .args(args)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("запустить бинарь"),
+    )
+}
+
+/// Вырезает ANSI-последовательности вида `ESC [ ... <буква>` (SGR-коды
+/// цвета/стиля). `tracing_subscriber::fmt()` без явного `.with_ansi(false)`
+/// красит вывод БЕЗУСЛОВНО, даже когда stderr — обычная труба, а не терминал
+/// (проверено вживую: `backoff_ms=` в сыром выводе — это `"backoff_ms"`,
+/// затем `ESC[0m`, потом `"="`, то есть строка `"backoff_ms="` в байтах не
+/// встречается вовсе). Без этой очистки `collect_backoff_delays` не находит
+/// поле никогда, независимо от того, сброшен бэкофф или нет, — тест был бы
+/// слеп, а не просто неверен.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI-последовательность: ESC '[' ... завершается первой буквой.
+            let mut lookahead = chars.clone();
+            if lookahead.next() == Some('[') {
+                chars = lookahead;
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Читает stderr потомка и возвращает первые `n` задержек бэкоффа из строк
+/// события переподключения. Бюджет ограничен: если задержек не набралось,
+/// падаем с тем, что действительно увидели, а не висим.
+pub async fn collect_backoff_delays(child: &mut KillOnDrop, n: usize) -> Vec<u64> {
+    use std::io::{BufRead, BufReader};
+
+    let stderr = child.stderr.take().expect("stderr перехвачен при запуске");
+    let handle = tokio::task::spawn_blocking(move || {
+        let mut found = Vec::new();
+        for raw_line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let line = strip_ansi(&raw_line);
+            if !line.contains("reconnecting") {
+                continue;
+            }
+            // Поле пишется структурно: ищем его по имени, а не по позиции.
+            if let Some(rest) = line.split("backoff_ms=").nth(1) {
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(v) = digits.parse::<u64>() {
+                    found.push(v);
+                    if found.len() >= n {
+                        break;
+                    }
+                }
+            }
+        }
+        found
+    });
+
+    match tokio::time::timeout(std::time::Duration::from_secs(20), handle).await {
+        Ok(Ok(found)) if found.len() >= n => found,
+        Ok(Ok(found)) => panic!("нашли только {} задержек из {n}: {found:?}", found.len()),
+        Ok(Err(e)) => panic!("чтение stderr упало: {e}"),
+        Err(_) => panic!("не дождались {n} задержек за 20 секунд"),
     }
 }
 

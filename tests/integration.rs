@@ -1911,3 +1911,71 @@ async fn sigint_also_stops_the_process_cleanly() {
 
     let _ = std::fs::remove_file(&out);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_productive_session_resets_the_backoff() {
+    // Перенесено с этапа 4. Сброс считался непроверяемым, но задержка
+    // попадает в лог структурным полем на каждой попытке, и этого достаточно.
+    // Сценарий: два обрыва подряд с продуктивной сессией между ними —
+    // задержка второй серии обязана начаться заново с начальной, а не
+    // продолжить расти от достигнутой.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let out = std::env::temp_dir().join(format!("pgcdc-backoff-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+
+    let mut child = common::spawn_with_stderr(&[
+        "--database-url",
+        &conn,
+        "--publication",
+        "pgcdc_pub",
+        "--slot",
+        "pgcdc_slot",
+        "--output",
+        "file",
+        "--output-path",
+        out.to_str().unwrap(),
+        "--reconnect-initial-ms",
+        "100",
+        "--reconnect-max-ms",
+        "800",
+    ]);
+
+    // Ждём, пока walsender первой (холодный старт) сессии реально
+    // подключится: между `spawn()` и `START_REPLICATION` проходит заметное
+    // время (разбор аргументов, TCP, preflight), и обрыв, посланный раньше,
+    // никого не находит — первая серия бэкоффа тогда вообще не случится.
+    common::wait_until_slot_active(&client, "pgcdc_slot").await;
+
+    // Первый обрыв и вставка, чтобы сессия после него была продуктивной.
+    common::terminate_replication_backend(&client).await;
+    client
+        .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
+        .await
+        .unwrap();
+    let target: String = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let target = common::parse_lsn(&target).expect("распарсить LSN");
+    common::wait_for_slot_at_least(&client, "pgcdc_slot", target).await;
+
+    // Второй обрыв. Первая попытка после него обязана взять начальную задержку.
+    common::terminate_replication_backend(&client).await;
+
+    // Читаем ОБЕ серии: первая начинается с начальной задержки в любом случае,
+    // и различает их только вторая. Со сбросом получится [100, 100], без него
+    // вторая серия продолжит с удвоенной — [100, 200].
+    let delays = common::collect_backoff_delays(&mut child, 2).await;
+    assert_eq!(
+        delays.get(1).copied(),
+        Some(100),
+        "после продуктивной сессии бэкофф обязан начаться заново, а не продолжить: {delays:?}"
+    );
+
+    let _ = std::fs::remove_file(&out);
+}

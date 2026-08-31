@@ -386,6 +386,11 @@ pub async fn run(
 /// пробуждения от периода барьера.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Как часто выходит сводная строка. Не конфигурируется: это не поведение, а
+/// громкость, и десять секунд — компромисс между «видно, что процесс жив» и
+/// «лог не забивается» (DECISIONS Q23).
+const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Одна сессия репликации: preflight, подключение, цикл. Возвращается при
 /// обрыве соединения или при штатном завершении.
 async fn stream_once(
@@ -478,6 +483,7 @@ async fn stream_once(
     // потом durable, только потом ack, только потом feedback.
     let ack_interval = Duration::from_millis(config.ack_interval_ms);
     let mut last_flush = tokio::time::Instant::now();
+    let mut last_report = tokio::time::Instant::now();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -486,6 +492,26 @@ async fn stream_once(
             flush_and_acknowledge(sink, state, &mut stream, metrics).await?;
             info!("shutdown_requested");
             return Ok(SessionOutcome::ShutdownRequested);
+        }
+
+        // Сводка на INFO раз в METRICS_REPORT_INTERVAL — не на каждое событие
+        // (то на DEBUG, ниже). Стоит на входе в оборот цикла, вне порядка
+        // запись→processed→(таймер)барьер→durable→ack→feedback, потому что
+        // только читает снимок и ни на что не влияет (§16, DECISIONS Q23).
+        if last_report.elapsed() >= METRICS_REPORT_INTERVAL {
+            last_report = tokio::time::Instant::now();
+            let s = metrics.snapshot();
+            info!(
+                events = s.events_total,
+                transactions = s.transactions_total,
+                bytes = s.bytes_received_total,
+                reconnects = s.reconnects_total,
+                errors = s.errors_total,
+                last_received_lsn = %Lsn(s.last_received_lsn),
+                last_acknowledged_lsn = %Lsn(s.last_acknowledged_lsn),
+                buffer = s.transaction_buffer_size,
+                "metrics_report"
+            );
         }
 
         // Ограниченное чтение здесь безопасно, потому что прод работает на
