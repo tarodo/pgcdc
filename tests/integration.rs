@@ -562,9 +562,13 @@ async fn schema_change_resends_relation_and_the_cache_takes_the_new_one() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn several_transactions_are_acknowledged_as_one_group() {
-    // Группировка не должна ни терять транзакции, ни подтверждать позицию
-    // раньше, чем барьер её довёл.
+async fn several_transactions_are_not_lost_and_the_slot_catches_up() {
+    // Название раньше обещало проверку группировки подтверждений, но
+    // ChannelSink отдаёт durable-позицию на КАЖДОМ вызове flush независимо от
+    // того, сколько транзакций накопилось, — этому дублёру групповое и
+    // потранзакционное подтверждение неотличимы. Реально проверяемо здесь
+    // только то, что группировка не теряет транзакции и что слот в итоге
+    // догоняет последнюю доведённую позицию (review round 2, F3).
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -658,8 +662,13 @@ async fn slot_advances_while_the_publication_is_idle() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
-    // Sink принимает записи, но барьер всегда падает: durable не двигается.
-    // Даже при активном keepalive слот обязан стоять.
+    // FlushFailsSink, не дублёр, который падает безусловно (review round 2,
+    // F2): тот проваливал барьер и на ПУСТОМ тике тоже, обрывая run() ошибкой
+    // до первого write_transaction — INSERT ниже не успевал случиться, и
+    // ассерт «слот не сдвинулся» проходил бы, ничего не проверив про
+    // keepalive-ветку. FlushFailsSink отвечает Ok(None) на пустой барьер и
+    // падает только когда есть что подтверждать, так что запись реально
+    // доходит до sink'а, а падает только барьер — и слот обязан стоять.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -676,7 +685,7 @@ async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
 
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(FailingFlushSink)).await
+        pgcdc::postgres::replication::run(cfg, Box::new(FlushFailsSink(None))).await
     });
 
     client
@@ -701,18 +710,65 @@ async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
     assert_eq!(before, after, "барьер не прошёл — слот не двигается");
 }
 
-/// Принимает записи, но всегда падает на барьере.
-struct FailingFlushSink;
+#[tokio::test(flavor = "multi_thread")]
+async fn file_output_binary_writes_durable_json_lines() {
+    // Ветка `--output file` в main.rs ничем не покрыта: замени в match'e
+    // FileSink на StdoutSink — ни один тест не покраснеет. FileSink — единственный
+    // sink этапа, который честно обещает Fsync, и именно эта ветка бинаря его
+    // не проверяет вовсе (review round 2, F7). Гоняем настоящий бинарь целиком:
+    // CLI-разбор, guard, цикл репликации и файловый sink с fsync.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
 
-#[async_trait::async_trait]
-impl Sink for FailingFlushSink {
-    fn durability(&self) -> Durability {
-        Durability::Fsync
-    }
-    async fn write_transaction(&mut self, _tx: &Transaction) -> Result<(), PgcdcError> {
-        Ok(())
-    }
-    async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError> {
-        Err(PgcdcError::Sink("deliberate barrier failure".into()))
-    }
+    let mut path = std::env::temp_dir();
+    path.push(format!("pgcdc-integration-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+        .env("PGCDC_DATABASE_URL", &conn)
+        .env("PGCDC_PUBLICATION", "pgcdc_pub")
+        .env("PGCDC_SLOT", "pgcdc_slot")
+        .env("PGCDC_OUTPUT", "file")
+        .env("PGCDC_OUTPUT_PATH", &path)
+        .env("PGCDC_ACK_INTERVAL_MS", "50")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("запустить бинарь");
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let text = loop {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if !text.trim().is_empty() {
+                break text;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&path);
+            panic!("файл не получил ни одной строки за 20с");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&path);
+
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "один INSERT — одна строка: {text:?}");
+    let json: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("строка файла — валидный JSON");
+    assert_eq!(json["operation"], "insert");
+    assert_eq!(json["table"], "users");
+    assert_eq!(json["after"]["id"], "1");
+    assert_eq!(json["after"]["name"], "Alice");
 }

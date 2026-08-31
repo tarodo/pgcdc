@@ -143,11 +143,17 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
             if let Some(durable) = sink.flush().await? {
                 tracker.note_durable(durable);
                 tracker.try_ack(durable)?;
+                let acked = tracker.acked();
 
-                // Подтверждаем durable, НЕ commit_lsn: commit_lsn указывает на
+                // Отчитываемся позицией трекера (acked), а не тем, что вернул
+                // барьер: сегодня они совпадают, но с реконнектом внутри
+                // процесса (следующий этап) replay уже подтверждённой
+                // транзакции может вернуть из flush позицию позади слота —
+                // отправить её в feedback значило бы откатить сервер назад.
+                // Подтверждаем acked, НЕ commit_lsn: commit_lsn указывает на
                 // начало записи коммита, и рестарт перечитал бы ту же транзакцию.
-                stream.shared_lsn_feedback.update_flushed_lsn(durable.0);
-                stream.shared_lsn_feedback.update_applied_lsn(durable.0);
+                stream.shared_lsn_feedback.update_flushed_lsn(acked.0);
+                stream.shared_lsn_feedback.update_applied_lsn(acked.0);
 
                 // Обязательство Q25(в): без явного вызова подтверждение уходит
                 // с задержкой 18–22 с по внутреннему расписанию крейта.
@@ -156,7 +162,7 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
                     .await
                     .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
 
-                debug!(lsn = %durable, "group_acknowledged");
+                debug!(lsn = %acked, "group_acknowledged");
             }
         }
 
