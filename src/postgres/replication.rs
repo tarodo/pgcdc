@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pg_walstream::{
     CancellationToken, LogicalReplicationStream, ReplicationError, ReplicationStreamConfig,
@@ -236,20 +236,21 @@ fn extract_sqlstate(message: &str) -> Option<&str> {
 /// коду; расчёт на неё как на основную проверку и есть то, что было
 /// исправлено этим раундом.
 ///
-/// Известное ограничение, которое эта функция закрыть не может: слот,
+/// Ограничение, которое эта функция в одиночку закрыть НЕ может: слот,
 /// занятый ЧУЖИМ (не нашим) потребителем НАВСЕГДА, отвечает буквально тем же
 /// `SQLSTATE 55006` — по одному коду состояния «наша прошлая сессия ещё не
 /// отсоединилась» и «кто-то другой держит слот вечно» неотличимы, и
-/// исключение выше классифицирует оба как восстановимые. Процесс в этом
-/// случае уходит в вечный реконнект без единого ненулевого кода выхода —
-/// см. «Что осталось открытым» в `task-4-report.md`.
+/// исключение выше классифицирует оба как восстановимые. Различитель этих
+/// двух случаев физический, а не в коде состояния: наша прошлая сессия
+/// отпускает слот за десятки миллисекунд (измерено, см.
+/// `SlotBusyPatience`), чужой потребитель — нет. Именно поэтому эта функция
+/// остаётся ЧИСТОЙ (без состояния, без времени) и не решает вопрос сама:
+/// вызывающий (`classify_start_outcome`) оборачивает её решение бюджетом
+/// терпения, накопленным по длительности, и эскалирует в
+/// `PgcdcError::SlotBusyTimedOut`, когда терпение исчерпано.
 fn classify_start_error(slot: &str, e: ReplicationError) -> PgcdcError {
     let reason = e.to_string();
-    let is_busy_race = match extract_sqlstate(&reason) {
-        Some(code) => code == SLOT_BUSY_SQLSTATE,
-        None => reason.contains("is active for PID"),
-    };
-    if e.is_transient() || is_busy_race {
+    if e.is_transient() || is_busy_race_reason(&reason) {
         PgcdcError::Connection(format!("start replication: {e}"))
     } else {
         PgcdcError::SlotUnusable {
@@ -257,6 +258,102 @@ fn classify_start_error(slot: &str, e: ReplicationError) -> PgcdcError {
             reason,
         }
     }
+}
+
+/// Общий признак гонки "занят" (`SQLSTATE 55006`), вынесенный из
+/// `classify_start_error` отдельно, чтобы `classify_start_outcome` мог
+/// проверить его ДО того, как ошибка будет классифицирована и текст
+/// сообщения станет недоступен без повторного `to_string()`.
+fn is_busy_race_reason(reason: &str) -> bool {
+    match extract_sqlstate(reason) {
+        Some(code) => code == SLOT_BUSY_SQLSTATE,
+        None => reason.contains("is active for PID"),
+    }
+}
+
+/// Отслеживает, сколько времени ПОДРЯД слот отвечает гонкой "занят"
+/// (`SQLSTATE 55006`). Код состояния не различает «наша прошлая сессия ещё
+/// не отсоединилась» (разрешается за десятки миллисекунд) от «кто-то другой
+/// держит слот навсегда» (не разрешается никогда) — единственный физический
+/// различитель это ДЛИТЕЛЬНОСТЬ, поэтому бюджет терпения задан временем, а
+/// не числом попыток: число попыток зависит от длины паузы бэкоффа, а не от
+/// природы отказа.
+///
+/// Измерено (30 циклов «walsender держит слот → drop → тайминг до
+/// следующего успешного `START_REPLICATION` с нуля, включая установление
+/// нового соединения» — та же операция, что выполняет `stream_once` на
+/// каждом реконнекте): 45–124мс, медиана ~76мс. Отдельно измерено сырое
+/// время до сброса флага `pg_replication_slots.active`, без накладных
+/// расходов нового соединения: 1.1–3.5мс, медиана ~1.8мс — то есть почти
+/// весь след из первого замера это не задержка освобождения слота, а
+/// накладные расходы TCP + аутентификации + `START_REPLICATION` самого
+/// пробного соединения. Умолчание бюджета (`--slot-busy-budget-ms`,
+/// 30000мс, `Config`) взято с запасом ~240× над худшим наблюдением полного
+/// цикла реконнекта и ~8500× над сырым временем освобождения слота.
+///
+/// Счётчик ОБЯЗАН сбрасываться на каждом успешном старте сессии
+/// (`classify_start_outcome`, ветка `Ok`) — иначе долгоживущий процесс
+/// однажды упадёт из-за СУММЫ несвязанных между собой гонок, накопленной за
+/// месяцы работы, а не из-за одного затянувшегося эпизода.
+struct SlotBusyPatience {
+    first_seen: Option<Instant>,
+}
+
+impl SlotBusyPatience {
+    fn new() -> Self {
+        Self { first_seen: None }
+    }
+
+    /// Отмечает очередное наблюдение гонки "занят" в момент `now`. Возвращает
+    /// `Some(waited)`, когда суммарная длительность с первого наблюдения
+    /// достигла или превысила `budget` — вызывающий обязан считать это
+    /// исчерпанием терпения и фатальной ошибкой.
+    fn observe_busy(&mut self, now: Instant, budget: Duration) -> Option<Duration> {
+        let first = *self.first_seen.get_or_insert(now);
+        let waited = now.saturating_duration_since(first);
+        (waited >= budget).then_some(waited)
+    }
+
+    /// Успешный старт сессии закрывает эпизод: несвязанные во времени гонки
+    /// над месяцами работы долгоживущего процесса не должны суммироваться в
+    /// один фатальный выход.
+    fn reset(&mut self) {
+        self.first_seen = None;
+    }
+}
+
+/// Классифицирует исход `stream.start()` вместе с решением о терпении к
+/// занятому слоту — хвост, общий для обоих полей задачи: `classify_start_error`
+/// решает recoverable/fatal по ОДНОЙ попытке, эта функция добавляет
+/// накопленное по ВРЕМЕНИ решение поверх него. Вынесена отдельно от
+/// `stream_once`, чтобы мутация "убрать сброс терпения на успешном старте"
+/// ловилась юнит-тестом уровня значений, а не только интеграционным
+/// сценарием на реальном Postgres (тот же приём, что и у
+/// `session_was_productive`/`ReconnectBackoff` выше).
+fn classify_start_outcome(
+    slot: &str,
+    result: Result<(), ReplicationError>,
+    patience: &mut SlotBusyPatience,
+    budget: Duration,
+    now: Instant,
+) -> Result<(), PgcdcError> {
+    let e = match result {
+        Ok(()) => {
+            patience.reset();
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    if is_busy_race_reason(&e.to_string()) {
+        if let Some(waited) = patience.observe_busy(now, budget) {
+            return Err(PgcdcError::SlotBusyTimedOut {
+                slot: slot.to_owned(),
+                waited_ms: waited.as_millis() as u64,
+                budget_ms: budget.as_millis() as u64,
+            });
+        }
+    }
+    Err(classify_start_error(slot, e))
 }
 
 /// Была ли только что закончившаяся сессия продуктивной для целей сброса
@@ -397,6 +494,13 @@ pub async fn run(
     );
     let mut attempt: u32 = 0;
 
+    // Живёт РЯДОМ с `backoff`, а не внутри `SessionState`: `reset_for_reconnect`
+    // зовётся на КАЖДОМ обрыве соединения независимо от того, был ли этот
+    // обрыв гонкой "занят" — если бы терпение жило там, оно обнулялось бы на
+    // каждой попытке и никогда не смогло бы накопить достаточно времени,
+    // чтобы вообще сработать (SlotBusyPatience).
+    let mut slot_busy_patience = SlotBusyPatience::new();
+
     // Флаг создаётся один раз ДО внешнего цикла и передаётся одной и той же
     // ссылкой в каждую сессию: если создавать его заново на каждом реконнекте,
     // после первого обрыва процесс перестал бы реагировать на сигнал.
@@ -446,6 +550,7 @@ pub async fn run(
             &shutdown,
             &metrics,
             &mut last_report,
+            &mut slot_busy_patience,
         )
         .await
         {
@@ -529,6 +634,7 @@ async fn stream_once(
     shutdown: &Arc<AtomicBool>,
     metrics: &Arc<Metrics>,
     last_report: &mut tokio::time::Instant,
+    slot_busy_patience: &mut SlotBusyPatience,
 ) -> Result<SessionOutcome, PgcdcError> {
     // Захватываем ДО preflight, а не проверяем `state.durable()` заново
     // позже: решение "это реконнект" принимается на входе в функцию и не
@@ -584,10 +690,21 @@ async fn stream_once(
 
     // start_lsn = None означает 0/0: сервер возьмёт confirmed_flush_lsn слота.
     // Слот — единственный источник истины (DECISIONS Q4, Q19).
-    stream
-        .start(None)
-        .await
-        .map_err(|e| classify_start_error(&config.slot, e))?;
+    //
+    // classify_start_outcome оборачивает classify_start_error бюджетом
+    // терпения к занятому слоту (SlotBusyPatience): гонка "занят" сама по
+    // себе остаётся восстановимой, но если она тянется дольше
+    // `slot_busy_budget_ms` суммарно, это эскалируется в фатальный
+    // SlotBusyTimedOut — единственный сигнал, отличающий вечно занятый
+    // чужим потребителем слот от мгновенно разрешающейся гонки с нашей же
+    // прошлой сессией, это ДЛИТЕЛЬНОСТЬ, а не код ошибки.
+    classify_start_outcome(
+        &config.slot,
+        stream.start(None).await,
+        slot_busy_patience,
+        Duration::from_millis(config.slot_busy_budget_ms),
+        Instant::now(),
+    )?;
     info!(slot = %config.slot, publication = %config.publication, "replication_started");
 
     if reconnecting {
@@ -811,6 +928,157 @@ mod tests {
         let err = classify_start_error("pgcdc_slot", e);
         assert!(matches!(err, PgcdcError::SlotUnusable { .. }), "{err:?}");
         assert!(err.is_fatal());
+    }
+
+    /// Строит ту же самую ошибку гонки "занят", что и живой прогон против
+    /// реального Postgres (см. `start_replication_slot_still_held_by_our_own_prior_session_stays_recoverable`
+    /// выше и `task-4-report.md`).
+    fn busy_race_error() -> ReplicationError {
+        ReplicationError::protocol(
+            "START_REPLICATION did not enter COPY mode: ERROR:  replication slot \"pgcdc_slot\" is active for PID 4242 (SQLSTATE 55006)",
+        )
+    }
+
+    #[test]
+    fn slot_busy_patience_does_not_trigger_before_the_budget_elapses() {
+        let mut p = SlotBusyPatience::new();
+        let t0 = Instant::now();
+        let budget = Duration::from_millis(1000);
+        assert!(p.observe_busy(t0, budget).is_none());
+        assert!(p
+            .observe_busy(t0 + Duration::from_millis(999), budget)
+            .is_none());
+    }
+
+    #[test]
+    fn slot_busy_patience_triggers_once_the_budget_elapses() {
+        let mut p = SlotBusyPatience::new();
+        let t0 = Instant::now();
+        let budget = Duration::from_millis(1000);
+        assert!(p.observe_busy(t0, budget).is_none());
+        let waited = p
+            .observe_busy(t0 + Duration::from_millis(1000), budget)
+            .expect("бюджет исчерпан");
+        assert_eq!(waited, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn slot_busy_patience_reset_forgets_the_accumulated_duration() {
+        let mut p = SlotBusyPatience::new();
+        let t0 = Instant::now();
+        let budget = Duration::from_millis(1000);
+        assert!(p.observe_busy(t0, budget).is_none());
+        p.reset();
+        // Без сброса это наблюдение (ровно на границе бюджета от t0) сработало бы.
+        assert!(p
+            .observe_busy(t0 + Duration::from_millis(1000), budget)
+            .is_none());
+    }
+
+    #[test]
+    fn classify_start_outcome_stays_recoverable_while_the_busy_race_is_within_budget() {
+        let mut patience = SlotBusyPatience::new();
+        let budget = Duration::from_millis(1000);
+        let t0 = Instant::now();
+        let err = classify_start_outcome(
+            "pgcdc_slot",
+            Err(busy_race_error()),
+            &mut patience,
+            budget,
+            t0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PgcdcError::Connection(_)), "{err:?}");
+        assert!(!err.is_fatal());
+    }
+
+    #[test]
+    fn classify_start_outcome_escalates_to_fatal_once_the_busy_race_outlives_the_budget() {
+        // Ровно то, что видел живой прогон "что осталось открытым" в
+        // task-4-report.md: 34 цикла подряд SQLSTATE 55006 без единого
+        // ненулевого кода выхода. Здесь тот же наблюдаемый ряд ошибок, но
+        // растянутый по времени дольше бюджета — эскалация обязана
+        // сработать.
+        let mut patience = SlotBusyPatience::new();
+        let budget = Duration::from_millis(1000);
+        let t0 = Instant::now();
+        let err = classify_start_outcome(
+            "pgcdc_slot",
+            Err(busy_race_error()),
+            &mut patience,
+            budget,
+            t0,
+        )
+        .unwrap_err();
+        assert!(
+            !err.is_fatal(),
+            "первое наблюдение не должно быть фатальным"
+        );
+
+        let err = classify_start_outcome(
+            "pgcdc_slot",
+            Err(busy_race_error()),
+            &mut patience,
+            budget,
+            t0 + Duration::from_millis(1500),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PgcdcError::SlotBusyTimedOut { .. }),
+            "{err:?}"
+        );
+        assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn a_successful_start_resets_the_slot_busy_patience_so_unrelated_episodes_dont_sum() {
+        // Отдельный тест на требование "счётчик терпения обязан сбрасываться
+        // на успешном старте сессии": без сброса в Ok-ветке
+        // `classify_start_outcome` эпизод из первого наблюдения продолжил бы
+        // копиться и после успешной сессии, и второй, никак не связанный с
+        // первым эпизод сложился бы с ним в один фатальный выход.
+        let mut patience = SlotBusyPatience::new();
+        let budget = Duration::from_millis(1000);
+        let t0 = Instant::now();
+
+        // Эпизод 1: одно наблюдение гонки, бюджет ещё не исчерпан.
+        let err = classify_start_outcome(
+            "pgcdc_slot",
+            Err(busy_race_error()),
+            &mut patience,
+            budget,
+            t0,
+        )
+        .unwrap_err();
+        assert!(!err.is_fatal());
+
+        // Сессия успешно стартует 900мс спустя — обязана закрыть эпизод 1.
+        classify_start_outcome(
+            "pgcdc_slot",
+            Ok(()),
+            &mut patience,
+            budget,
+            t0 + Duration::from_millis(900),
+        )
+        .expect("успешный старт не может быть ошибкой");
+
+        // Эпизод 2 начинается 1800мс после t0 — то есть 900мс после сброса.
+        // Без сброса это наблюдение унаследовало бы first_seen = t0 и уже
+        // превысило бы бюджет (1800мс >= 1000мс). Со сбросом это новый,
+        // самостоятельный эпизод, ещё далёкий от бюджета.
+        let err = classify_start_outcome(
+            "pgcdc_slot",
+            Err(busy_race_error()),
+            &mut patience,
+            budget,
+            t0 + Duration::from_millis(1800),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PgcdcError::Connection(_)),
+            "сброс обязан был начать эпизод 2 заново: {err:?}"
+        );
+        assert!(!err.is_fatal());
     }
 
     #[test]

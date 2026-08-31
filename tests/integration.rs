@@ -95,6 +95,7 @@ fn config(conn: &str) -> Config {
         ack_interval_ms: 200,
         reconnect_initial_ms: 100,
         reconnect_max_ms: 30_000,
+        slot_busy_budget_ms: 30_000,
     }
 }
 
@@ -1044,6 +1045,101 @@ async fn slot_busy_with_our_own_prior_session_is_recoverable_not_fatal() {
     assert_eq!(tx.changes.len(), 1);
 
     handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slot_busy_forever_exhausts_the_patience_budget_and_the_process_exits_nonzero() {
+    // Обратная сторона гонки выше (slot_busy_with_our_own_prior_session_is_recoverable_not_fatal):
+    // слот, занятый ЧУЖИМ потребителем НАВСЕГДА, отвечает буквально тем же
+    // SQLSTATE 55006 — по коду состояния эти два случая неотличимы (см. §
+    // "Что осталось открытым" в task-4-report.md по задаче 4, п.3, и
+    // подробный разбор у classify_start_error/SlotBusyPatience в
+    // src/postgres/replication.rs). Единственный физический различитель —
+    // ДЛИТЕЛЬНОСТЬ: наша прошлая сессия отпускает слот за десятки
+    // миллисекунд (измерено), чужой потребитель — нет. Здесь блокирующее
+    // соединение держит слот и НЕ освобождается на протяжении всего теста;
+    // с маленьким бюджетом терпения процесс обязан исчерпать его и
+    // завершиться ненулевым кодом, а не уйти в вечный реконнект — именно
+    // это было воспроизведено вручную (34 цикла, ни одного ненулевого
+    // кода выхода) в отчёте по задаче 4.
+    //
+    // Гоняем настоящий скомпилированный бинарь: пункт 14 чек-листа — про код
+    // выхода ПРОЦЕССА, а не про Result библиотеки.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let blocker_config = pg_walstream::ReplicationStreamConfig::new(
+        "pgcdc_slot".to_string(),
+        "pgcdc_pub".to_string(),
+        1,
+        pg_walstream::StreamingMode::Off,
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        pg_walstream::RetryConfig::default(),
+    )
+    .with_binary(false)
+    .with_messages(false);
+    let blocker_url = format!("{conn}?replication=database");
+    let mut blocker = pg_walstream::LogicalReplicationStream::new(&blocker_url, blocker_config)
+        .await
+        .expect("открыть блокирующее соединение");
+    blocker
+        .start(None)
+        .await
+        .expect("блокирующее соединение обязано захватить слот и не отпускать его вовсе");
+
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"));
+    cmd.env("PGCDC_DATABASE_URL", &conn)
+        .env("PGCDC_PUBLICATION", "pgcdc_pub")
+        .env("PGCDC_SLOT", "pgcdc_slot")
+        // Быстрый бэкофф и маленький бюджет — чтобы терпение исчерпалось за
+        // сотни миллисекунд, а не за настоящие 30 секунд умолчания.
+        .env("PGCDC_RECONNECT_INITIAL_MS", "20")
+        .env("PGCDC_RECONNECT_MAX_MS", "50")
+        .env("PGCDC_SLOT_BUSY_BUDGET_MS", "300")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // kill_on_drop: если таймаут ниже сработает (терпение почему-то не
+        // исчерпалось), процесс не осиротеет вечно реконнектящимся.
+        .kill_on_drop(true);
+    let child = cmd.spawn().expect("запустить pgcdc");
+
+    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+        .await
+        .expect(
+            "процесс обязан исчерпать бюджет терпения и завершиться, а не уйти в вечный реконнект",
+        )
+        .expect("дождаться завершения pgcdc");
+
+    // Держим блокирующее соединение живым до этой точки: слот обязан
+    // оставаться занятым весь тест, иначе это тестировало бы обычную гонку
+    // (уже покрытую тестом выше), а не вечно занятый слот.
+    drop(blocker);
+
+    assert!(
+        !output.status.success(),
+        "вечно занятый чужим потребителем слот обязан быть фатальным по исчерпании бюджета терпения"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "фатальная ошибка обязана давать код выхода 1 (DECISIONS Q22)"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout должен быть валидным UTF-8");
+    assert!(
+        stdout.is_empty(),
+        "stdout обязан остаться пустым при фатальной ошибке старта, получили: {stdout:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr должен быть валидным UTF-8");
+    assert!(
+        stderr.contains("slot_busy_timed_out"),
+        "stderr обязан назвать причину машиночитаемой меткой error_kind, получили: {stderr}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

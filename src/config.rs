@@ -191,6 +191,33 @@ pub struct Config {
     #[arg(long, env = "PGCDC_RECONNECT_MAX_MS", default_value = "30000",
           value_parser = clap::value_parser!(u64).range(1..))]
     pub reconnect_max_ms: u64,
+
+    /// Верхняя граница на суммарное время, которое слот подряд может отвечать
+    /// гонкой "занят" (`SQLSTATE 55006`, `ERRCODE_OBJECT_IN_USE`), прежде чем
+    /// это перестаёт считаться разрешающейся самой гонкой с нашей же прошлой
+    /// сессией и становится фатальной ошибкой (`PgcdcError::SlotBusyTimedOut`).
+    /// Postgres отвечает ОДНИМ и тем же кодом состояния в обоих случаях —
+    /// «наш собственный walsender ещё не отсоединился» и «кто-то другой
+    /// держит слот навсегда» — единственный физический различитель это
+    /// ДЛИТЕЛЬНОСТЬ, а не сам код (`SlotBusyPatience`, `replication.rs`).
+    ///
+    /// Умолчание обосновано измерением, а не догадкой: 30 циклов
+    /// «walsender держит слот → drop → тайминг до следующего успешного
+    /// `START_REPLICATION` с нуля, включая установление нового соединения»
+    /// дали 45–124мс (медиана ~76мс) — это та же операция, что выполняет
+    /// `stream_once` на каждом реконнекте. Отдельно измеренное сырое время
+    /// до сброса флага `pg_replication_slots.active` (без накладных расходов
+    /// нового соединения) — 1.1–3.5мс. Умолчание 30000мс даёт запас ~240×
+    /// над худшим наблюдением полного цикла реконнекта и ~8500× над сырым
+    /// временем освобождения слота.
+    ///
+    /// Счётчик терпения сбрасывается на каждом успешном старте сессии
+    /// (`classify_start_outcome`), поэтому несвязанные между собой редкие
+    /// гонки, случившиеся за месяцы работы долгоживущего процесса, не
+    /// суммируются в один фатальный выход.
+    #[arg(long, env = "PGCDC_SLOT_BUSY_BUDGET_MS", default_value = "30000",
+          value_parser = clap::value_parser!(u64).range(1..))]
+    pub slot_busy_budget_ms: u64,
 }
 
 impl Config {
@@ -285,6 +312,28 @@ mod tests {
         args.extend(["--reconnect-max-ms", "1", "--reconnect-initial-ms", "1"]);
         let cfg = Config::try_parse_from(args).expect("1 обязан быть валиден");
         assert_eq!(cfg.reconnect_max_ms, 1);
+    }
+
+    #[test]
+    fn slot_busy_budget_ms_rejects_zero_at_the_parser_level() {
+        let mut args = base_args();
+        args.extend(["--slot-busy-budget-ms", "0"]);
+        let err = Config::try_parse_from(args).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn slot_busy_budget_ms_accepts_one_as_the_lowest_valid_value() {
+        let mut args = base_args();
+        args.extend(["--slot-busy-budget-ms", "1"]);
+        let cfg = Config::try_parse_from(args).expect("1 обязан быть валиден");
+        assert_eq!(cfg.slot_busy_budget_ms, 1);
+    }
+
+    #[test]
+    fn slot_busy_budget_ms_defaults_to_thirty_seconds() {
+        let cfg = Config::try_parse_from(base_args()).expect("минимальные аргументы валидны");
+        assert_eq!(cfg.slot_busy_budget_ms, 30_000);
     }
 
     #[test]

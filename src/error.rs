@@ -27,6 +27,27 @@ pub enum PgcdcError {
     #[error("replication slot {slot} rejected START_REPLICATION: {reason}")]
     SlotUnusable { slot: String, reason: String },
 
+    /// Слот подряд отвечает гонкой "занят" (`SQLSTATE 55006`,
+    /// `ERRCODE_OBJECT_IN_USE`) дольше настроенного бюджета терпения
+    /// (`--slot-busy-budget-ms`, `SlotBusyPatience` в `replication.rs`). По
+    /// одному коду состояния «наша прошлая сессия ещё не отсоединилась» и
+    /// «кто-то другой держит слот навсегда» неразличимы — единственный
+    /// различитель физический: наш собственный walsender освобождает слот за
+    /// десятки миллисекунд (измерено), чужой потребитель — нет. Превышение
+    /// бюджета означает, что это не гонка с нами самими, и молчаливый вечный
+    /// реконнект здесь — ровно тот класс отказа, против которого написан
+    /// инвариант 3 (DECISIONS §1): процесс выглядит живым, а слот недоступен.
+    #[error(
+        "replication slot {slot} stayed busy (SQLSTATE 55006) for {waited_ms}ms, exceeding the \
+         configured patience budget of {budget_ms}ms — most likely held by a foreign consumer, \
+         not our own prior session"
+    )]
+    SlotBusyTimedOut {
+        slot: String,
+        waited_ms: u64,
+        budget_ms: u64,
+    },
+
     #[error("malformed pgoutput message: {0}")]
     Decode(String),
 
@@ -65,6 +86,7 @@ impl PgcdcError {
             Self::SlotMissing { .. } => "slot_missing",
             Self::SlotAhead { .. } => "slot_ahead",
             Self::SlotUnusable { .. } => "slot_unusable",
+            Self::SlotBusyTimedOut { .. } => "slot_busy_timed_out",
             Self::Decode(_) => "decode",
             Self::UnsupportedMessage { .. } => "unsupported_message",
             Self::UnknownRelation { .. } => "unknown_relation",
@@ -82,6 +104,7 @@ impl PgcdcError {
             Self::SlotMissing { .. } => true,
             Self::SlotAhead { .. } => true,
             Self::SlotUnusable { .. } => true,
+            Self::SlotBusyTimedOut { .. } => true,
             Self::Decode(_) => true,
             Self::UnsupportedMessage { .. } => true,
             Self::UnknownRelation { .. } => true,
@@ -117,6 +140,17 @@ mod tests {
         };
         assert!(err.is_fatal());
         assert_eq!(err.kind(), "slot_unusable");
+    }
+
+    #[test]
+    fn a_slot_busy_race_that_outlives_the_patience_budget_is_fatal() {
+        let err = PgcdcError::SlotBusyTimedOut {
+            slot: "s".into(),
+            waited_ms: 5000,
+            budget_ms: 3000,
+        };
+        assert!(err.is_fatal());
+        assert_eq!(err.kind(), "slot_busy_timed_out");
     }
 
     #[test]
