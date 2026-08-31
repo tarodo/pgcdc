@@ -126,6 +126,19 @@ pub async fn wait_for_slot_at_least(
     panic!("слот не догнал {target}, остановился на {last}");
 }
 
+/// Обрывает наше репликационное соединение со стороны сервера. Это дешевле
+/// перезапуска контейнера и точнее воспроизводит сетевой обрыв.
+pub async fn terminate_replication_backend(client: &tokio_postgres::Client) {
+    client
+        .execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE backend_type = 'walsender'",
+            &[],
+        )
+        .await
+        .expect("terminate walsender");
+}
+
 /// PostgreSQL печатает позицию как две шестнадцатеричные половины через слэш.
 pub fn parse_lsn(text: &str) -> Option<pgcdc::lsn::Lsn> {
     let (hi, lo) = text.split_once('/')?;

@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::error::PgcdcError;
 use crate::lsn::{Lsn, LsnTracker};
-use crate::postgres::guard::preflight_cold_start;
+use crate::postgres::guard::{check_reconnect, preflight_cold_start};
 use crate::postgres::pgoutput::decode;
 use crate::schema::RelationCache;
 use crate::sink::Sink;
@@ -63,16 +63,11 @@ impl SessionState {
         }
     }
 
-    // На эти два метода пока нет вызывающего кода: внешний цикл реконнекта,
-    // который их вызовет, приходит в следующей задаче этапа. Не удалять как
-    // мёртвый код — цикл реконнекта станет их единственным потребителем.
-    #[allow(dead_code)]
     fn reset_for_reconnect(&mut self) {
         self.cache.clear();
         self.assembler.reset();
     }
 
-    #[allow(dead_code)]
     fn durable(&self) -> Lsn {
         self.tracker.durable()
     }
@@ -90,19 +85,61 @@ pub(crate) enum SessionOutcome {
     ShutdownRequested,
 }
 
+/// Удвоение с потолком. `saturating_mul` вместо `*` — чтобы удвоение у верха
+/// диапазона не паниковало в debug-сборке.
+fn next_backoff(current: Duration, max: Duration) -> Duration {
+    let doubled = current.saturating_mul(2);
+    if doubled > max {
+        max
+    } else {
+        doubled
+    }
+}
+
 pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcError> {
     // Первым делом — до любого подключения и любого лога, где могла бы всплыть строка.
     config.database_url.validate()?;
 
     let mut state = SessionState::new(config.max_transaction_events);
+    let initial = Duration::from_millis(config.reconnect_initial_ms);
+    let max = Duration::from_millis(config.reconnect_max_ms);
+    let mut backoff = initial;
+    let mut attempt: u32 = 0;
 
-    // Внешний цикл появится в следующей задаче. Пока одна сессия: обрыв —
-    // это ошибка, как и было.
-    match stream_once(&config, &mut sink, &mut state).await? {
-        SessionOutcome::ShutdownRequested => Ok(()),
-        SessionOutcome::Disconnected => Err(PgcdcError::Connection(
-            "replication stream ended".to_string(),
-        )),
+    loop {
+        let received_before = state.tracker.received();
+
+        match stream_once(&config, &mut sink, &mut state).await {
+            Ok(SessionOutcome::ShutdownRequested) => return Ok(()),
+            Ok(SessionOutcome::Disconnected) => {}
+            // Восстановимые ошибки ведут в реконнект, фатальные — наружу.
+            // Классификация живёт в типе (`is_fatal`), а не в разборе текста.
+            Err(e) if !e.is_fatal() => {
+                warn!(error = %e, error_kind = e.kind(), "postgres_connection_lost");
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Продуктивная сессия сбрасывает бэкофф. Без этого один долгий простой
+        // навсегда оставлял бы паузу на потолке, и следующий одиночный сбой
+        // через неделю ждал бы полминуты впустую. Признак продуктивности —
+        // сессия сдвинула принятую позицию, то есть реально что-то прочитала.
+        if state.tracker.received() > received_before {
+            backoff = initial;
+            attempt = 0;
+        }
+
+        attempt += 1;
+        warn!(
+            retry = attempt,
+            backoff_ms = backoff.as_millis() as u64,
+            "reconnecting"
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = next_backoff(backoff, max);
+
+        // Кэш и сборщик сбрасываются, позиции переносятся.
+        state.reset_for_reconnect();
     }
 }
 
@@ -123,6 +160,20 @@ async fn stream_once(
         confirmed_flush_lsn = ?info_slot.confirmed_flush_lsn.map(|l| l.to_string()),
         "slot_preflight_ok"
     );
+
+    // Проверка реконнекта: на холодном старте сравнивать не с чем, durable ещё
+    // ноль. На повторном подключении позиция в памяти есть, и сверка ничего не
+    // стоит. Слот ВПЕРЁД нашей durable-точки означает, что кто-то подтвердил
+    // WAL, который мы не довели до sink, — падаем. Слот ПОЗАДИ — ожидаемый
+    // исход обрыва: последний feedback мог не дойти. Пишем предупреждение и
+    // продолжаем, промежуток перечитается дубликатами (DECISIONS R11 этапа 0).
+    if state.durable() > Lsn(0) {
+        if let Some(warning) = check_reconnect(&config.slot, &info_slot, state.durable())? {
+            warn!("{warning}");
+        }
+        // Успешное восстановление отмечаем только после того, как проверка прошла.
+        info!(slot = %config.slot, "postgres_connection_restored");
+    }
 
     let stream_config = ReplicationStreamConfig::new(
         config.slot.clone(),
@@ -270,6 +321,35 @@ async fn stream_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_doubles_until_it_reaches_the_ceiling() {
+        let max = Duration::from_millis(1000);
+        assert_eq!(
+            next_backoff(Duration::from_millis(100), max),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_millis(400), max),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_millis(800), max),
+            max,
+            "упирается в потолок"
+        );
+        assert_eq!(next_backoff(max, max), max, "и остаётся на нём");
+    }
+
+    #[test]
+    fn backoff_cannot_overflow() {
+        // Удвоение у самого верха диапазона не должно паниковать в debug-сборке.
+        let huge = Duration::from_millis(u64::MAX / 2 + 1);
+        assert_eq!(
+            next_backoff(huge, Duration::from_millis(1000)),
+            Duration::from_millis(1000)
+        );
+    }
 
     #[test]
     fn keepalive_advance_requires_an_empty_buffer() {

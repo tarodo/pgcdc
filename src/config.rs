@@ -158,6 +158,22 @@ pub struct Config {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub ack_interval_ms: u64,
+
+    /// Начальная пауза перед первой попыткой переподключения.
+    /// Намеренно НЕ выводится из `ack_interval_ms`: тот задаёт период барьера,
+    /// таймаут чтения и частоту проверки гейта keepalive сразу, и связать их
+    /// значило бы, что попытка ускорить подтверждение учащает долбёжку
+    /// упавшего сервера.
+    #[arg(long, env = "PGCDC_RECONNECT_INITIAL_MS", default_value = "100",
+          value_parser = clap::value_parser!(u64).range(1..))]
+    pub reconnect_initial_ms: u64,
+
+    /// Потолок паузы. Экспоненциальный рост останавливается здесь и дальше
+    /// повторяет попытки бесконечно: сетевой сбой не повод ронять процесс
+    /// (DECISIONS Q19).
+    #[arg(long, env = "PGCDC_RECONNECT_MAX_MS", default_value = "30000",
+          value_parser = clap::value_parser!(u64).range(1..))]
+    pub reconnect_max_ms: u64,
 }
 
 #[cfg(test)]

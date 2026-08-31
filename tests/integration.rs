@@ -93,6 +93,8 @@ fn config(conn: &str) -> Config {
         output_path: None,
         max_transaction_events: 100_000,
         ack_interval_ms: 200,
+        reconnect_initial_ms: 100,
+        reconnect_max_ms: 30_000,
     }
 }
 
@@ -708,6 +710,71 @@ async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
         .unwrap()
         .get(0);
     assert_eq!(before, after, "барьер не прошёл — слот не двигается");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_connection_is_recovered_without_losing_rows() {
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let cfg = config(&conn);
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+    });
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'before', NULL, NULL)", &[])
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("первая транзакция")
+        .expect("канал закрыт");
+    assert_eq!(
+        first.changes[0]
+            .after
+            .as_ref()
+            .unwrap()
+            .get("name")
+            .unwrap(),
+        "before"
+    );
+
+    // Сервер обрывает наше репликационное соединение.
+    common::terminate_replication_backend(&client).await;
+
+    client
+        .execute("INSERT INTO users VALUES (2, 'after', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    // Строка, вставленная после обрыва, обязана приехать. Дубликат первой
+    // допустим и контрактом разрешён, поэтому ищем нужную, а не берём первую.
+    let mut names = Vec::new();
+    for _ in 0..5 {
+        match tokio::time::timeout(Duration::from_secs(20), tx_recv.recv()).await {
+            Ok(Some(tx)) => {
+                for ch in &tx.changes {
+                    if let Some(after) = &ch.after {
+                        names.push(after.get("name").unwrap().as_str().unwrap().to_string());
+                    }
+                }
+                if names.iter().any(|n| n == "after") {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        names.iter().any(|n| n == "after"),
+        "строка после обрыва не приехала, видели: {names:?}"
+    );
+
+    handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
