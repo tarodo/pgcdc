@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::error::PgcdcError;
 use crate::lsn::{Lsn, LsnTracker};
+use crate::metrics::Metrics;
 use crate::postgres::guard::{check_reconnect, preflight_slot};
 use crate::postgres::pgoutput::decode;
 use crate::schema::RelationCache;
@@ -210,6 +211,7 @@ async fn acknowledge_durable(
     state: &mut SessionState,
     stream: &mut LogicalReplicationStream,
     durable: Lsn,
+    metrics: &Arc<Metrics>,
 ) -> Result<Lsn, PgcdcError> {
     // Порядок держит инвариант 1 в этой точке вызова по построению:
     // `note_durable` только что подняла durable как минимум до `durable`,
@@ -220,6 +222,11 @@ async fn acknowledge_durable(
     state.tracker.note_durable(durable);
     state.tracker.try_ack(durable)?;
     let acked = state.tracker.acked();
+
+    // Единственное место записи этой позиции (см. бриф задачи 2): и
+    // групповой барьер, и keepalive-продвижение проходят через этот общий
+    // хвост, так что второго сайта записи не появится ни у одного из них.
+    metrics.set_last_acknowledged_lsn(acked.0);
 
     stream.shared_lsn_feedback.update_flushed_lsn(acked.0);
     stream.shared_lsn_feedback.update_applied_lsn(acked.0);
@@ -244,16 +251,21 @@ async fn flush_and_acknowledge(
     sink: &mut Box<dyn Sink>,
     state: &mut SessionState,
     stream: &mut LogicalReplicationStream,
+    metrics: &Arc<Metrics>,
 ) -> Result<(), PgcdcError> {
     // Отметить durable имеет право только успешный барьер, а не приём записи.
     if let Some(durable) = sink.flush().await? {
-        let acked = acknowledge_durable(state, stream, durable).await?;
+        let acked = acknowledge_durable(state, stream, durable, metrics).await?;
         debug!(lsn = %acked, "group_acknowledged");
     }
     Ok(())
 }
 
-pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcError> {
+pub async fn run(
+    config: Config,
+    mut sink: Box<dyn Sink>,
+    metrics: Arc<Metrics>,
+) -> Result<(), PgcdcError> {
     // Первым делом — до любого подключения и любого лога, где могла бы всплыть строка.
     config.database_url.validate()?;
     config.validate_reconnect_bounds()?;
@@ -297,13 +309,14 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
 
         let acked_before = state.tracker.acked();
 
-        match stream_once(&config, &mut sink, &mut state, &shutdown).await {
+        match stream_once(&config, &mut sink, &mut state, &shutdown, &metrics).await {
             Ok(SessionOutcome::ShutdownRequested) => return Ok(()),
             Ok(SessionOutcome::Disconnected) => {}
             // Восстановимые ошибки ведут в реконнект, фатальные — наружу.
             // Классификация живёт в типе (`is_fatal`), а не в разборе текста.
             Err(e) if !e.is_fatal() => {
                 warn!(error = %e, error_kind = e.kind(), "postgres_connection_lost");
+                metrics.add_error();
             }
             Err(e) => return Err(e),
         }
@@ -318,6 +331,7 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
         }
         attempt += 1;
         let delay = backoff.next_delay(productive);
+        metrics.add_reconnect();
         warn!(
             retry = attempt,
             backoff_ms = delay.as_millis() as u64,
@@ -367,6 +381,7 @@ async fn stream_once(
     sink: &mut Box<dyn Sink>,
     state: &mut SessionState,
     shutdown: &Arc<AtomicBool>,
+    metrics: &Arc<Metrics>,
 ) -> Result<SessionOutcome, PgcdcError> {
     // Захватываем ДО preflight, а не проверяем `state.durable()` заново
     // позже: решение "это реконнект" принимается на входе в функцию и не
@@ -456,7 +471,7 @@ async fn stream_once(
         if shutdown.load(Ordering::Relaxed) {
             // Довести принятое до барьера и подтвердить, прежде чем выйти.
             // Выйти раньше значило бы потерять уже принятые транзакции.
-            flush_and_acknowledge(sink, state, &mut stream).await?;
+            flush_and_acknowledge(sink, state, &mut stream, metrics).await?;
             info!("shutdown_requested");
             return Ok(SessionOutcome::ShutdownRequested);
         }
@@ -487,19 +502,24 @@ async fn stream_once(
         match read {
             Ok(Ok(raw)) => {
                 state.tracker.note_received(Lsn(raw.wal_end.0));
+                metrics.add_bytes(raw.data.len() as u64);
+                metrics.set_last_received_lsn(raw.wal_end.0);
 
                 let msg = decode(&raw.data)?;
-                if let Some(tx) =
+                let assembled =
                     state
                         .assembler
-                        .handle(msg, Lsn(raw.wal_start.0), &mut state.cache)?
-                {
+                        .handle(msg, Lsn(raw.wal_start.0), &mut state.cache)?;
+                metrics.set_transaction_buffer_size(state.assembler.len() as u64);
+                if let Some(tx) = assembled {
                     let changes = tx.changes.len();
                     let end_lsn = tx.end_lsn;
 
                     // Порядок нерушим: сначала sink, потом барьер, потом durable, только потом ack.
                     sink.write_transaction(&tx).await?;
                     state.tracker.note_processed(end_lsn);
+                    metrics.add_transaction();
+                    metrics.add_events(changes as u64);
                     debug!(xid = tx.xid, changes, lsn = %end_lsn, "transaction_accepted");
                 }
             }
@@ -513,7 +533,7 @@ async fn stream_once(
 
         if last_flush.elapsed() >= ack_interval {
             last_flush = tokio::time::Instant::now();
-            flush_and_acknowledge(sink, state, &mut stream).await?;
+            flush_and_acknowledge(sink, state, &mut stream, metrics).await?;
         }
 
         // Продвижение по keepalive: если мы ничего не должны sink'у, вся позиция,
@@ -527,7 +547,7 @@ async fn stream_once(
             state.tracker.durable(),
         ) && server_lsn > state.tracker.acked()
         {
-            let acked = acknowledge_durable(state, &mut stream, server_lsn).await?;
+            let acked = acknowledge_durable(state, &mut stream, server_lsn, metrics).await?;
             debug!(lsn = %acked, "advanced_from_keepalive");
         }
     }

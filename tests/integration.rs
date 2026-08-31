@@ -116,7 +116,11 @@ async fn reconnect_bounds_above_the_ceiling_fail_before_any_connection() {
     // запаникует: мутация ловится, а не проходит незамеченной.
     let err = tokio::time::timeout(
         Duration::from_secs(5),
-        pgcdc::postgres::replication::run(cfg, Box::new(FailingSink)),
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(FailingSink),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        ),
     )
     .await
     .expect("проверка границ обязана вернуть ошибку немедленно, не дожидаясь сети")
@@ -397,7 +401,12 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
     });
 
     client
@@ -472,7 +481,12 @@ async fn postgres_does_not_send_rolled_back_transactions() {
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
     });
 
     client
@@ -518,10 +532,14 @@ async fn sink_failure_stops_us_before_the_slot_advances() {
         .get(0);
 
     let cfg = config(&conn);
-    let handle =
-        tokio::spawn(
-            async move { pgcdc::postgres::replication::run(cfg, Box::new(FailingSink)).await },
-        );
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(FailingSink),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
+    });
 
     client
         .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
@@ -577,7 +595,12 @@ async fn barrier_failure_stops_us_before_the_slot_advances() {
 
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(FlushFailsSink(None))).await
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(FlushFailsSink(None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
     });
 
     client
@@ -608,6 +631,99 @@ async fn barrier_failure_stops_us_before_the_slot_advances() {
     assert_eq!(
         before, after,
         "слот не должен был сдвинуться: барьер не довёл запись до диска"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn we_acknowledge_the_end_of_the_commit_record_not_its_start() {
+    // Перенесено с этапа 3. Раньше это проверялось по позиции слота на точное
+    // равенство, но продвижение слота по keepalive сделало равенство
+    // недостижимым: фоновая запись WAL законно уводит слот дальше, и
+    // ослабленная проверка «не меньше» перестала различать подмену
+    // end_lsn на commit_lsn — keepalive увёл бы слот за end_lsn в обоих
+    // случаях. Счётчик читает НАШЕ решение, а не состояние сервера,
+    // и потому различает.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let cfg = config(&conn);
+    let m = metrics.clone();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None)), m).await
+    });
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("транзакция должна приехать")
+        .expect("канал закрыт");
+
+    // Ждём, пока счётчик догонит: подтверждение уходит из барьера по таймеру.
+    let mut acked = 0;
+    for _ in 0..200 {
+        acked = metrics.snapshot().last_acknowledged_lsn;
+        if acked >= tx.end_lsn.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        acked, tx.end_lsn.0,
+        "подтверждаем end_lsn транзакции, а не что-то ещё"
+    );
+    assert_ne!(
+        acked, tx.commit_lsn.0,
+        "commit_lsn указывает на начало записи коммита — рестарт перечитал бы её"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_barrier_leaves_the_acknowledged_counter_at_zero() {
+    // Формулировка Q23 дословно: «после sink-failure last_acknowledged_lsn
+    // не сдвинулся». Раньше это можно было проверить только по слоту;
+    // теперь видно и наше собственное решение.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let cfg = config(&conn);
+    let m = metrics.clone();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(FlushFailsSink(None)), m).await
+    });
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        .await
+        .expect("run должен завершиться, а не висеть")
+        .expect("join");
+    assert!(matches!(result.unwrap_err(), PgcdcError::Sink(_)));
+
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.last_acknowledged_lsn, 0,
+        "барьер не прошёл — подтверждать нечего"
+    );
+    assert!(
+        snap.transactions_total >= 1,
+        "но транзакция была принята и посчитана"
     );
 }
 
@@ -742,7 +858,11 @@ async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
     // сломалась (review Task 2, round 1, F9).
     let err = tokio::time::timeout(
         Duration::from_secs(20),
-        pgcdc::postgres::replication::run(config(&conn), Box::new(FailingSink)),
+        pgcdc::postgres::replication::run(
+            config(&conn),
+            Box::new(FailingSink),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        ),
     )
     .await
     .expect("run должен завершиться, а не висеть")
@@ -774,7 +894,12 @@ async fn changing_a_key_column_produces_a_key_only_before_image() {
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
     });
 
     client
@@ -828,7 +953,12 @@ async fn schema_change_resends_relation_and_the_cache_takes_the_new_one() {
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
     });
 
     client
@@ -878,7 +1008,12 @@ async fn several_transactions_are_not_lost_and_the_slot_catches_up() {
     let mut cfg = config(&conn);
     cfg.ack_interval_ms = 500;
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
     });
 
     for id in 1..=5 {
@@ -931,7 +1066,12 @@ async fn slot_advances_while_the_publication_is_idle() {
     let (tx_send, _tx_recv) = mpsc::unbounded_channel();
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
     });
 
     for id in 1..=50 {
@@ -985,7 +1125,12 @@ async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
 
     let cfg = config(&conn);
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(FlushFailsSink(None))).await
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(FlushFailsSink(None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
     });
 
     client
@@ -1032,7 +1177,12 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
     let mut cfg = config(&conn);
     cfg.slot = slot.into();
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
     });
 
     client
@@ -1149,7 +1299,12 @@ async fn a_slot_advanced_past_our_durable_position_is_fatal_on_reconnect() {
     // предпримет попытку реконнекта.
     cfg.reconnect_initial_ms = 3000;
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
     });
 
     client
@@ -1348,7 +1503,12 @@ async fn a_transaction_over_the_limit_is_fatal_and_the_slot_stays_put() {
     cfg.max_transaction_events = 2;
     let (tx_send, _rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
     });
 
     client

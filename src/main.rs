@@ -1,7 +1,9 @@
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Parser;
 use pgcdc::config::{Config, OutputKind};
+use pgcdc::metrics::Metrics;
 use pgcdc::sink::{FileSink, Sink, StdoutSink};
 use tracing::error;
 
@@ -38,7 +40,8 @@ async fn main() -> ExitCode {
         }
     };
 
-    match pgcdc::postgres::replication::run(config, sink).await {
+    let metrics = Arc::new(Metrics::new());
+    match pgcdc::postgres::replication::run(config, sink, metrics).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!(error_kind = e.kind(), fatal = e.is_fatal(), "{e}");

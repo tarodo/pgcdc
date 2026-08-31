@@ -61,6 +61,12 @@ impl Assembler {
         self.open.is_none()
     }
 
+    /// Сколько изменений накоплено в открытой транзакции. Для счётчика
+    /// `transaction_buffer_size`; на решения в коде не влияет.
+    pub fn len(&self) -> usize {
+        self.open.as_ref().map_or(0, |o| o.changes.len())
+    }
+
     pub fn reset(&mut self) {
         self.open = None;
     }
@@ -476,6 +482,25 @@ mod tests {
             "а commit_lsn общий на транзакцию"
         );
         assert!(a.is_empty(), "после коммита буфер пуст");
+    }
+
+    #[test]
+    fn buffer_length_grows_with_changes_and_empties_on_commit() {
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1000);
+        assert_eq!(a.len(), 0);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(users_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(a.len(), 0, "BEGIN сам по себе изменений не добавляет");
+        a.handle(insert(), Lsn(0x200), &mut cache).unwrap();
+        assert_eq!(a.len(), 1);
+        a.handle(commit(), Lsn(0x1000), &mut cache).unwrap();
+        assert_eq!(a.len(), 0, "коммит опустошает буфер");
     }
 
     #[test]
