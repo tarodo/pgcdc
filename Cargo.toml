@@ -19,3 +19,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 testcontainers = "0.28.0"
+# "process" только для тестов (F9: осиротевший дочерний процесс на таймауте
+# теста нужно уметь убить через async Child/kill_on_drop) — прод-бинарь его
+# не использует, поэтому фича не добавлена в [dependencies].
+tokio = { version = "1", features = ["process"] }

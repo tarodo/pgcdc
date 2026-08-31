@@ -176,6 +176,23 @@ pub struct Config {
     pub reconnect_max_ms: u64,
 }
 
+impl Config {
+    /// `clap` проверяет каждую границу порознь (`range(1..)`), но не их
+    /// отношение друг к другу. Начальная пауза больше потолка означает, что
+    /// первая попытка проспит долгую паузу, а `next_backoff` тут же схлопнет
+    /// её обратно к потолку — конфигурация технически валидна для парсера, но
+    /// бессмысленна (review Task 2, round 1, F8).
+    pub fn validate_reconnect_bounds(&self) -> Result<(), PgcdcError> {
+        if self.reconnect_initial_ms > self.reconnect_max_ms {
+            return Err(PgcdcError::InvalidReconnectBounds {
+                initial: self.reconnect_initial_ms,
+                max: self.reconnect_max_ms,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
@@ -216,6 +233,71 @@ mod tests {
         args.extend(["--ack-interval-ms", "1"]);
         let cfg = Config::try_parse_from(args).expect("1 обязан быть валиден");
         assert_eq!(cfg.ack_interval_ms, 1);
+    }
+
+    // Review Task 2, round 1, F8: у `ack_interval_ms` были два таких теста
+    // (нулю нельзя, единице можно), у новых флагов бэкоффа — ни одного, то
+    // есть пропажа ограничения парсера прошла бы незамеченной.
+    #[test]
+    fn reconnect_initial_ms_rejects_zero_at_the_parser_level() {
+        let mut args = base_args();
+        args.extend(["--reconnect-initial-ms", "0"]);
+        let err = Config::try_parse_from(args).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn reconnect_initial_ms_accepts_one_as_the_lowest_valid_value() {
+        let mut args = base_args();
+        args.extend(["--reconnect-initial-ms", "1"]);
+        let cfg = Config::try_parse_from(args).expect("1 обязан быть валиден");
+        assert_eq!(cfg.reconnect_initial_ms, 1);
+    }
+
+    #[test]
+    fn reconnect_max_ms_rejects_zero_at_the_parser_level() {
+        let mut args = base_args();
+        args.extend(["--reconnect-max-ms", "0"]);
+        let err = Config::try_parse_from(args).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn reconnect_max_ms_accepts_one_as_the_lowest_valid_value() {
+        let mut args = base_args();
+        args.extend(["--reconnect-max-ms", "1", "--reconnect-initial-ms", "1"]);
+        let cfg = Config::try_parse_from(args).expect("1 обязан быть валиден");
+        assert_eq!(cfg.reconnect_max_ms, 1);
+    }
+
+    #[test]
+    fn an_initial_delay_above_the_ceiling_is_rejected() {
+        // Парсер видит только каждую границу порознь; отношение между ними
+        // проверяет validate_reconnect_bounds() (review Task 2, round 1, F8).
+        let mut args = base_args();
+        args.extend([
+            "--reconnect-initial-ms",
+            "5000",
+            "--reconnect-max-ms",
+            "1000",
+        ]);
+        let cfg = Config::try_parse_from(args).expect("обе границы порознь валидны");
+        let err = cfg.validate_reconnect_bounds().unwrap_err();
+        assert!(matches!(err, PgcdcError::InvalidReconnectBounds { .. }));
+        assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn equal_initial_and_max_are_accepted() {
+        let mut args = base_args();
+        args.extend([
+            "--reconnect-initial-ms",
+            "1000",
+            "--reconnect-max-ms",
+            "1000",
+        ]);
+        let cfg = Config::try_parse_from(args).expect("обе границы порознь валидны");
+        assert!(cfg.validate_reconnect_bounds().is_ok());
     }
 
     #[test]

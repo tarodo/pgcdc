@@ -96,18 +96,66 @@ fn next_backoff(current: Duration, max: Duration) -> Duration {
     }
 }
 
+/// Есть ли уже durable-позиция, с которой можно сверять слот. На холодном
+/// старте сравнивать не с чем — durable ещё ноль; сверка осмысленна только
+/// со второго подключения и далее.
+fn is_reconnect(durable: Lsn) -> bool {
+    durable > Lsn(0)
+}
+
+/// Пауза перед следующей попыткой подключения. Обёрнута в тип, а не голый
+/// `Duration`, живущий внутри бесконечного цикла `run()` с настоящими
+/// `sleep`, — ради тестируемости: в таком виде мутация "убрать сброс" не
+/// ловилась ни одним тестом (review Task 2, round 1, F2).
+struct ReconnectBackoff {
+    current: Duration,
+    initial: Duration,
+    max: Duration,
+}
+
+impl ReconnectBackoff {
+    fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            current: initial,
+            initial,
+            max,
+        }
+    }
+
+    /// Продуктивная сессия сбрасывает паузу на начальную: без этого один
+    /// долгий простой навсегда оставлял бы паузу на потолке, и следующий
+    /// одиночный сбой через неделю ждал бы полминуты впустую. Что считать
+    /// продуктивностью — решает вызывающий; передавать сюда нужно движение
+    /// ПОДТВЕРЖДЁННОЙ позиции, а не принятой: keepalive-продвижение простаивающей
+    /// публикации подтверждает WAL, ничего не читая, и было бы ошибочно
+    /// признано непродуктивным (review Task 2, round 1, F1).
+    ///
+    /// Возвращает паузу, которую нужно выждать ПЕРЕД этой попыткой, и сама
+    /// продвигается для следующего вызова.
+    fn next_delay(&mut self, productive: bool) -> Duration {
+        if productive {
+            self.current = self.initial;
+        }
+        let delay = self.current;
+        self.current = next_backoff(self.current, self.max);
+        delay
+    }
+}
+
 pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcError> {
     // Первым делом — до любого подключения и любого лога, где могла бы всплыть строка.
     config.database_url.validate()?;
+    config.validate_reconnect_bounds()?;
 
     let mut state = SessionState::new(config.max_transaction_events);
-    let initial = Duration::from_millis(config.reconnect_initial_ms);
-    let max = Duration::from_millis(config.reconnect_max_ms);
-    let mut backoff = initial;
+    let mut backoff = ReconnectBackoff::new(
+        Duration::from_millis(config.reconnect_initial_ms),
+        Duration::from_millis(config.reconnect_max_ms),
+    );
     let mut attempt: u32 = 0;
 
     loop {
-        let received_before = state.tracker.received();
+        let acked_before = state.tracker.acked();
 
         match stream_once(&config, &mut sink, &mut state).await {
             Ok(SessionOutcome::ShutdownRequested) => return Ok(()),
@@ -120,23 +168,22 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
             Err(e) => return Err(e),
         }
 
-        // Продуктивная сессия сбрасывает бэкофф. Без этого один долгий простой
-        // навсегда оставлял бы паузу на потолке, и следующий одиночный сбой
-        // через неделю ждал бы полминуты впустую. Признак продуктивности —
-        // сессия сдвинула принятую позицию, то есть реально что-то прочитала.
-        if state.tracker.received() > received_before {
-            backoff = initial;
+        // Признак продуктивности — сдвинулась ПОДТВЕРЖДЁННАЯ позиция, а не
+        // принятая: и групповое подтверждение, и keepalive-продвижение на
+        // простаивающей публикации двигают acked, а вот received трогает
+        // только приход кадра данных (review Task 2, round 1, F1).
+        let productive = state.tracker.acked() > acked_before;
+        if productive {
             attempt = 0;
         }
-
         attempt += 1;
+        let delay = backoff.next_delay(productive);
         warn!(
             retry = attempt,
-            backoff_ms = backoff.as_millis() as u64,
+            backoff_ms = delay.as_millis() as u64,
             "reconnecting"
         );
-        tokio::time::sleep(backoff).await;
-        backoff = next_backoff(backoff, max);
+        tokio::time::sleep(delay).await;
 
         // Кэш и сборщик сбрасываются, позиции переносятся.
         state.reset_for_reconnect();
@@ -150,6 +197,12 @@ async fn stream_once(
     sink: &mut Box<dyn Sink>,
     state: &mut SessionState,
 ) -> Result<SessionOutcome, PgcdcError> {
+    // Захватываем ДО preflight, а не проверяем `state.durable()` заново
+    // позже: решение "это реконнект" принимается на входе в функцию и не
+    // должно незаметно подстроиться под то, что случится дальше внутри неё
+    // (review Task 2, round 1, F7).
+    let reconnecting = is_reconnect(state.durable());
+
     // Обязательство Q25(а): guard ДО start(), потому что start() безусловно
     // зовёт ensure_replication_slot() и при отсутствующем слоте молча создаст
     // новый на текущей позиции WAL, потеряв всё закоммиченное раньше.
@@ -167,12 +220,10 @@ async fn stream_once(
     // WAL, который мы не довели до sink, — падаем. Слот ПОЗАДИ — ожидаемый
     // исход обрыва: последний feedback мог не дойти. Пишем предупреждение и
     // продолжаем, промежуток перечитается дубликатами (DECISIONS R11 этапа 0).
-    if state.durable() > Lsn(0) {
+    if reconnecting {
         if let Some(warning) = check_reconnect(&config.slot, &info_slot, state.durable())? {
             warn!("{warning}");
         }
-        // Успешное восстановление отмечаем только после того, как проверка прошла.
-        info!(slot = %config.slot, "postgres_connection_restored");
     }
 
     let stream_config = ReplicationStreamConfig::new(
@@ -203,6 +254,15 @@ async fn stream_once(
         .await
         .map_err(|e| PgcdcError::Connection(format!("start replication: {e}")))?;
     info!(slot = %config.slot, publication = %config.publication, "replication_started");
+
+    if reconnecting {
+        // Только теперь: поток реально открыт и запущен сервером. Залогировать
+        // это сразу после проверки слота означало бы заявить восстановление
+        // раньше, чем сервер его подтвердил, — на нестабильном сервере лог
+        // обещал бы восстановление, за которым тут же следует новый обрыв
+        // (review Task 2, round 1, F7).
+        info!(slot = %config.slot, "postgres_connection_restored");
+    }
 
     if sink.durability() == crate::sink::Durability::BestEffort {
         warn!(
@@ -321,6 +381,30 @@ async fn stream_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_reconnect_is_false_on_a_cold_start() {
+        assert!(!is_reconnect(Lsn(0)));
+    }
+
+    #[test]
+    fn is_reconnect_is_true_once_something_is_durable() {
+        assert!(is_reconnect(Lsn(0x1000)));
+    }
+
+    #[test]
+    fn backoff_resets_to_initial_after_a_productive_session() {
+        let mut b = ReconnectBackoff::new(Duration::from_millis(100), Duration::from_millis(1000));
+        // Взбираемся к потолку серией непродуктивных попыток.
+        for _ in 0..10 {
+            b.next_delay(false);
+        }
+        assert_eq!(
+            b.next_delay(true),
+            Duration::from_millis(100),
+            "продуктивная сессия обязана сбросить паузу на начальную"
+        );
+    }
 
     #[test]
     fn backoff_doubles_until_it_reaches_the_ceiling() {

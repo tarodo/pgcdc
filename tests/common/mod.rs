@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::sync::{Arc, Mutex, OnceLock};
+
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -137,6 +139,104 @@ pub async fn terminate_replication_backend(client: &tokio_postgres::Client) {
         )
         .await
         .expect("terminate walsender");
+}
+
+/// Ждёт, пока слот не перестанет числиться активным (то есть walsender
+/// действительно отключился) — нужно перед `pg_replication_slot_advance`,
+/// которая на активном слоте отказывает.
+pub async fn wait_until_slot_inactive(client: &tokio_postgres::Client, slot: &str) {
+    for _ in 0..100 {
+        let row = client
+            .query_one(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .expect("query slot");
+        let active: bool = row.get(0);
+        if !active {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("слот {slot} остаётся активным");
+}
+
+/// Роняет слот, но только когда он действительно неактивен: `pg_terminate_backend`
+/// лишь посылает сигнал и возвращается, не дожидаясь фактического закрытия —
+/// `pg_drop_replication_slot` в это окно падает с ошибкой "slot is active".
+/// Ретраим, а не спим один раз наугад (review Task 2, round 1, F4).
+pub async fn drop_slot_once_inactive(client: &tokio_postgres::Client, slot: &str) {
+    for _ in 0..100 {
+        if client
+            .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("не удалось удалить слот {slot}: остаётся активным");
+}
+
+/// Подписчик tracing, копящий текст поля `message` каждого события в общий
+/// буфер. Не использует `tracing-subscriber` — минимальная ручная реализация
+/// достаточна и не требует новой зависимости.
+struct CapturingSubscriber {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for CapturingSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        self.events.lock().unwrap().push(visitor.0);
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+static LOG_EVENTS: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+
+/// Включает перехват сообщений трейсинга ровно один раз на весь тестовый
+/// бинарь (диспетчер tracing глобален для процесса, `set_global_default`
+/// нельзя вызывать дважды) и возвращает общий буфер. Сообщения из ВСЕХ
+/// одновременно идущих тестов попадают в один список, но искомые здесь
+/// строки уникальны для сценария реконнекта, так что ложных совпадений
+/// не будет (review Task 2, round 1, F3).
+pub fn capture_log_events() -> Arc<Mutex<Vec<String>>> {
+    LOG_EVENTS
+        .get_or_init(|| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = CapturingSubscriber {
+                events: events.clone(),
+            };
+            // Игнорируем ошибку: если диспетчер уже установлен (другим тестом
+            // в этом же бинаре до `OnceLock::get_or_init`), общий буфер —
+            // именно тот, что уже используется.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            events
+        })
+        .clone()
 }
 
 /// PostgreSQL печатает позицию как две шестнадцатеричные половины через слэш.

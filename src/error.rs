@@ -39,6 +39,12 @@ pub enum PgcdcError {
 
     #[error("database URL must start with postgres:// or postgresql:// (libpq key=value connection strings are not supported)")]
     InvalidDatabaseUrl,
+
+    #[error(
+        "reconnect_initial_ms ({initial}) must not exceed reconnect_max_ms ({max}): the first \
+         retry would sleep for the ceiling duration and then collapse to it on every attempt after"
+    )]
+    InvalidReconnectBounds { initial: u64, max: u64 },
 }
 
 impl PgcdcError {
@@ -55,6 +61,7 @@ impl PgcdcError {
             Self::Sink(_) => "sink",
             Self::Connection(_) => "connection",
             Self::InvalidDatabaseUrl => "invalid_database_url",
+            Self::InvalidReconnectBounds { .. } => "invalid_reconnect_bounds",
         }
     }
 
@@ -70,6 +77,7 @@ impl PgcdcError {
             Self::Sink(_) => true,
             Self::Connection(_) => false,
             Self::InvalidDatabaseUrl => true,
+            Self::InvalidReconnectBounds { .. } => true,
         }
     }
 }

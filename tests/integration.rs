@@ -136,40 +136,35 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
     assert!(json["before"].is_null());
     assert_eq!(json["unchanged_columns"], serde_json::json!([]));
 
-    // Ядро контракта на LSN: PostgreSQL должен подтвердить ровно end_lsn, а не
-    // commit_lsn (они различаются на фиксированные 0x30 байт — DECISIONS/бриф
-    // Task 6). Опрашиваем в цикле: send_feedback() уходит из цикла репликации
-    // асинхронно относительно этого запроса, поэтому однократное чтение гонится
-    // с нашим же подтверждением.
-    let expected_end = tx.end_lsn.to_string();
-    let expected_commit = tx.commit_lsn.to_string();
+    // Ядро контракта на LSN: PostgreSQL должен подтвердить НЕ РАНЬШЕ end_lsn,
+    // а не commit_lsn (они различаются на фиксированные 0x30 байт —
+    // DECISIONS/бриф Task 6). Ждём "не раньше", а не точного совпадения:
+    // idle-keepalive-advance (этап 3) может увести confirmed_flush_lsn дальше
+    // end_lsn ещё до нашего опроса — под нагрузкой это ловилось примерно в
+    // 20% прогонов (review Task 2, round 1, F5), и дело не в том, что
+    // подтвердили что-то не то, а в том, что сервер продолжил собственную
+    // WAL-активность в фоне (зафиксированный пример — 0x38 байт от одной
+    // фоновой standby-snapshot-записи).
+    //
+    // Расплата: этот тест больше не различает "подтвердили ровно end_lsn" от
+    // "подтвердили что-то ЗА него keepalive'ом" — под мутацию, отправляющую
+    // в feedback commit_lsn вместо end_lsn, keepalive-ветка позже всё равно
+    // дотащит слот выше end_lsn, и проверка `>=` этого не заметит.
+    // Различить эти два случая может только наблюдение за НАШИМ собственным
+    // подтверждением (acked), а не за позицией слота на сервере; это
+    // сознательно отложено в stage 5, где уже запланирован счётчик метрик
+    // для acked-позиции (ruling review Task 2, round 1, F5) — то есть
+    // потеряно осознанно, а не по недосмотру.
+    let expected_end = tx.end_lsn;
     assert_ne!(
-        expected_end, expected_commit,
-        "end_lsn и commit_lsn обязаны отличаться, иначе проверка равенства ничего не доказывает"
+        tx.end_lsn, tx.commit_lsn,
+        "end_lsn и commit_lsn обязаны отличаться, иначе проверка ниже ничего не доказывает"
     );
 
-    let mut confirmed = String::new();
-    for _ in 0..100 {
-        confirmed = client
-            .query_one(
-                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'pgcdc_slot'",
-                &[],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        if confirmed == expected_end {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert_eq!(
-        confirmed, expected_end,
-        "PostgreSQL должен был подтвердить end_lsn транзакции"
-    );
-    assert_ne!(
-        confirmed, expected_commit,
-        "подтверждена не должна быть позиция начала COMMIT-записи"
+    let confirmed = common::wait_for_slot_at_least(&client, "pgcdc_slot", expected_end).await;
+    assert!(
+        confirmed >= expected_end,
+        "PostgreSQL должен был подтвердить хотя бы end_lsn транзакции: {confirmed} < {expected_end}"
     );
 
     handle.abort();
@@ -339,21 +334,27 @@ async fn stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error() {
     common::setup_schema(&client).await;
     // Слот намеренно не создаём.
 
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"));
+    // tokio::process::Command, не std + spawn_blocking: с std, если таймаут
+    // ниже срабатывает, отменяется только ожидание join-хендла — блокирующий
+    // поток внутри cmd.output() и сам осиротевший дочерний процесс продолжают
+    // жить. Теперь, когда процесс умеет ретраить реконнект бесконечно, такой
+    // сирота никогда не завершается сам и вешает весь тестовый бинарь при
+    // выключении рантайма (review Task 2, round 1, F9). kill_on_drop(true)
+    // даёт нам хендл, который убивает процесс, если future отменяется по
+    // таймауту: async Child, в отличие от std, дропается вместе с future.
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"));
     cmd.env("PGCDC_DATABASE_URL", &conn)
         .env("PGCDC_PUBLICATION", "pgcdc_pub")
         .env("PGCDC_SLOT", "pgcdc_slot")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn().expect("запустить pgcdc");
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(20),
-        tokio::task::spawn_blocking(move || cmd.output()),
-    )
-    .await
-    .expect("бинарь должен завершиться за 20 секунд")
-    .expect("spawn_blocking join")
-    .expect("запуск pgcdc");
+    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+        .await
+        .expect("бинарь должен завершиться за 20 секунд")
+        .expect("дождаться завершения pgcdc");
 
     assert!(
         !output.status.success(),
@@ -446,9 +447,17 @@ async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
     common::setup_schema(&client).await;
     // Слот намеренно НЕ создаём.
 
-    let err = pgcdc::postgres::replication::run(config(&conn), Box::new(FailingSink))
-        .await
-        .unwrap_err();
+    // Слот сейчас классифицирован как немедленно фатальный, но run() теперь
+    // умеет ретраить бесконечно на восстановимых ошибках — без таймаута этот
+    // await навсегда повесил бы тест, если бы классификация когда-нибудь
+    // сломалась (review Task 2, round 1, F9).
+    let err = tokio::time::timeout(
+        Duration::from_secs(20),
+        pgcdc::postgres::replication::run(config(&conn), Box::new(FailingSink)),
+    )
+    .await
+    .expect("run должен завершиться, а не висеть")
+    .unwrap_err();
     assert!(matches!(err, PgcdcError::SlotMissing { .. }));
     assert!(err.is_fatal());
 
@@ -714,6 +723,10 @@ async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_connection_is_recovered_without_losing_rows() {
+    // Захватываем логи до старта run(): проверка ниже (F3) должна увидеть
+    // событие восстановления, а не просто угадать, что оно случилось.
+    let log_events = common::capture_log_events();
+
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -742,6 +755,15 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
             .unwrap(),
         "before"
     );
+
+    // Ждём, пока наш собственный барьер доведёт первую транзакцию до durable
+    // и слот на сервере это подтвердит: канал отдаёт транзакцию сразу после
+    // write_transaction, а до durable/acked ещё нужно дождаться следующего
+    // тика барьера. Без этого обрыв ниже почти наверняка случится раньше
+    // первого flush, `state.durable()` останется нулём, is_reconnect()
+    // никогда не станет true, и весь блок проверки реконнекта останется
+    // непройденным этим тестом — ровно риск из review Task 2, round 1, F3.
+    common::wait_for_slot_at_least(&client, "pgcdc_slot", first.end_lsn).await;
 
     // Сервер обрывает наше репликационное соединение.
     common::terminate_replication_backend(&client).await;
@@ -774,7 +796,107 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
         "строка после обрыва не приехала, видели: {names:?}"
     );
 
-    handle.abort();
+    // F3: это headline-проверка задачи — check_reconnect действительно
+    // выполнился и recovery действительно залогирован, а не просто
+    // "строка как-то приехала". Удаление всего блока проверки реконнекта
+    // не тронуло бы ни одно из предыдущих утверждений в этом тесте.
+    assert!(
+        log_events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m == "postgres_connection_restored"),
+        "событие восстановления соединения не залогировано"
+    );
+
+    // F4: слот, пропавший во время обрыва, обязан быть фатальным немедленно,
+    // а не ретраиться бесконечно — иначе процесс сидел бы в цикле реконнекта,
+    // пока данные, которые он должен был захватить, не состарились в WAL.
+    common::terminate_replication_backend(&client).await;
+    common::drop_slot_once_inactive(&client, "pgcdc_slot").await;
+
+    let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        .await
+        .expect("run должен упасть на пропавшем слоте, а не ретраиться вечно")
+        .expect("join");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, PgcdcError::SlotMissing { .. }),
+        "получили {err:?}"
+    );
+    assert!(err.is_fatal());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_advanced_past_our_durable_position_is_fatal_on_reconnect() {
+    // Прямое доказательство, что check_reconnect() теперь ДЕЙСТВИТЕЛЬНО
+    // вызывается, а не просто существует нетронутым (review Task 2, round 1,
+    // F3). Тест из соседней функции этого не проверяет: там слот на обычном
+    // реконнекте либо точно совпадает с durable, либо отстаёт — асимметрию
+    // "слот ВПЕРЁД — фатально" ни разу не задевает. Здесь слот двигаем вручную
+    // через pg_replication_slot_advance мимо нашего sink — ровно тот случай,
+    // когда кто-то подтвердил WAL, который мы не записали.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let mut cfg = config(&conn);
+    // Окно нужно, чтобы успеть продвинуть слот ДО того, как процесс сам
+    // предпримет попытку реконнекта.
+    cfg.reconnect_initial_ms = 3000;
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+    });
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'before', NULL, NULL)", &[])
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("первая транзакция")
+        .expect("канал закрыт");
+    // Durable должен реально стать ненулевым, иначе is_reconnect() на
+    // следующем подключении останется false и check_reconnect не вызовется.
+    common::wait_for_slot_at_least(&client, "pgcdc_slot", first.end_lsn).await;
+
+    common::terminate_replication_backend(&client).await;
+    common::wait_until_slot_inactive(&client, "pgcdc_slot").await;
+
+    // Строка, которую наш (сейчас отключённый) sink никогда не увидит.
+    client
+        .execute("INSERT INTO users VALUES (2, 'ghost', NULL, NULL)", &[])
+        .await
+        .unwrap();
+    let target: String = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    client
+        .query(
+            // Двойное приведение, а не прямое $2::pg_lsn: иначе Postgres выводит
+            // тип плейсхолдера как pg_lsn напрямую, а tokio-postgres не умеет
+            // биндить в него `String` (WrongType). Через ::text::pg_lsn плейсхолдер
+            // остаётся текстовым для драйвера, а привод в pg_lsn происходит на сервере.
+            "SELECT * FROM pg_replication_slot_advance($1, $2::text::pg_lsn)",
+            &[&"pgcdc_slot", &target],
+        )
+        .await
+        .expect("advance slot past our durable position");
+
+    let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        .await
+        .expect("run должен упасть на SlotAhead, а не тихо продолжить реконнект")
+        .expect("join");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, PgcdcError::SlotAhead { .. }),
+        "получили {err:?}"
+    );
+    assert!(err.is_fatal());
 }
 
 #[tokio::test(flavor = "multi_thread")]
