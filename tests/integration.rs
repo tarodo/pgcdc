@@ -180,8 +180,15 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
     // СИГНАЛ ровно тогда, когда в работе паузa вплоть до потолка (3000мс,
     // что в разы больше SHUTDOWN_POLL_INTERVAL) — только так тест различает
     // нарезку и цельный sleep(delay) (round 1 стадии 5, F1).
+    //
+    // Бюджет — 20с (400×50мс), а не прежние 10с (round 1 review, F3): сама
+    // обязательная часть ожидания (сумма пауз до седьмого ретрая) — уже
+    // ~3.15с, и на локально нагруженной машине этот набор тестов измеренно
+    // гуляет 2.4x (9.5–22.4с по прогонам) — 10с оставляли запас всего
+    // втрое, а не в шестьдесят раз, как было при пороге "две". 20с ничего
+    // не стоят в зелёном прогоне и убирают историческую нестабильность.
     let mut retries_seen = 0usize;
-    for _ in 0..200 {
+    for _ in 0..400 {
         retries_seen = lines
             .lock()
             .unwrap()
@@ -195,7 +202,7 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
     }
     assert!(
         retries_seen >= 7,
-        "не увидели семь ретраев (бэкофф до потолка) за 10 секунд, видели: {:?}",
+        "не увидели семь ретраев (бэкофф до потолка) за 20 секунд, видели: {:?}",
         lines.lock().unwrap()
     );
 
@@ -233,6 +240,125 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
         Some(0),
         "нечего было доводить до барьера — реконнект на недостижимой БД обязан завершаться нулём"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_in_the_last_backoff_chunk_needs_the_top_of_loop_check() {
+    // Round 1 review, F1/F2: нарезка бэкоффа проверяет флаг ПЕРЕД каждым
+    // куском и ни разу ПОСЛЕ последнего — сигнал, попавший именно в
+    // последний кусок, до неё не доходит и ловится только проверкой в
+    // начале СЛЕДУЮЩЕГО прохода внешнего цикла. Сосед этого теста (мёртвый
+    // порт) эту проверку не пин: против отказанного порта "лишняя попытка
+    // подключения", которую эта проверка экономит, стоит меньше
+    // миллисекунды — неотличимо от нуля на фоне любого разумного бюджета.
+    //
+    // Здесь вместо мёртвого порта — пир, который ПРИНИМАЕТ TCP-соединение
+    // и молча держит его ~3с перед тем, как сбросить: preflight падает не
+    // мгновенно и не никогда, а на ограниченной, но реальной задержке.
+    // Без проверки в начале прохода эта задержка проявляется ПОЛНОСТЬЮ —
+    // именно то время, которое новая документация `spawn_shutdown_listener`
+    // называет неограниченным.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake peer");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                // Никогда не говорит протокол Postgres: просто держит
+                // сокет, чтобы clientский connect() заблокировался на
+                // предсказуемые ~3с, а не упал мгновенно и не завис навечно.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                drop(stream);
+            });
+        }
+    });
+
+    let mut child = common::KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+            .args([
+                "--database-url",
+                &format!("postgres://u:p@{addr}/db"),
+                "--publication",
+                "pgcdc_pub",
+                "--slot",
+                "pgcdc_slot",
+                // Начальная и максимальная границы равны: каждая пауза
+                // бэкоффа — ровно 1с (5 кусков по 200мс), без роста, так
+                // что момент сигнала внутри паузы предсказуем.
+                "--reconnect-initial-ms",
+                "1000",
+                "--reconnect-max-ms",
+                "1000",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("запустить бинарь"),
+    );
+
+    let stderr = child.stderr.take().expect("stderr был запрошен как piped");
+    let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lines_writer = lines.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            lines_writer.lock().unwrap().push(line);
+        }
+    });
+
+    // Ждём вторую строку "reconnecting": первая попытка и первая пауза уже
+    // позади, вторая попытка провалилась, и сейчас в работе вторая пауза
+    // (ровно 1с). Бюджет — 15с: два подключения к держащему пиру (~3с
+    // каждое) плюс пауза между ними (~1с) плюс запас.
+    let mut retries_seen = 0usize;
+    for _ in 0..300 {
+        retries_seen = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains("reconnecting"))
+            .count();
+        if retries_seen >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        retries_seen >= 2,
+        "не увидели вторую строку reconnecting за 15 секунд, видели: {:?}",
+        lines.lock().unwrap()
+    );
+
+    // Пауза после второго ретрая — ровно 1с, нарезана на 5 кусков по
+    // 200мс. 900мс после её начала — это последний кусок (800–1000мс),
+    // тот самый, после которого нарезка сама флаг больше не проверяет.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+
+    // ~600мс: нарезанному коду с проверкой в начале прохода этого с
+    // избытком хватает (флаг замечен либо остатком последнего куска, либо
+    // этой проверкой на следующем обороте — счёт на десятки миллисекунд).
+    // Без неё следующая попытка подключения к держащему пиру блокирует ещё
+    // на ~3с, которые этот бюджет заведомо не покрывает.
+    let mut status = None;
+    for _ in 0..12 {
+        if let Ok(Some(s)) = child.try_wait() {
+            status = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let status = status.expect(
+        "проверка в начале прохода обязана поймать сигнал из последнего куска паузы за 600мс",
+    );
+    assert_eq!(status.code(), Some(0), "нечего было доводить до барьера");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1564,10 +1690,22 @@ async fn sigint_also_stops_the_process_cleanly() {
     common::wait_for_slot_at_least(&client, "pgcdc_slot", target).await;
 
     unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
-    let status = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .unwrap()
-        .expect("wait");
+
+    // Опрос через try_wait(), а не блокирующий wait() (round 1 review, F5):
+    // как и в мёртвопортовом соседе этого теста, регрессия, которая ставит
+    // обработчик, но никогда не взводит флаг, оставила бы блокирующий
+    // wait() висеть навсегда, а Drop рантайма tokio ждёт именно
+    // blocking-задачи — тест повесил бы весь тестовый бинарь вместо того,
+    // чтобы просто покраснеть.
+    let mut status = None;
+    for _ in 0..100 {
+        if let Ok(Some(s)) = child.try_wait() {
+            status = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let status = status.expect("SIGINT обязан остановить процесс за 5 секунд, а не только SIGKILL");
     assert_eq!(status.code(), Some(0), "SIGINT тоже даёт ноль");
 
     let _ = std::fs::remove_file(&out);
