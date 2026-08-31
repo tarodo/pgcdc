@@ -51,6 +51,16 @@ fn may_advance_from_keepalive(assembler_empty: bool, processed: Lsn, durable: Ls
 /// сессии репликации и после разрыва может описывать устаревшую схему
 /// (DECISIONS Q19), а недособранная транзакция придёт заново целиком, потому
 /// что её BEGIN был после `confirmed_flush_lsn`.
+///
+/// Датчик буфера (`transaction_buffer_size`) обнуляется здесь же, отдельным
+/// вызовом (F1, review Task 2, round 1): его единственный обычный сайт записи
+/// живёт в приёмной ветке `stream_once` и срабатывает только на кадре
+/// данных, а этот сброс происходит на обрыве соединения без единого нового
+/// кадра. Не обнулить его значило бы держать последнее ненулевое значение
+/// сколь угодно долго на простаивающей после обрыва публикации — гейджу, в
+/// отличие от подтверждённой позиции, разрешено иметь второй сайт записи
+/// именно потому, что он обязан уметь падать вне общего хвоста
+/// `acknowledge_durable`.
 pub(crate) struct SessionState {
     tracker: LsnTracker,
     assembler: Assembler,
@@ -66,9 +76,10 @@ impl SessionState {
         }
     }
 
-    fn reset_for_reconnect(&mut self) {
+    fn reset_for_reconnect(&mut self, metrics: &Metrics) {
         self.cache.clear();
         self.assembler.reset();
+        metrics.set_transaction_buffer_size(0);
     }
 
     fn durable(&self) -> Lsn {
@@ -356,8 +367,9 @@ pub async fn run(
             remaining = remaining.saturating_sub(chunk);
         }
 
-        // Кэш и сборщик сбрасываются, позиции переносятся.
-        state.reset_for_reconnect();
+        // Кэш и сборщик сбрасываются, позиции переносятся, датчик буфера
+        // обнуляется вместе с ними (F1, review Task 2, round 1).
+        state.reset_for_reconnect(&metrics);
     }
 }
 
@@ -506,12 +518,15 @@ async fn stream_once(
                 metrics.set_last_received_lsn(raw.wal_end.0);
 
                 let msg = decode(&raw.data)?;
-                let assembled =
-                    state
-                        .assembler
-                        .handle(msg, Lsn(raw.wal_start.0), &mut state.cache)?;
+                // F4 (review Task 2, round 1): захватываем длину буфера ДО
+                // `?`, а не только независимо от Some/None результата — иначе
+                // ошибка внутри `handle` пропускает обновление датчика вовсе,
+                // и он остаётся при последнем значении из прошлого кадра.
+                let handled = state
+                    .assembler
+                    .handle(msg, Lsn(raw.wal_start.0), &mut state.cache);
                 metrics.set_transaction_buffer_size(state.assembler.len() as u64);
-                if let Some(tx) = assembled {
+                if let Some(tx) = handled? {
                     let changes = tx.changes.len();
                     let end_lsn = tx.end_lsn;
 
@@ -655,7 +670,7 @@ mod tests {
         assert_eq!(s.cache.len(), 1);
         assert!(!s.assembler.is_empty());
 
-        s.reset_for_reconnect();
+        s.reset_for_reconnect(&Metrics::new());
 
         assert_eq!(s.cache.len(), 0, "кэш сбрасывается целиком");
         assert!(
@@ -675,7 +690,7 @@ mod tests {
         s.tracker.note_durable(Lsn(0x2000));
         s.tracker.try_ack(Lsn(0x2000)).unwrap();
 
-        s.reset_for_reconnect();
+        s.reset_for_reconnect(&Metrics::new());
 
         assert_eq!(s.durable(), Lsn(0x2000), "durable переносится");
         assert_eq!(s.tracker.acked(), Lsn(0x2000), "подтверждённая переносится");
@@ -690,8 +705,40 @@ mod tests {
         let mut s = SessionState::new(1000);
         s.tracker.note_processed(Lsn(0x2000));
         s.tracker.note_durable(Lsn(0x2000));
-        s.reset_for_reconnect();
+        s.reset_for_reconnect(&Metrics::new());
         s.tracker.note_processed(Lsn(0x1000));
         assert_eq!(s.tracker.processed(), Lsn(0x2000));
+    }
+
+    #[test]
+    fn reconnect_zeroes_the_buffer_gauge_even_with_an_open_transaction() {
+        // F1 (review Task 2, round 1): сброс на реконнекте не проходит через
+        // приёмную ветку stream_once, где обычно выставляется этот датчик, —
+        // он обязан обнулить его сам. Без этого на простаивающей после
+        // обрыва публикации датчик держал бы последнее ненулевое значение
+        // бесконечно, вместо того чтобы честно показать пустой буфер новой
+        // сессии.
+        let mut s = SessionState::new(1000);
+        s.assembler
+            .handle(
+                crate::postgres::pgoutput::PgOutputMessage::Begin {
+                    final_lsn: 0x1000,
+                    commit_timestamp: 0,
+                    xid: 7,
+                },
+                Lsn(0x100),
+                &mut s.cache,
+            )
+            .unwrap();
+        let metrics = Metrics::new();
+        metrics.set_transaction_buffer_size(5);
+
+        s.reset_for_reconnect(&metrics);
+
+        assert_eq!(
+            metrics.snapshot().transaction_buffer_size,
+            0,
+            "датчик обязан упасть до нуля вместе со сбросом сборщика"
+        );
     }
 }

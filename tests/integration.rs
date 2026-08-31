@@ -449,10 +449,13 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
     // в feedback commit_lsn вместо end_lsn, keepalive-ветка позже всё равно
     // дотащит слот выше end_lsn, и проверка `>=` этого не заметит.
     // Различить эти два случая может только наблюдение за НАШИМ собственным
-    // подтверждением (acked), а не за позицией слота на сервере; это
-    // сознательно отложено в stage 5, где уже запланирован счётчик метрик
-    // для acked-позиции (ruling review Task 2, round 1, F5) — то есть
-    // потеряно осознанно, а не по недосмотру.
+    // подтверждением (acked), а не за позицией слота на сервере — то есть
+    // потеряно здесь осознанно, а не по недосмотру. Ту дискриминацию, от
+    // которой этот тест отказался, закрывает
+    // `we_acknowledge_the_end_of_the_commit_record_not_its_start` в этом же
+    // файле: он читает `metrics.last_acknowledged_lsn`, а не позицию слота,
+    // и потому различает подмену end_lsn на commit_lsn там, где keepalive
+    // всё равно увёл бы слот вперёд обоих вариантов.
     let expected_end = tx.end_lsn;
     assert_ne!(
         tx.end_lsn, tx.commit_lsn,
@@ -1173,16 +1176,17 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
     let slot = "pgcdc_slot_recover_no_loss";
     common::create_slot(&client, slot).await;
 
+    // F5 (review Task 2, round 1): общий экземпляр, а не одноразовый — это
+    // единственный тест, который заведомо пересекает ветку реконнекта, и
+    // потому единственное мутационное покрытие, которое `reconnects_total`
+    // вообще когда-либо получит.
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
     let mut cfg = config(&conn);
     cfg.slot = slot.into();
+    let m = metrics.clone();
     let handle = tokio::spawn(async move {
-        pgcdc::postgres::replication::run(
-            cfg,
-            Box::new(ChannelSink(tx_send, None)),
-            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
-        )
-        .await
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None)), m).await
     });
 
     client
@@ -1259,6 +1263,17 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
     assert!(
         log_events.lock().unwrap().contains(&expected_log),
         "событие восстановления соединения не залогировано для слота {slot}"
+    );
+
+    // F5 (review Task 2, round 1): к этой точке внешний цикл реконнекта уже
+    // прошёл хотя бы один полный оборот (доказано логом восстановления
+    // выше), так что счётчик обязан был продвинуться. Это единственная
+    // мутационная проверка, которую `reconnects_total` вообще получает —
+    // удаление или неверная привязка инкремента остались бы незамеченными
+    // всем остальным набором.
+    assert!(
+        metrics.snapshot().reconnects_total >= 1,
+        "reconnects_total обязан был продвинуться после обрыва и восстановления"
     );
 
     // F4: слот, пропавший во время обрыва, обязан быть фатальным немедленно,
