@@ -1,56 +1,71 @@
 # pgcdc
 
-A minimal Change Data Capture engine for PostgreSQL in Rust. Reads logical replication
-events directly over the `pgoutput` protocol and prints normalized JSON events.
+A minimal Change Data Capture engine for PostgreSQL, in Rust. It reads logical replication
+events over the `pgoutput` protocol and emits normalized JSON Lines.
 
-## What already works
+```json
+{"schema":"public","table":"users","operation":"insert","after":{"id":"1","name":"Alice"},"transaction_id":748,"lsn":"0/19742B8","commit_lsn":"0/19743B0","commit_timestamp":"2026-08-31T09:12:26.946113Z"}
+```
 
-Stage 2 — full decoder: decodes `BEGIN`, `COMMIT`, `RELATION`, `INSERT`, `UPDATE`,
-`DELETE` → JSON on stdout, LSN acknowledgement only after a successful sink write. Each
-event carries `before` distinguishing a "full row" (`before_kind: "full"`, REPLICA
-IDENTITY FULL) from a "key only" (`before_kind: "key"`, the primary key changed under
-DEFAULT identity); TOAST values that weren't sent are named in `unchanged_columns` and do
-not appear in `after`.
+**The design rule everything else follows from:** a WAL position is never acknowledged to
+PostgreSQL before the sink has confirmed the data is durable. Acknowledging is
+irreversible — it permits the server to delete that WAL.
 
-Stage 3 — acknowledgement correctness: a file sink with fsync (`--output file`), grouped
-acknowledgement on a timer (`--ack-interval-ms`), slot advancement on an idle publication
-via keepalive — without this, writes to tables outside the publication would hold the slot
-in place and grow the WAL indefinitely.
+---
 
-Stage 4 — resilience: reconnection with exponential backoff after a connection drop
-(`--reconnect-initial-ms`, `--reconnect-max-ms`), a clean stop on SIGTERM/SIGINT with a
-zero exit code in every case — the signal is caught at three points in the loop (inside
-the active session, at the entry of the outer reconnect loop, and inside the backoff
-pause), and only the first of those, before exiting, drives what the sink accepted
-through the barrier and acknowledges it; the other two return zero without flushing,
-because outside an active session there is nothing to acknowledge — anything not carried
-through the barrier was never acknowledged either, the slot will hand it over again,
-which invariant 2 allows — and survives a hard restart (SIGKILL and a re-run from the
-same slot position).
+## What it does
 
-Stage 5 — wrap-up: structured logs (`tracing`, JSONL on stdout stays separate from logs
-on stderr — see "Observability" below), eight process counters and a periodic summary at
-INFO once every ten seconds, budget-limited patience for a slot that keeps answering with
-a "busy" race (`--slot-busy-budget-ms`) — so a slot forever held by someone else's
-consumer doesn't masquerade as an endlessly-resolving race with our own past session (see
-"Guarantees" below) — and a Dockerfile with a `demo` profile as a showcase (see "Demo"
-below).
+- Decodes `BEGIN`, `COMMIT`, `RELATION`, `INSERT`, `UPDATE`, `DELETE` from `pgoutput`.
+- Emits whole transactions only, on `COMMIT` — a rolled-back transaction never reaches the output.
+- Distinguishes a full old row (`before_kind: "full"`) from a key-only one (`before_kind: "key"`).
+- Names TOAST values the server did not resend in `unchanged_columns`, instead of reporting them as `null`.
+- Writes to stdout or to a file with `fsync`.
+- Advances the slot on an idle publication, so unrelated write traffic cannot pin the WAL.
+- Reconnects with exponential backoff, and stops cleanly on `SIGTERM` / `SIGINT`.
+- Exits non-zero on anything a retry cannot fix.
 
-## Demo
+**Not in scope:** Kafka and other sinks, initial snapshots, DDL replication, fetching TOAST
+values the server did not send, multi-database or multi-publication runs.
 
-Two equivalent ways to run the engine against the demo database: from the host via
-`cargo run` (convenient during development), or entirely in Docker via the `demo` profile
-(shows off the finished image). Both use the same `docker/init.sql`: the slot
-`pgcdc_slot` and the publication `pgcdc_pub` are created on the first start of the
-`postgres` container, **before** pgcdc ever tries to connect. This isn't a minor detail:
-if the slot didn't exist yet, the transport crate would silently create it at the current
-WAL position, and every event committed before that moment would never arrive — see
-`docs/spike-findings.md`.
+---
 
-### Option A: `cargo run` from the host
+## Requirements
+
+| | |
+|---|---|
+| PostgreSQL | 14+, started with `wal_level=logical` and at least one free `max_replication_slots` / `max_wal_senders`. Tested against 16 |
+| Rust | 1.95+ (stable) |
+| Role | `REPLICATION` privilege, plus `SELECT` on the published tables |
+
+---
+
+## Setup
+
+The publication and the slot must exist **before** pgcdc starts:
+
+```sql
+CREATE PUBLICATION pgcdc_pub FOR TABLE public.users;
+SELECT pg_create_logical_replication_slot('pgcdc_slot', 'pgoutput');
+```
+
+pgcdc will not create the slot for you, and refuses to start if it is missing
+(`error_kind=slot_missing`, exit code 1). This is deliberate: a slot created at startup
+begins at the *current* WAL position, so everything committed before that moment is lost
+silently. Refusing is the only way to make that visible.
+
+To capture the old row on `UPDATE` / `DELETE`, set the table's replica identity — otherwise
+`before` carries the primary key alone:
+
+```sql
+ALTER TABLE public.users REPLICA IDENTITY FULL;
+```
+
+---
+
+## Quick start
 
 ```bash
-docker compose up -d --wait
+docker compose up -d --wait          # Postgres with the demo schema, publication and slot
 
 cargo run -- \
   --database-url postgres://postgres:postgres@localhost:5432/app \
@@ -59,38 +74,34 @@ cargo run -- \
   --output stdout
 ```
 
-In another terminal:
+From another terminal:
 
 ```sql
 INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', NULL);
+UPDATE users SET name = 'Bob' WHERE id = 1;
+DELETE FROM users WHERE id = 1;
 ```
 
-The demo uses a fixed primary key (`id = 1`), so a repeat run must be preceded by
-`docker compose down -v` — otherwise `INSERT` will fail on a duplicate key.
+The demo uses a fixed primary key, so run `docker compose down -v` before repeating.
 
-### Option B: the `demo` profile in Docker Compose
+<details>
+<summary>Running everything in Docker instead (the <code>demo</code> profile)</summary>
 
-A plain `docker compose up -d` brings up only `postgres` — the pgcdc service is hidden
-behind the `demo` profile and only starts explicitly:
+A plain `docker compose up -d` starts only Postgres; pgcdc sits behind a profile:
 
 ```bash
-docker compose down -v
 docker compose up -d --wait
 docker compose --profile demo build
 docker compose --profile demo up -d pgcdc
+# ... run the SQL above ...
+docker compose logs pgcdc
+docker compose --profile demo down -v
 ```
 
-Then from another terminal:
+</details>
 
-```bash
-export PGPASSWORD=postgres
-psql -h 127.0.0.1 -U postgres -d app -c "INSERT INTO users VALUES (1,'Alice','alice@example.com',NULL);"
-psql -h 127.0.0.1 -U postgres -d app -c "UPDATE users SET name='Bob' WHERE id=1;"
-psql -h 127.0.0.1 -U postgres -d app -c "DELETE FROM users WHERE id=1;"
-```
-
-Actual output (`docker compose logs pgcdc`) from a real run — three lines of JSON on
-stdout, insert/update/delete, with structured lines on stderr around them:
+<details>
+<summary>Actual output from a real run</summary>
 
 ```json
 {"schema":"public","table":"users","operation":"insert","before":null,"before_kind":null,"after":{"id":"1","name":"Alice","email":"alice@example.com","bio":null},"unchanged_columns":[],"transaction_id":748,"lsn":"0/1973EE8","commit_lsn":"0/1973FE0","commit_timestamp":"2026-08-31T09:12:26.946113Z"}
@@ -98,125 +109,190 @@ stdout, insert/update/delete, with structured lines on stderr around them:
 {"schema":"public","table":"users","operation":"delete","before":{"id":"1","name":"Bob","email":"alice@example.com","bio":null},"before_kind":"full","after":null,"unchanged_columns":[],"transaction_id":750,"lsn":"0/19740E0","commit_lsn":"0/1974140","commit_timestamp":"2026-08-31T09:12:26.997366Z"}
 ```
 
-The values of `transaction_id`, `lsn`, `commit_lsn`, and `commit_timestamp` will be
-different on your own run. Clean up after yourself:
+</details>
+
+---
+
+## Configuration
+
+Every flag has a matching environment variable. Flags win over the environment.
+
+| Flag | Environment | Default | Meaning |
+|---|---|---|---|
+| `--database-url` | `PGCDC_DATABASE_URL` | *required* | `postgres://…`; the password is redacted from all output |
+| `--publication` | `PGCDC_PUBLICATION` | *required* | existing publication name |
+| `--slot` | `PGCDC_SLOT` | *required* | existing slot name, `pgoutput` plugin |
+| `--output` | `PGCDC_OUTPUT` | `stdout` | `stdout` or `file` |
+| `--output-path` | `PGCDC_OUTPUT_PATH` | — | required when `--output file` |
+| `--ack-interval-ms` | `PGCDC_ACK_INTERVAL_MS` | `200` | how often the barrier runs and a position is acknowledged |
+| `--max-transaction-events` | `PGCDC_MAX_TRANSACTION_EVENTS` | `100000` | a transaction larger than this is a fatal error, not a silent OOM |
+| `--reconnect-initial-ms` | `PGCDC_RECONNECT_INITIAL_MS` | `100` | first backoff delay after a drop |
+| `--reconnect-max-ms` | `PGCDC_RECONNECT_MAX_MS` | `30000` | backoff ceiling |
+| `--slot-busy-budget-ms` | `PGCDC_SLOT_BUSY_BUDGET_MS` | `30000` | how long a slot may keep answering "busy" before it is fatal |
+
+`--output stdout` cannot promise durability — bytes handed to a pipe may never be written
+anywhere. It logs a warning at startup and is meant for development. `--output file`
+performs a real `fsync` before any position is acknowledged.
+
+---
+
+## Output
+
+Payload goes to **stdout**, logs go to **stderr**, always. So this is safe:
 
 ```bash
-docker compose --profile demo down -v
+pgcdc --output stdout … | jq -r '.table'
 ```
 
-Logs go to stderr, the payload goes to stdout, so the container's or process's output can
-be safely piped downstream without filtering.
+| Field | Meaning |
+|---|---|
+| `schema`, `table` | source relation |
+| `operation` | `insert` / `update` / `delete` |
+| `before` | old row; `null` for `insert` |
+| `before_kind` | `full` (whole old row) or `key` (primary key only) — `null` when `before` is `null` |
+| `after` | new row; `null` for `delete` |
+| `unchanged_columns` | TOAST columns the server did not resend; they are absent from `after`, not `null` in it |
+| `transaction_id` | the transaction's xid |
+| `lsn` | position of this change |
+| `commit_lsn` | position of the commit record that made it visible |
+| `commit_timestamp` | commit time, RFC 3339, microseconds, UTC |
+
+Column order follows the table, not the alphabet.
+
+---
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | clean stop on `SIGTERM` / `SIGINT` — see the note below |
+| `1` | a failure a retry cannot fix; the reason is in the log's `error_kind` field |
+| `2` | invalid command line (from the argument parser) |
+
+**Why zero is always right on shutdown.** The signal is checked at three points: inside an
+active session, at the top of the reconnect loop, and inside the backoff pause. Only the
+first flushes what the sink accepted and acknowledges it before leaving. The other two exit
+without flushing — and zero is still correct there, but for a different reason: whatever did
+not pass the barrier was never acknowledged either, so the slot hands it over again on the
+next run, and duplicates are permitted.
+
+A process that could lose events never exits `0`. Every fatal reason carries an
+`error_kind` you can alert on:
+
+| `error_kind` | What happened | What to do |
+|---|---|---|
+| `slot_missing` | the slot does not exist | create it, then decide whether the gap matters |
+| `slot_unusable` | the server refuses to stream it: invalidated (`SQLSTATE 55000`) or a foreign output plugin (`22023`) | the WAL is gone — recreate the slot and re-sync |
+| `slot_ahead` | the slot is ahead of our durable position | someone else acknowledged WAL that never passed through our sink; investigate before restarting |
+| `slot_busy_timed_out` | the slot stayed busy past the budget | find the other consumer holding it |
+| `transaction_too_large` | a transaction exceeded `--max-transaction-events` | raise the limit or split the write |
+| `decode`, `unknown_relation`, `unsupported_message` | the protocol stream did not match expectations | a bug or a server version mismatch; report it |
+| `sink` | the output failed | check disk, permissions, downstream |
+| `invalid_database_url`, `invalid_reconnect_bounds` | bad configuration, caught before connecting | fix the flags |
+| `ack_beyond_durable` | an internal invariant was violated — acknowledging past what is durable | should be unreachable; report it |
+
+---
 
 ## Guarantees
 
-Duplicates after a failure are acceptable; silent loss is not. A WAL position is not
-acknowledged to PostgreSQL before the sink has reported a successful write. The one
-exception is an idle publication: the slot advances to the server's position from
-keepalive, because that range is provably free of any row belonging to our publication;
-every range that did contain data still waits for the barrier.
+**Duplicates after a failure are acceptable; silent loss is not.** After a crash you may
+see events again around the boundary — consumers must be idempotent. You will not miss any.
 
-A position is acknowledged only after a successful durability barrier (`Sink::flush`),
-not after the write alone has been accepted (`Sink::write_transaction`) — a window exists
-between the two, and acknowledging within that window would mean acknowledging something
-that could still be lost on a crash.
+**A position is acknowledged only after the durability barrier**, never after the write was
+merely accepted. There is a window between the two, and acknowledging inside it would mean
+telling the server to delete WAL that a crash could still take from us.
 
-Don't judge the process's progress by `pg_stat_replication.write_lsn`: the transport
-library reports there the "received over the network" position, which runs ahead of what
-has actually reached disk — go by the slot's `confirmed_flush_lsn` instead. For the same
-reason, don't add this slot to `synchronous_standby_names`: a `write_lsn` that has leaked
-ahead would start releasing pending `synchronous_commit` waiters prematurely.
+**The slot is the only source of truth for position.** Nothing is checkpointed locally, so
+there is no second place to drift out of sync. Recovery after `SIGKILL` relies on the slot
+alone — pinned by `no_committed_row_is_lost_across_a_hard_restart` in `tests/restart.rs`.
 
-A slot that has moved AHEAD of our durable position on reconnect is a fatal error, not a
-reason to silently reconnect: it means someone else acknowledged `confirmed_flush_lsn`
-(or we did, in a past run this in-memory position no longer knows about) — WAL that never
-passed through our sink. Continuing would mean silently accepting a data gap, so the
-process stops with an error instead. A slot BEHIND the durable position is a normal,
-expected outcome of a drop (the last feedback may not have made it through) and is not
-fatal: the gap gets replayed, and invariant 2 permits the duplicates.
+**An idle publication still advances the slot.** Writes to tables outside the publication
+would otherwise hold it in place and grow the WAL forever. Only ranges provably free of our
+own rows are advanced this way; anything containing data still waits for the barrier.
 
-A slot the server explicitly refuses to stream is also a fatal error, not a reason to
-reconnect: invalidation from exceeding `max_slot_wal_keep_size` (PostgreSQL `SQLSTATE
-55000`) or someone else's output plugin (`SQLSTATE 22023`) mean that the same
-`START_REPLICATION` with the same parameters will get the same failure an hour from now
-too — retrying it would mean hiding an irreversible loss of WAL access behind the
-appearance of a working process. The process exits with **exit code 1**, and the log
-carries `error_kind=slot_unusable`. The exception is a race with a walsender from our own
-past session not yet released right after a drop (`SQLSTATE 55006`): the server answers
-the same way, but this resolves itself on the next attempt and stays recoverable rather
-than fatal.
+### Failure handling
 
-But `SQLSTATE 55006` is also the code the server uses to answer a slot held FOREVER by
-SOMEONE ELSE'S (not our own) consumer: the status code by itself doesn't distinguish "our
-own past session hasn't detached yet" from "someone else is holding the slot forever".
-The difference between them is physical, not in the response code: our own walsender
-releases the slot within tens of milliseconds, while another consumer can hold it
-indefinitely. This is measured, not eyeballed: 30 cycles of "walsender holds the slot →
-drop → timing to the next successful `START_REPLICATION` from scratch, including
-establishing a new connection" — the same operation every reconnect performs — gave
-**45–124ms, median ~76ms**. That's why patience for a busy slot is limited by a time
-budget rather than being unbounded: `--slot-busy-budget-ms` / `PGCDC_SLOT_BUSY_BUDGET_MS`,
-default **30000** (30 seconds) — a **~240×** margin over the worst measured value of a
-full reconnect cycle. As long as the race's total time stays within the budget, the error
-remains recoverable and the process reconnects as usual; once the budget is exhausted,
-the process exits with **exit code 1**, and the log carries
-`error_kind=slot_busy_timed_out`, with the error string itself naming both the
-accumulated wait time and the configured budget. The counter accumulates only genuinely
-continuous race time: a failure of a different nature (transport failure, unreachable
-server) doesn't take away what's accumulated, but it does break the chain — the whole
-interval from the last observation of the race to the next one doesn't count toward the
-budget, because we don't know whether the busy condition held throughout it. What
-escalates, therefore, is not any forever-busy slot, but one for which there's an
-unbroken chain of observations spanning the budget: with rare unrelated failures it adds
-up, with a failure on every other attempt it doesn't. The counter is fully closed only by
-a successful session start — the one observation that proves the slot is free right now;
-so rare, mutually unrelated races that happen over months of a long-lived process's
-operation, separated by at least one successful connection, don't sum into a single
-fatal exit.
+| Situation | Treated as | Result |
+|---|---|---|
+| connection dropped | recoverable | reconnect with backoff |
+| slot behind our durable position after a drop | expected | replay, duplicates allowed |
+| slot ahead of our durable position | fatal | exit 1 — WAL passed by that our sink never saw |
+| server refuses to stream the slot | fatal | exit 1 — the same request gets the same refusal an hour later |
+| slot busy | recoverable, on a budget | see below |
 
-After a hard restart (the process dies without a clean shutdown — e.g. SIGKILL),
-duplicates around the crash boundary are possible, but no committed row is lost: the
-PostgreSQL slot is the sole source of truth for position, and recovery relies only on it,
-not on what the dying process managed to do. This is verified by the test
-`no_committed_row_is_lost_across_a_hard_restart` (`tests/restart.rs`).
+### A busy slot
+
+Two very different situations answer with the same `SQLSTATE 55006`:
+
+| | |
+|---|---|
+| our own previous walsender has not detached yet | normal right after a drop, resolves itself |
+| someone else's consumer holds the slot | will never resolve on its own |
+
+The status code cannot tell them apart. The difference is physical — duration. Our own
+walsender releases the slot within **45–124 ms** (measured over 30 full reconnect cycles,
+median ~76 ms); a foreign consumer holds it indefinitely. So patience is bounded by
+`--slot-busy-budget-ms`, defaulting to 30 s — a ~240× margin over the worst measurement.
+Past the budget the process exits 1 with `error_kind=slot_busy_timed_out`, naming both the
+accumulated wait and the configured budget.
+
+Only an **unbroken chain** of busy answers counts toward the budget. An unrelated failure in
+between breaks the chain, because the gap it sits in cannot be attributed to the slot being
+busy; a successful start clears the count entirely. A slot that is busy with only rare
+unrelated failures between attempts will escalate; one where a failure lands on every other
+attempt will not. Rationale and the rejected alternatives: [DECISIONS.md](DECISIONS.md),
+Q27 and Q29.
+
+### Two operational cautions
+
+Do not judge progress by `pg_stat_replication.write_lsn` — the transport library reports the
+"received over the network" position there, which runs ahead of what reached disk. Use the
+slot's `confirmed_flush_lsn`.
+
+For the same reason, do not put this slot in `synchronous_standby_names`: a `write_lsn` that
+has leaked ahead would release `synchronous_commit` waiters early.
+
+---
 
 ## Observability
 
-The process keeps eight counters (`src/metrics.rs`, `struct Metrics`, all on
-`AtomicU64`, with no external facade like `metrics-rs` — see DECISIONS Q23):
+Eight counters, all `AtomicU64` (`src/metrics.rs`):
 
-| Counter | What it means |
+| Counter | Meaning |
 |---|---|
-| `events_total` | how many row changes were handed to the sink (per transaction commit) |
-| `transactions_total` | how many transactions were committed and handed to the sink |
-| `bytes_received_total` | how many bytes of raw `XLogData` frames were received over the network |
-| `reconnects_total` | how many times the reconnect loop ran after a drop |
-| `errors_total` | how many recoverable connection errors were caught |
-| `last_received_lsn` | the last received WAL LSN (monotonic, never moves backward) |
-| `last_acknowledged_lsn` | the last LSN ACKNOWLEDGED to Postgres — written in exactly one place, right after the durability barrier, and it observes our own decision, not the slot's position |
-| `transaction_buffer_size` | how many changes have accumulated in an open, not-yet-committed transaction — a gauge, not a position: must drop to zero on commit and on reconnect |
+| `events_total` | row changes handed to the sink |
+| `transactions_total` | transactions committed and handed to the sink |
+| `bytes_received_total` | raw `XLogData` bytes received |
+| `reconnects_total` | reconnect-loop passes after a drop |
+| `errors_total` | recoverable connection errors caught |
+| `last_received_lsn` | last received WAL position (monotonic) |
+| `last_acknowledged_lsn` | last position acknowledged to Postgres — our own decision, not the slot's state |
+| `transaction_buffer_size` | changes buffered in an open transaction — a gauge; must fall to zero on commit and on reconnect |
 
-A summary line with all eight values goes out at **INFO** level once every ten seconds —
-the `metrics_report` event, its interval set by the `METRICS_REPORT_INTERVAL` constant in
-`src/postgres/replication.rs` — not configurable, this is volume, not behavior. Example:
+A `metrics_report` line carrying all eight goes out at **INFO** every ten seconds. The
+interval is not configurable: it is volume, not behavior.
 
 ```text
-INFO pgcdc::postgres::replication: metrics_report events=3 transactions=3 bytes=395 reconnects=0 errors=0 last_received_lsn=0/1974170 last_acknowledged_lsn=0/19741A8 buffer=0
+INFO metrics_report events=3 transactions=3 bytes=395 reconnects=0 errors=0 last_received_lsn=0/1974170 last_acknowledged_lsn=0/19741A8 buffer=0
 ```
 
-Per-event lines (`transaction_accepted`, `group_acknowledged`,
-`advanced_from_keepalive`) go out at **DEBUG** level — on a stream with thousands of
-transactions per second, a line per transaction would make the log both a bottleneck and
-noise (DECISIONS Q23; a correction to §16 of the base spec). Enable them via
-`RUST_LOG=debug` or `RUST_LOG=pgcdc=debug`.
+Per-event lines (`transaction_accepted`, `group_acknowledged`, `advanced_from_keepalive`)
+are at **DEBUG** — at thousands of transactions per second a line each would make the log
+both a bottleneck and noise. Turn them on with `RUST_LOG=pgcdc=debug`.
 
-**Row payload — the contents of the `before`/`after` columns — never appears in the logs
-anywhere.** Counters and positions may be logged, data contents may not (base spec §16).
-This applies to both the summary line and the per-event ones: both carry only numbers,
-LSNs, and transaction identifiers.
+**Row contents never appear in the logs.** Counters, positions and transaction ids only.
+This holds for every log line at every level.
+
+Worth alerting on: `last_received_lsn` advancing while `last_acknowledged_lsn` stands still;
+`transaction_buffer_size` that never returns to zero; a steadily climbing `reconnects_total`.
+
+---
 
 ## Documentation
 
-- [DECISIONS.md](DECISIONS.md) — accepted decisions for the MVP
-- [docs/pgoutput-notes.md](docs/pgoutput-notes.md) — byte-level protocol breakdown
-- [docs/spike-findings.md](docs/spike-findings.md) — transport findings
+| | |
+|---|---|
+| [docs/how-it-works.md](docs/how-it-works.md) | how the code is laid out — written for someone reading Rust for the first time |
+| [DECISIONS.md](DECISIONS.md) | every accepted decision and the alternatives rejected, with reasons |
+| [docs/pgoutput-notes.md](docs/pgoutput-notes.md) | byte-level breakdown of the protocol |
+| [docs/spike-findings.md](docs/spike-findings.md) | what we found in the transport crate, and what must not be used |
