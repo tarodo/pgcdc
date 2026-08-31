@@ -957,8 +957,8 @@ mod tests {
     fn start_replication_rejected_by_the_server_is_fatal_invalidated_slot() {
         // The expensive C1 branch: the slot is invalidated by exceeding
         // max_slot_wal_keep_size, the server answers SQLSTATE 55000 (reproduced
-        // verbatim by a live run in task-4-report.md). The same Protocol envelope, the
-        // same verdict.
+        // verbatim by a live run during the stage 5 review). The same Protocol
+        // envelope, the same verdict.
         let e = ReplicationError::protocol(
             "START_REPLICATION did not enter COPY mode: ERROR:  can no longer get changes from replication slot \"pgcdc_slot\" (SQLSTATE 55000)",
         );
@@ -1024,7 +1024,7 @@ mod tests {
 
     /// Builds the very same busy-race error as a live run against a real Postgres (see
     /// `start_replication_slot_still_held_by_our_own_prior_session_stays_recoverable`
-    /// above and `task-4-report.md`).
+    /// above); the live reproduction was done during the stage 5 review.
     fn busy_race_error() -> ReplicationError {
         ReplicationError::protocol(
             "START_REPLICATION did not enter COPY mode: ERROR:  replication slot \"pgcdc_slot\" is active for PID 4242 (SQLSTATE 55006)",
@@ -1087,8 +1087,8 @@ mod tests {
 
     #[test]
     fn classify_start_outcome_escalates_to_fatal_once_the_busy_race_outlives_the_budget() {
-        // Exactly what the live run "what stayed open" in task-4-report.md saw: 34
-        // cycles of SQLSTATE 55006 in a row without a single non-zero exit code. Here
+        // Exactly what the live run during the stage 5 review saw: 34 cycles of
+        // SQLSTATE 55006 in a row without a single non-zero exit code. Here
         // is the same observed series of errors, but stretched over time beyond the
         // budget — the escalation MUST fire.
         let mut patience = SlotBusyPatience::new();
@@ -1445,7 +1445,7 @@ mod tests {
     fn extract_sqlstate_reads_the_code_from_pg_walstreams_error_formatting() {
         // The format is confirmed by reading the crate's source
         // (connection/native/error.rs::PgErrorFields::Display) and by a live run
-        // against a real Postgres (task-4-report.md).
+        // against a real Postgres during the stage 5 review.
         assert_eq!(
             extract_sqlstate(
                 "ERROR:  can no longer get changes from replication slot \"s\" (SQLSTATE 55000)"

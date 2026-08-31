@@ -13,8 +13,8 @@ WORKDIR /src
 # and cargo inside the next RUN only rebuilds pgcdc itself (two small
 # files), not all the external crates again. Measured by editing one line
 # in src/main.rs and re-running `docker build`: 40.5s from scratch (36.4s —
-# this stub layer) → 3.6s on a rebuild (dependency layer CACHED,
-# task-4-report.md).
+# this stub layer) → 3.6s on a rebuild (dependency layer CACHED).
+# Measured during the stage 5 review.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src \
     && echo "fn main() {}" > src/main.rs \

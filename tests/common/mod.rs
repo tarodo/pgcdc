@@ -107,7 +107,7 @@ pub async fn create_slot(client: &tokio_postgres::Client, slot: &str) {
 /// attempts get eaten up long before the actual 10 seconds pass, never
 /// having seen the target position — that is exactly how
 /// `a_productive_session_resets_the_backoff` failed about once every five
-/// full runs. Measured (`task-4-report.md`): 50 checks under the suite's own
+/// full runs. Measured during the stage 5 review: 50 checks under the suite's own
 /// clean 4-thread load landed in 207-631ms; under extra unrelated host load,
 /// a reproduced case had a single check stretch to 209 seconds and still
 /// SUCCEED in waiting for the target — the slot kept acknowledging, just

@@ -1381,8 +1381,7 @@ async fn slot_busy_forever_exhausts_the_patience_budget_and_the_process_exits_no
     // The flip side of the race above (slot_busy_with_our_own_prior_session_is_recoverable_not_fatal):
     // a slot held busy by a FOREIGN consumer FOREVER responds with literally
     // the same SQLSTATE 55006 — by status code alone the two cases are
-    // indistinguishable (see the "What's Left Open" section in
-    // task-4-report.md for task 4, item 3, and the detailed breakdown at
+    // indistinguishable (see the detailed breakdown at
     // classify_start_error/SlotBusyPatience in
     // src/postgres/replication.rs). The only physical discriminator is
     // DURATION: our own prior session releases the slot within tens of
