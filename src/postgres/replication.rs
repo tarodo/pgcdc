@@ -165,6 +165,30 @@ fn is_reconnect(durable: Lsn) -> bool {
     durable > Lsn(0)
 }
 
+/// SQLSTATE гонки «слот ещё занят нашей же прошлой сессией»
+/// (`ERRCODE_OBJECT_IN_USE`, `ReplicationSlotAcquire` в `slot.c` PostgreSQL).
+const SLOT_BUSY_SQLSTATE: &str = "55006";
+
+/// Достаёт SQLSTATE из строки ошибки `pg_walstream`, если он там есть.
+///
+/// Форматирование ответа сервера в этом крейте
+/// (`connection/native/error.rs::PgErrorFields::Display`) кладёт код
+/// состояния в ту же строку, что и текст сообщения:
+/// `"{severity}: {message} (SQLSTATE {code})"`. Оба живых прогона против
+/// реального Postgres это подтвердили дословно: `SQLSTATE 55000` на
+/// инвалидированном слоте, `SQLSTATE 22023` на чужом output-плагине (round
+/// after task 4). Код состояния — пятизначный идентификатор, который
+/// протокол PostgreSQL никогда не переводит; `message` рядом с ним
+/// переводится, если у сервера локализован `lc_messages`.
+fn extract_sqlstate(message: &str) -> Option<&str> {
+    const MARKER: &str = "(SQLSTATE ";
+    let start = message.find(MARKER)? + MARKER.len();
+    let rest = message.get(start..)?;
+    let end = rest.find(')')?;
+    let code = &rest[..end];
+    (code.len() == 5 && code.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(code)
+}
+
 /// Классифицирует отказ `stream.start()` (C1, review round after task 4).
 ///
 /// До этой функции ЛЮБАЯ ошибка `START_REPLICATION` заворачивалась в
@@ -178,22 +202,54 @@ fn is_reconnect(durable: Lsn) -> bool {
 /// DECISIONS §1).
 ///
 /// Различение опирается на `pg_walstream::ReplicationError::is_transient()`:
-/// разрыв сокета (`Io`/`TransientConnection`/`ReplicationConnection`/
-/// `Backend`) остаётся восстановимым, а `Protocol` — которым крейт
-/// заворачивает любой ответ сервера, не переведший COPY-режим в `CopyBoth`
-/// (`connection/native/connection.rs::start_replication`), — фатален.
+/// разрыв сокета или временная неполадка транспорта (`Io`/
+/// `TransientConnection`/`Timeout`/`ReplicationConnection`/`Backend`)
+/// остаётся восстановимой, а `Protocol` — которым крейт заворачивает и явный
+/// отказ сервера на `START_REPLICATION`, и низкоуровневую ошибку разбора
+/// самого проволочного формата (например, недопустимую длину сообщения,
+/// `connection/native/copy.rs`) — фатален по умолчанию. Для второго случая
+/// (порча самого протокола, а не отказ, адресованный слоту) вердикт
+/// «фатально» верен так же, как и для первого — небезопасно молча ретраить
+/// поток, чьё кодирование уже разошлось с ожидаемым, — но имя варианта,
+/// `PgcdcError::SlotUnusable`, вводит в заблуждение: эта ветка шире своего
+/// названия и ловит любой `Protocol`, а не только отказ, который сервер
+/// адресовал именно слоту.
 ///
-/// Единственное исключение — подстрока `"is active for PID"`
-/// (`ERRCODE_OBJECT_IN_USE`, `ReplicationSlotAcquire` в `slot.c` PostgreSQL):
-/// сервер тоже отвечает, но отказ здесь не про сам слот, а про то, что
-/// предыдущий walsender ещё не успел его отпустить — наш же реконнект мог
-/// прийти раньше, чем сервер дочистил прошлую сессию (DECISIONS Q19: каждый
-/// реконнект — новое соединение и новый `START_REPLICATION`). Это разрешится
-/// само на следующей попытке; объявить его фатальным значило бы уронить
-/// процесс на гонке, которую создаёт наш собственный реконнект.
+/// Единственное исключение — гонка «слот ещё занят нашей же прошлой
+/// сессией» (`SQLSTATE 55006` = `ERRCODE_OBJECT_IN_USE`,
+/// `ReplicationSlotAcquire` в `slot.c` PostgreSQL): сервер тоже отвечает, но
+/// отказ здесь не про сам слот, а про то, что предыдущий walsender ещё не
+/// успел его отпустить — наш же реконнект мог прийти раньше, чем сервер
+/// дочистил прошлую сессию (DECISIONS Q19: каждый реконнект — новое
+/// соединение и новый `START_REPLICATION`). Это разрешится само на
+/// следующей попытке; объявить его фатальным значило бы уронить процесс на
+/// гонке, которую создаёт наш собственный реконнект.
+///
+/// Эта гонка различается по коду состояния (`extract_sqlstate`), а не по
+/// переводимой подстроке текста: код состояния не переводится никогда,
+/// текст сообщения — переводится, когда у сервера локализован
+/// `lc_messages`, и тогда подстрочная проверка молча перестала бы находить
+/// гонку, превращая каждый её случай в фатальный выход. Подстрока
+/// `"is active for PID"` остаётся запасным условием только на случай, если
+/// строка ошибки почему-то не несёт SQLSTATE вовсе (например, будущая
+/// версия крейта поменяет форматирование) — не потому, что она равноценна
+/// коду; расчёт на неё как на основную проверку и есть то, что было
+/// исправлено этим раундом.
+///
+/// Известное ограничение, которое эта функция закрыть не может: слот,
+/// занятый ЧУЖИМ (не нашим) потребителем НАВСЕГДА, отвечает буквально тем же
+/// `SQLSTATE 55006` — по одному коду состояния «наша прошлая сессия ещё не
+/// отсоединилась» и «кто-то другой держит слот вечно» неотличимы, и
+/// исключение выше классифицирует оба как восстановимые. Процесс в этом
+/// случае уходит в вечный реконнект без единого ненулевого кода выхода —
+/// см. «Что осталось открытым» в `task-4-report.md`.
 fn classify_start_error(slot: &str, e: ReplicationError) -> PgcdcError {
     let reason = e.to_string();
-    if e.is_transient() || reason.contains("is active for PID") {
+    let is_busy_race = match extract_sqlstate(&reason) {
+        Some(code) => code == SLOT_BUSY_SQLSTATE,
+        None => reason.contains("is active for PID"),
+    };
+    if e.is_transient() || is_busy_race {
         PgcdcError::Connection(format!("start replication: {e}"))
     } else {
         PgcdcError::SlotUnusable {
@@ -676,8 +732,11 @@ mod tests {
         // Дешёвая ветка C1: слот несёт чужой output-плагин, сервер отвечает
         // "option \"proto_version\" = \"1\" is unknown" (SQLSTATE 22023), а
         // pg_walstream заворачивает это в Protocol (не транзиентный вариант).
+        // Строка сконструирована как настоящая: "(SQLSTATE 22023)" в хвосте —
+        // ровно то, что кладёт туда PgErrorFields::Display крейта транспорта
+        // (connection/native/error.rs), а не синтетическое упрощение.
         let e = ReplicationError::protocol(
-            "START_REPLICATION did not enter COPY mode: ERROR:  option \"proto_version\" = \"1\" is unknown",
+            "START_REPLICATION did not enter COPY mode: ERROR:  option \"proto_version\" = \"1\" is unknown (SQLSTATE 22023)",
         );
         let err = classify_start_error("pgcdc_slot", e);
         assert!(matches!(err, PgcdcError::SlotUnusable { .. }), "{err:?}");
@@ -687,10 +746,11 @@ mod tests {
     #[test]
     fn start_replication_rejected_by_the_server_is_fatal_invalidated_slot() {
         // Дорогая ветка C1: слот инвалидирован превышением
-        // max_slot_wal_keep_size, сервер отвечает SQLSTATE 55000. Тот же
+        // max_slot_wal_keep_size, сервер отвечает SQLSTATE 55000 (дословно
+        // воспроизведено живым прогоном в task-4-report.md). Тот же
         // Protocol-конверт, тот же вердикт.
         let e = ReplicationError::protocol(
-            "START_REPLICATION did not enter COPY mode: ERROR:  can no longer get changes from replication slot \"pgcdc_slot\"",
+            "START_REPLICATION did not enter COPY mode: ERROR:  can no longer get changes from replication slot \"pgcdc_slot\" (SQLSTATE 55000)",
         );
         let err = classify_start_error("pgcdc_slot", e);
         assert!(matches!(err, PgcdcError::SlotUnusable { .. }), "{err:?}");
@@ -711,13 +771,64 @@ mod tests {
     #[test]
     fn start_replication_slot_still_held_by_our_own_prior_session_stays_recoverable() {
         // Сервер тоже ОТВЕТИЛ, но это не про непригодность слота — предыдущий
-        // walsender ещё не отпустил его. Разрешится само на следующей попытке.
+        // walsender ещё не отпустил его. Разрешится само на следующей
+        // попытке. SQLSTATE 55006 в хвосте строки — настоящий код гонки
+        // (ERRCODE_OBJECT_IN_USE), различение обязано опираться на него, а
+        // не на подстроку "is active for PID" (P1, re-review round after
+        // task 4): без него в строке этот тест ловил бы только запасной путь.
+        let e = ReplicationError::protocol(
+            "START_REPLICATION did not enter COPY mode: ERROR:  replication slot \"pgcdc_slot\" is active for PID 4242 (SQLSTATE 55006)",
+        );
+        let err = classify_start_error("pgcdc_slot", e);
+        assert!(matches!(err, PgcdcError::Connection(_)), "{err:?}");
+        assert!(!err.is_fatal());
+    }
+
+    #[test]
+    fn start_replication_slot_busy_race_is_recognized_without_sqlstate_via_fallback() {
+        // Запасной путь: строка не несёт SQLSTATE вовсе (гипотетическая
+        // будущая версия крейта поменяла форматирование, или ошибка пришла
+        // не через PgErrorFields). Подстрока остаётся резервным условием —
+        // именно оно и обязано сработать здесь.
         let e = ReplicationError::protocol(
             "START_REPLICATION did not enter COPY mode: ERROR:  replication slot \"pgcdc_slot\" is active for PID 4242",
         );
         let err = classify_start_error("pgcdc_slot", e);
         assert!(matches!(err, PgcdcError::Connection(_)), "{err:?}");
         assert!(!err.is_fatal());
+    }
+
+    #[test]
+    fn start_replication_wrong_sqlstate_with_the_race_substring_is_still_fatal() {
+        // Когда SQLSTATE присутствует, но не совпадает с гонкой (55006), он
+        // обязан решать — даже если по случайности в тексте тоже нашлась бы
+        // подстрока "is active for PID" где-то дальше по сообщению (DETAIL,
+        // например). Проверяем, что primary-путь не даёт запасному пути
+        // перекрыть себя.
+        let e = ReplicationError::protocol(
+            "START_REPLICATION did not enter COPY mode: ERROR:  can no longer get changes from replication slot \"pgcdc_slot\" (SQLSTATE 55000)\nDETAIL: another slot is active for PID 4242 elsewhere",
+        );
+        let err = classify_start_error("pgcdc_slot", e);
+        assert!(matches!(err, PgcdcError::SlotUnusable { .. }), "{err:?}");
+        assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn extract_sqlstate_reads_the_code_from_pg_walstreams_error_formatting() {
+        // Формат подтверждён чтением исходника крейта
+        // (connection/native/error.rs::PgErrorFields::Display) и живым
+        // прогоном на реальном Postgres (task-4-report.md).
+        assert_eq!(
+            extract_sqlstate(
+                "ERROR:  can no longer get changes from replication slot \"s\" (SQLSTATE 55000)"
+            ),
+            Some("55000")
+        );
+    }
+
+    #[test]
+    fn extract_sqlstate_is_none_when_absent() {
+        assert_eq!(extract_sqlstate("connection reset by peer"), None);
     }
 
     #[test]
