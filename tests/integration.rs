@@ -646,6 +646,19 @@ async fn we_acknowledge_the_end_of_the_commit_record_not_its_start() {
     // end_lsn на commit_lsn — keepalive увёл бы слот за end_lsn в обоих
     // случаях. Счётчик читает НАШЕ решение, а не состояние сервера,
     // и потому различает.
+    //
+    // M5 (review round after task 4): это пин-тест плотины acknowledge_durable
+    // (src/postgres/replication.rs) и Transaction::end_lsn (src/transaction.rs)
+    // через ChannelSink — тестового дублёра приёмника, объявленного в этом же
+    // файле, который сам кладёт нужную позицию (`self.1 = Some(tx.end_lsn)`).
+    // Он НЕ ловит мутацию «боевые приёмники (FileSink/StdoutSink) отдают
+    // начало вместо конца» — ChannelSink её попросту не касается. Ту мутацию
+    // ловят `flush_reports_the_last_accepted_position_then_clears_it`
+    // (src/sink/file.rs) и `a_second_flush_right_after_the_first_reports_nothing_new`
+    // (src/sink/stdout.rs) — обе используют фикстуру с end_lsn ≠ commit_lsn и
+    // сверяют возврат `flush()` на точное равенство. Проверено мутацией
+    // руками: подмена `tx.end_lsn` на `tx.commit_lsn` в обоих боевых sink'ах
+    // красит ровно эти два юнит-теста и оставляет этот тест зелёным.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -881,6 +894,271 @@ async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
         rows.is_empty(),
         "слот не создан — иначе мы маскировали бы потерю данных"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slot_with_a_foreign_output_plugin_is_fatal_and_the_process_exits() {
+    // C1 (review round after task 4): §20 п.14 требует ненулевой код выхода,
+    // когда слот отсутствует ИЛИ непригоден. "Отсутствует" покрывает
+    // missing_slot_is_fatal_and_the_slot_is_not_created выше;
+    // "непригоден" не был покрыт вовсе — слот, на котором START_REPLICATION
+    // получает явный отказ сервера, попадал в PgcdcError::Connection и уходил
+    // в вечный реконнект без единого ненулевого кода выхода.
+    //
+    // Дешёвая ветка непригодности: слот создан с чужим output-плагином
+    // (`test_decoding` вместо `pgoutput`). Существование слота проходит
+    // preflight (он не смотрит на плагин), а START_REPLICATION отвечает
+    // "option \"proto_version\" = \"1\" is unknown" (SQLSTATE 22023) — тот же
+    // конверт ошибки (сервер ОТВЕТИЛ и отказал), что и настоящая инвалидация
+    // по объёму удержанного WAL, но без необходимости прогонять гигабайты
+    // WAL, чтобы её спровоцировать.
+    //
+    // Гоняем настоящий скомпилированный бинарь, а не run() in-process: пункт
+    // 14 чек-листа — про код выхода ПРОЦЕССА, а не про Result библиотеки.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    client
+        .query(
+            "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+            &[&"pgcdc_slot"],
+        )
+        .await
+        .expect("создать слот с чужим output-плагином");
+
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"));
+    cmd.env("PGCDC_DATABASE_URL", &conn)
+        .env("PGCDC_PUBLICATION", "pgcdc_pub")
+        .env("PGCDC_SLOT", "pgcdc_slot")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // async Child, а не std + spawn_blocking: если таймаут ниже
+        // сработает, kill_on_drop(true) действительно убьёт процесс, вместо
+        // того чтобы оставить его вечно реконнектящейся сиротой (тот же
+        // приём, что и в stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error).
+        .kill_on_drop(true);
+    let child = cmd.spawn().expect("запустить pgcdc");
+
+    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+        .await
+        .expect("процесс обязан завершиться за 20 секунд, а не уйти в вечный реконнект")
+        .expect("дождаться завершения pgcdc");
+
+    assert!(
+        !output.status.success(),
+        "непригодный (чужой плагин) слот обязан быть фатальным для реального бинаря"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "фатальная ошибка обязана давать код выхода 1 (DECISIONS Q22)"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout должен быть валидным UTF-8");
+    assert!(
+        stdout.is_empty(),
+        "stdout обязан остаться пустым при фатальной ошибке старта, получили: {stdout:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr должен быть валидным UTF-8");
+    assert!(
+        stderr.contains("slot_unusable"),
+        "stderr обязан назвать причину машиночитаемой меткой error_kind, получили: {stderr}"
+    );
+    assert!(
+        !stderr.contains("reconnecting"),
+        "фатальный отказ сервера обязан остановить процесс, а не уйти в цикл реконнекта: {stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slot_busy_with_our_own_prior_session_is_recoverable_not_fatal() {
+    // Обратная сторона C1: сервер ТОЖЕ отвечает отказом на START_REPLICATION
+    // ("replication slot ... is active for PID ...", ERRCODE_OBJECT_IN_USE),
+    // но это не про непригодность слота — конкурентный читатель ещё держит
+    // его. Наивный "любой отказ сервера фатален" сломал бы обычный реконнект:
+    // после разрыва наша же предыдущая сессия может на мгновение не успеть
+    // отпустить слот раньше, чем новая сессия попробует его перехватить.
+    //
+    // Здесь гонка сделана детерминированной: отдельный pg_walstream держит
+    // слот занятым ДО того, как pgcdc вообще запускается, — первая попытка
+    // pgcdc гарантированно получает "is active for PID", а не что-то ещё.
+    // Если классификация когда-нибудь станет "любой отказ сервера фатален",
+    // этот тест покраснеет детерминированно: run() вернёт SlotUnusable на
+    // первой же попытке, канал закроется, и recv() ниже получит None вместо
+    // транзакции.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let blocker_config = pg_walstream::ReplicationStreamConfig::new(
+        "pgcdc_slot".to_string(),
+        "pgcdc_pub".to_string(),
+        1,
+        pg_walstream::StreamingMode::Off,
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        pg_walstream::RetryConfig::default(),
+    )
+    .with_binary(false)
+    .with_messages(false);
+    let blocker_url = format!("{conn}?replication=database");
+    let mut blocker = pg_walstream::LogicalReplicationStream::new(&blocker_url, blocker_config)
+        .await
+        .expect("открыть блокирующее соединение");
+    blocker
+        .start(None)
+        .await
+        .expect("блокирующее соединение обязано первым захватить слот");
+
+    let cfg = config(&conn);
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
+    });
+
+    // Дать pgcdc реально наткнуться на занятый слот хотя бы раз (100мс —
+    // reconnect_initial_ms по умолчанию из config()), прежде чем освободить
+    // его. Drop блокирующего потока на multi-thread рантайме синхронно шлёт
+    // CopyDone+Terminate (pg_walstream::connection::native, close_connection),
+    // так что слот освобождается раньше, чем drop() возвращает управление.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(blocker);
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("pgcdc обязан довести реконнект до конца, а не застрять или упасть")
+        .expect("канал закрыт — run() завершился ошибкой вместо ретрая");
+    assert_eq!(tx.changes.len(), 1);
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnect_zeroes_the_buffer_gauge_at_the_run_call_site() {
+    // M4 (review round after task 4): удаление вызова
+    // state.reset_for_reconnect(&metrics) из run() оставляет все остальные
+    // тесты зелёными — сама функция покрыта юнит-тестом
+    // (reconnect_zeroes_the_buffer_gauge_even_with_an_open_transaction в
+    // src/postgres/replication.rs), а её единственный вызов внутри run() —
+    // нет. README прямо обещает, что датчик размера буфера падает до нуля
+    // и на реконнекте тоже — этот тест пришпиливает именно вызов, а не саму
+    // функцию.
+    //
+    // Две ловушки, из-за которых "просто разорвать соединение и проверить
+    // счётчик" не сработало бы:
+    // 1) Однострочная транзакция приходит одним куском (BEGIN+row+COMMIT
+    //    подряд) — окна, где буфер реально ненулевой, а COMMIT ещё не
+    //    пришёл, не существует. Транзакция здесь достаточно большая, чтобы
+    //    decode и передача заняли измеримое время, и тест ждёт (опросом, а
+    //    не сном наугад), пока датчик не станет положительным.
+    // 2) Сама следующая BEGIN переигранной транзакции обнулила бы `len()`
+    //    естественно (Assembler::handle перезаписывает открытую транзакцию
+    //    целиком, без явного reset) — без дополнительной меры мутация
+    //    "убрать reset_for_reconnect" осталась бы незамеченной, потому что
+    //    ноль появился бы всё равно, просто по другой причине. Слот здесь
+    //    держит занятым второй читатель сразу после обрыва, так что ни
+    //    один новый кадр не может прийти, пока блокировщик жив, — и ноль,
+    //    если он появится, может быть только от самого reset_for_reconnect.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let (tx_send, _tx_recv) = mpsc::unbounded_channel();
+    let mut cfg = config(&conn);
+    // Достаточно большой, чтобы блокировщик гарантированно успел захватить
+    // слот (гонится только с отсоединением старого backend'а на сервере, а
+    // не с этой попыткой) раньше, чем run() вообще попробует реконнект.
+    cfg.reconnect_initial_ms = 2000;
+    let m = metrics.clone();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None)), m).await
+    });
+
+    common::wait_until_slot_active(&client, "pgcdc_slot").await;
+
+    client
+        .execute(
+            "INSERT INTO users SELECT g, 'x', NULL, repeat('y', 4000) \
+             FROM generate_series(1, 20000) g",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let mut caught_mid_transaction = false;
+    for _ in 0..400 {
+        if metrics.snapshot().transaction_buffer_size > 0 {
+            caught_mid_transaction = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        caught_mid_transaction,
+        "тест не поймал транзакцию в процессе передачи — увеличьте объём вставки"
+    );
+
+    common::terminate_replication_backend(&client).await;
+
+    // Захватить слот раньше, чем run() сам попробует реконнект (у него есть
+    // целых 2 секунды форы, cfg.reconnect_initial_ms выше). Гонка здесь —
+    // только с тем, сколько сервер отсоединяет старый backend после
+    // pg_terminate_backend, а не с pgcdc.
+    let make_blocker_config = || {
+        pg_walstream::ReplicationStreamConfig::new(
+            "pgcdc_slot".to_string(),
+            "pgcdc_pub".to_string(),
+            1,
+            pg_walstream::StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            pg_walstream::RetryConfig::default(),
+        )
+        .with_binary(false)
+        .with_messages(false)
+    };
+    let blocker_url = format!("{conn}?replication=database");
+    let mut blocker = None;
+    for _ in 0..200 {
+        if let Ok(mut s) =
+            pg_walstream::LogicalReplicationStream::new(&blocker_url, make_blocker_config()).await
+        {
+            if s.start(None).await.is_ok() {
+                blocker = Some(s);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _blocker = blocker.expect("захватить слот блокировщиком раньше pgcdc не удалось");
+
+    // К этому моменту run() уже должен был пройти через backoff-паузу и
+    // reset_for_reconnect(), но не смочь получить ни одного нового кадра —
+    // слот занят блокировщиком.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        metrics.snapshot().transaction_buffer_size,
+        0,
+        "датчик обязан упасть до нуля на реконнекте, даже пока слот занят и новых кадров нет"
+    );
+
+    handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pg_walstream::{
-    CancellationToken, LogicalReplicationStream, ReplicationStreamConfig, RetryConfig,
-    StreamingMode,
+    CancellationToken, LogicalReplicationStream, ReplicationError, ReplicationStreamConfig,
+    RetryConfig, StreamingMode,
 };
 use tracing::{debug, info, warn};
 
@@ -163,6 +163,44 @@ fn next_backoff(current: Duration, max: Duration) -> Duration {
 /// со второго подключения и далее.
 fn is_reconnect(durable: Lsn) -> bool {
     durable > Lsn(0)
+}
+
+/// Классифицирует отказ `stream.start()` (C1, review round after task 4).
+///
+/// До этой функции ЛЮБАЯ ошибка `START_REPLICATION` заворачивалась в
+/// `PgcdcError::Connection` — восстановимый вариант — и процесс уходил в
+/// вечный реконнект с потолком бэкоффа даже тогда, когда слот инвалидирован
+/// (`SQLSTATE 55000`) или несёт чужой output-плагин (`SQLSTATE 22023`):
+/// сервер ОТВЕТИЛ и явно отказал, а не бросил связь. Повторный
+/// `START_REPLICATION` с теми же параметрами получит тот же отказ и через
+/// час — ретраить его значит не восстанавливаться, а прятать необратимую
+/// потерю доступа к WAL за видимостью работающего процесса (инвариант 3,
+/// DECISIONS §1).
+///
+/// Различение опирается на `pg_walstream::ReplicationError::is_transient()`:
+/// разрыв сокета (`Io`/`TransientConnection`/`ReplicationConnection`/
+/// `Backend`) остаётся восстановимым, а `Protocol` — которым крейт
+/// заворачивает любой ответ сервера, не переведший COPY-режим в `CopyBoth`
+/// (`connection/native/connection.rs::start_replication`), — фатален.
+///
+/// Единственное исключение — подстрока `"is active for PID"`
+/// (`ERRCODE_OBJECT_IN_USE`, `ReplicationSlotAcquire` в `slot.c` PostgreSQL):
+/// сервер тоже отвечает, но отказ здесь не про сам слот, а про то, что
+/// предыдущий walsender ещё не успел его отпустить — наш же реконнект мог
+/// прийти раньше, чем сервер дочистил прошлую сессию (DECISIONS Q19: каждый
+/// реконнект — новое соединение и новый `START_REPLICATION`). Это разрешится
+/// само на следующей попытке; объявить его фатальным значило бы уронить
+/// процесс на гонке, которую создаёт наш собственный реконнект.
+fn classify_start_error(slot: &str, e: ReplicationError) -> PgcdcError {
+    let reason = e.to_string();
+    if e.is_transient() || reason.contains("is active for PID") {
+        PgcdcError::Connection(format!("start replication: {e}"))
+    } else {
+        PgcdcError::SlotUnusable {
+            slot: slot.to_owned(),
+            reason,
+        }
+    }
 }
 
 /// Была ли только что закончившаяся сессия продуктивной для целей сброса
@@ -493,7 +531,7 @@ async fn stream_once(
     stream
         .start(None)
         .await
-        .map_err(|e| PgcdcError::Connection(format!("start replication: {e}")))?;
+        .map_err(|e| classify_start_error(&config.slot, e))?;
     info!(slot = %config.slot, publication = %config.publication, "replication_started");
 
     if reconnecting {
@@ -632,6 +670,55 @@ async fn stream_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_replication_rejected_by_the_server_is_fatal_wrong_plugin() {
+        // Дешёвая ветка C1: слот несёт чужой output-плагин, сервер отвечает
+        // "option \"proto_version\" = \"1\" is unknown" (SQLSTATE 22023), а
+        // pg_walstream заворачивает это в Protocol (не транзиентный вариант).
+        let e = ReplicationError::protocol(
+            "START_REPLICATION did not enter COPY mode: ERROR:  option \"proto_version\" = \"1\" is unknown",
+        );
+        let err = classify_start_error("pgcdc_slot", e);
+        assert!(matches!(err, PgcdcError::SlotUnusable { .. }), "{err:?}");
+        assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn start_replication_rejected_by_the_server_is_fatal_invalidated_slot() {
+        // Дорогая ветка C1: слот инвалидирован превышением
+        // max_slot_wal_keep_size, сервер отвечает SQLSTATE 55000. Тот же
+        // Protocol-конверт, тот же вердикт.
+        let e = ReplicationError::protocol(
+            "START_REPLICATION did not enter COPY mode: ERROR:  can no longer get changes from replication slot \"pgcdc_slot\"",
+        );
+        let err = classify_start_error("pgcdc_slot", e);
+        assert!(matches!(err, PgcdcError::SlotUnusable { .. }), "{err:?}");
+        assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn start_replication_transport_drop_stays_recoverable() {
+        // Обрыв связи (сокет, а не ответ сервера) обязан остаться
+        // восстановимым — иначе тесты на реконнект покраснели бы (см. отчёт
+        // по C1: мутация "сделать транспортный обрыв фатальным").
+        let e = ReplicationError::transient_connection("connection reset by peer");
+        let err = classify_start_error("pgcdc_slot", e);
+        assert!(matches!(err, PgcdcError::Connection(_)), "{err:?}");
+        assert!(!err.is_fatal());
+    }
+
+    #[test]
+    fn start_replication_slot_still_held_by_our_own_prior_session_stays_recoverable() {
+        // Сервер тоже ОТВЕТИЛ, но это не про непригодность слота — предыдущий
+        // walsender ещё не отпустил его. Разрешится само на следующей попытке.
+        let e = ReplicationError::protocol(
+            "START_REPLICATION did not enter COPY mode: ERROR:  replication slot \"pgcdc_slot\" is active for PID 4242",
+        );
+        let err = classify_start_error("pgcdc_slot", e);
+        assert!(matches!(err, PgcdcError::Connection(_)), "{err:?}");
+        assert!(!err.is_fatal());
+    }
 
     #[test]
     fn is_reconnect_is_false_on_a_cold_start() {

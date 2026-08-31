@@ -16,6 +16,17 @@ pub enum PgcdcError {
         durable: String,
     },
 
+    /// Сервер ОТВЕТИЛ на `START_REPLICATION` и явно отказал: слот
+    /// инвалидирован (`SQLSTATE 55000`) или несёт чужой output-плагин
+    /// (`SQLSTATE 22023`) — тот же запрос с теми же параметрами получит тот
+    /// же отказ и через час. В отличие от `SlotAhead`, здесь мы даже не
+    /// знаем расхождение позиций — сервер отказал раньше, чем до этого
+    /// дошло; в отличие от `Connection`, повторная попытка не транспортная
+    /// удача, а гарантированный повтор того же отказа (review round after
+    /// task 4, C1).
+    #[error("replication slot {slot} rejected START_REPLICATION: {reason}")]
+    SlotUnusable { slot: String, reason: String },
+
     #[error("malformed pgoutput message: {0}")]
     Decode(String),
 
@@ -53,6 +64,7 @@ impl PgcdcError {
         match self {
             Self::SlotMissing { .. } => "slot_missing",
             Self::SlotAhead { .. } => "slot_ahead",
+            Self::SlotUnusable { .. } => "slot_unusable",
             Self::Decode(_) => "decode",
             Self::UnsupportedMessage { .. } => "unsupported_message",
             Self::UnknownRelation { .. } => "unknown_relation",
@@ -69,6 +81,7 @@ impl PgcdcError {
         match self {
             Self::SlotMissing { .. } => true,
             Self::SlotAhead { .. } => true,
+            Self::SlotUnusable { .. } => true,
             Self::Decode(_) => true,
             Self::UnsupportedMessage { .. } => true,
             Self::UnknownRelation { .. } => true,
@@ -92,6 +105,18 @@ mod tests {
         assert!(PgcdcError::SlotMissing { slot: "s".into() }.is_fatal());
         assert!(PgcdcError::Decode("bad".into()).is_fatal());
         assert!(PgcdcError::UnsupportedMessage { kind: 'T' }.is_fatal());
+    }
+
+    #[test]
+    fn a_slot_that_the_server_refuses_to_stream_from_is_fatal() {
+        // C1: сервер, ответивший отказом на START_REPLICATION (инвалидация,
+        // чужой output-плагин), — не то же самое, что оборвавшаяся связь.
+        let err = PgcdcError::SlotUnusable {
+            slot: "s".into(),
+            reason: "boom".into(),
+        };
+        assert!(err.is_fatal());
+        assert_eq!(err.kind(), "slot_unusable");
     }
 
     #[test]

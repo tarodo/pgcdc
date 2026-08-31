@@ -97,16 +97,31 @@ pub async fn create_slot(client: &tokio_postgres::Client, slot: &str) {
         .expect("create slot");
 }
 
-/// Ждёт, пока `confirmed_flush_lsn` слота не догонит `target`.
-/// Опрос ограничен: если не догнал, тест падает с фактической позицией,
-/// а не висит.
+/// Ждёт, пока `confirmed_flush_lsn` слота не догонит `target`. Бюджет —
+/// по времени, а не по числу попыток (I3, review round after task 4).
+///
+/// Прежний дизайн ограничивал число ПОПЫТОК (100 × сон 100мс), а не время:
+/// при параллельной нагрузке суиты (`RUST_TEST_THREADS=4`,
+/// `.cargo/config.toml`) сама сверка (`query_one`) иногда занимает на
+/// порядки дольше сна между попытками, и все 100 попыток съедаются задолго
+/// до фактических 10 секунд, так и не увидев целевую позицию, — ровно так
+/// `a_productive_session_resets_the_backoff` падал раз в пять полных
+/// прогонов. Измерено (`task-4-report.md`): 50 сверок под чистой 4-поточной
+/// нагрузкой самой суиты уложились в 207–631мс; под дополнительной
+/// посторонней нагрузкой хоста воспроизведён случай, где одна сверка
+/// растянулась до 209 секунд и всё равно УСПЕШНО дождалась цели — слот
+/// продолжал подтверждаться, просто медленно. 60 секунд — на два порядка
+/// больше чистого случая и меньше воспроизведённого затора, так что тест
+/// падает на дне зависания, а не маскирует его бесконечным ожиданием.
 pub async fn wait_for_slot_at_least(
     client: &tokio_postgres::Client,
     slot: &str,
     target: pgcdc::lsn::Lsn,
 ) -> pgcdc::lsn::Lsn {
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + BUDGET;
     let mut last = pgcdc::lsn::Lsn(0);
-    for _ in 0..100 {
+    loop {
         let row = client
             .query_one(
                 "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
@@ -123,9 +138,11 @@ pub async fn wait_for_slot_at_least(
                 }
             }
         }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("слот не догнал {target} за {BUDGET:?}, остановился на {last}");
+        }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("слот не догнал {target}, остановился на {last}");
 }
 
 /// Обрывает наше репликационное соединение со стороны сервера. Это дешевле

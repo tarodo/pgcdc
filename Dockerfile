@@ -5,10 +5,26 @@
 # образе сборки, поэтому скопированный бинарь не упрётся в несовместимость.
 FROM rust:1-slim AS build
 WORKDIR /src
-# Сначала манифесты: слой с зависимостями переиспользуется, пока они не менялись.
+# Слой зависимостей: манифесты + заглушки обеих целей пакета (lib.rs и
+# main.rs — DECISIONS Q24, "один крейт, lib + тонкий bin") собираются
+# отдельно, ДО того как в образ попадает настоящий src/. Пока Cargo.toml и
+# Cargo.lock не менялись, Docker переиспользует этот слой целиком, и cargo
+# внутри следующего RUN пересобирает только сам pgcdc (два маленьких файла),
+# а не все внешние крейты заново. Измерено правкой одной строки в src/main.rs
+# и повторным `docker build`: 40.5с с нуля (36.4с — этот слой заглушек) →
+# 3.6с на пересборке (слой зависимостей CACHED, task-4-report.md).
 COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+    && echo "fn main() {}" > src/main.rs \
+    && touch src/lib.rs \
+    && cargo build --release --bin pgcdc \
+    && rm -rf src
+# Настоящий src/ приходит с mtime свежее заглушек — но COPY в некоторых
+# движках BuildKit может сохранить исходный mtime вместо времени копирования,
+# а cargo триггерит пересборку в том числе по mtime, — поэтому touch не
+# опция, а обязательный шаг, а не подстраховка ради подстраховки.
 COPY src ./src
-RUN cargo build --release --bin pgcdc
+RUN touch src/main.rs src/lib.rs && cargo build --release --bin pgcdc
 
 FROM debian:stable-slim
 RUN apt-get update \

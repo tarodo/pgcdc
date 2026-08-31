@@ -2,4 +2,5 @@ target
 .git
 .superpowers
 docs
-tests
+input
+scripts
