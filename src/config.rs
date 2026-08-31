@@ -4,8 +4,8 @@ use clap::{Parser, ValueEnum};
 
 use crate::error::PgcdcError;
 
-/// Обёртка над строкой подключения. Ручные Debug и Display вырезают пароль,
-/// поэтому утечь он может только через явный `expose()`.
+/// Wrapper over the connection string. Manual Debug and Display strip the password,
+/// so it can only leak through an explicit `expose()`.
 #[derive(Clone)]
 pub struct DatabaseUrl(String);
 
@@ -14,17 +14,17 @@ impl DatabaseUrl {
         Self(raw)
     }
 
-    /// Единственный способ получить строку с паролем. Использовать только
-    /// при передаче в драйвер, никогда в лог.
+    /// The only way to get the string with the password. Use only
+    /// when passing it to the driver, never for logging.
     pub fn expose(&self) -> &str {
         &self.0
     }
 
     fn redacted(&self) -> String {
-        // Ищем `://user:password@` и заменяем пароль звёздочками. Пароль
-        // может также приехать параметром запроса (`?password=...`) — это
-        // не выдумка, драйверы принимают обе формы, — поэтому вторым
-        // проходом чистим и его (C3 разбора всей ветки).
+        // Look for `://user:password@` and replace the password with asterisks. The
+        // password can also arrive as a query parameter (`?password=...`) — this
+        // is not made up, drivers accept both forms — so a second pass
+        // cleans that too (C3 of the whole branch's review).
         redact_query_password(&self.redact_credentials())
     }
 
@@ -48,10 +48,10 @@ impl DatabaseUrl {
         }
     }
 
-    /// Принимаем только URL-форму. Строку libpq (`host=... password=...`) отвергаем:
-    /// её нельзя ни отредактировать (`redacted()` не найдёт `@` и вернёт ввод дословно),
-    /// ни корректно дополнить параметром репликации. Принять формат, который мы не умеем
-    /// обработать, — значит слить секрет и всё равно упасть.
+    /// We accept only the URL form. We reject the libpq string (`host=... password=...`):
+    /// it cannot be redacted (`redacted()` won't find `@` and will return the input verbatim),
+    /// nor correctly extended with the replication parameter. Accepting a format we don't know
+    /// how to handle would mean leaking the secret and still failing.
     pub fn validate(&self) -> Result<(), PgcdcError> {
         if self.0.starts_with("postgres://") || self.0.starts_with("postgresql://") {
             Ok(())
@@ -61,10 +61,10 @@ impl DatabaseUrl {
     }
 }
 
-/// Заменяет значение параметра запроса `password` на звёздочки, если он есть.
-/// Работает поверх уже обработанной (или необработанной, если `@` не нашлось)
-/// строки — `redacted()` — единственный вызывающий, отдельная функция просто
-/// потому, что тут своя, не связанная с учётными данными в URL-authority логика.
+/// Replaces the `password` query parameter's value with asterisks, if present.
+/// Works on top of an already-processed (or unprocessed, if `@` wasn't found)
+/// string — `redacted()` is the only caller, it's a separate function simply
+/// because this is its own logic, unrelated to credentials in the URL authority.
 fn redact_query_password(url: &str) -> String {
     let Some(q) = url.find('?') else {
         return url.to_string();
@@ -99,10 +99,10 @@ impl fmt::Debug for DatabaseUrl {
     }
 }
 
-/// Разбор намеренно не может провалиться. Если вернуть здесь ошибку, clap напечатает
-/// отвергнутое значение целиком в своей обёртке «invalid value '...'», и пароль
-/// окажется в stderr. Проверка живёт в `validate()`, который зовётся первой строкой
-/// `run()`, где текст ошибки контролируем мы.
+/// Parsing intentionally cannot fail. Returning an error here would make clap print
+/// the rejected value in full inside its own "invalid value '...'" wrapper, and the
+/// password would end up in stderr. The check lives in `validate()`, called on the
+/// first line of `run()`, where we control the error text.
 impl std::str::FromStr for DatabaseUrl {
     type Err = std::convert::Infallible;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -119,15 +119,15 @@ pub enum OutputKind {
 #[derive(Debug, Parser)]
 #[command(name = "pgcdc", about = "PostgreSQL CDC via logical replication")]
 pub struct Config {
-    // hide_env_values: без него clap печатает СЫРОЕ значение переменной
-    // окружения в `--help` (`[env: PGCDC_DATABASE_URL=postgres://...:hunter2@...]`),
-    // в обход DatabaseUrl и его редактирующих Debug/Display целиком.
+    // hide_env_values: without it, clap prints the RAW environment variable
+    // value in `--help` (`[env: PGCDC_DATABASE_URL=postgres://...:hunter2@...]`),
+    // bypassing DatabaseUrl and its redacting Debug/Display entirely.
     #[arg(long, env = "PGCDC_DATABASE_URL", hide_env_values = true)]
     pub database_url: DatabaseUrl,
 
-    // Осознанное решение: publication/slot/output/max_transaction_events секретов
-    // не несут, поэтому им hide_env_values не нужен — видимость текущего значения
-    // в `--help` тут помогает отладке конфигурации и ничего не утекает.
+    // Deliberate decision: publication/slot/output/max_transaction_events carry no
+    // secrets, so they don't need hide_env_values — the current value being visible
+    // in `--help` helps debug the configuration here and nothing leaks.
     #[arg(long, env = "PGCDC_PUBLICATION")]
     pub publication: String,
 
@@ -137,42 +137,43 @@ pub struct Config {
     #[arg(long, env = "PGCDC_OUTPUT", value_enum, default_value = "stdout")]
     pub output: OutputKind,
 
-    /// Путь для `--output file`. Обязателен при этом варианте.
+    /// Path for `--output file`. Required for that variant.
     #[arg(long, env = "PGCDC_OUTPUT_PATH")]
     pub output_path: Option<std::path::PathBuf>,
 
     #[arg(long, env = "PGCDC_MAX_TRANSACTION_EVENTS", default_value = "100000")]
     pub max_transaction_events: usize,
 
-    // M8: нижняя граница — 1 — запрещена парсером, а не только описана в
-    // тексте справки, потому что с нулём условие "интервал прошёл" истинно
-    // на каждой итерации цикла — busy spin с fsync на каждый холостой тик
-    // (review Task 4, round 1, F4). Чтение ограничено отдельной константой
-    // SHUTDOWN_POLL_INTERVAL (200мс, replication.rs), а не этим полем
-    // (review Task 3, round 3, F4) — оба следствия этого расписаны в самом
-    // тексте --help ниже, но без внутренних ссылок на раунды ревью: конечный
-    // пользователь их не должен видеть, это шум на этапе, названном обвязкой.
-    /// Как часто вызывается барьер durability и уходит подтверждение.
-    /// Задержка подтверждения на корректность не влияет: инвариант 1
-    /// сохраняется, а дубликаты после сбоя контракт разрешает. Нижняя
-    /// граница — 1: с нулём условие "интервал прошёл" истинно на каждой
-    /// итерации цикла, то есть busy spin с fsync на каждый холостой тик.
-    /// Запрещаем это на уровне парсера, а не только в комментарии.
+    // M8: the lower bound — 1 — is forbidden by the parser, not just described in
+    // the help text, because with zero the "interval elapsed" condition is true
+    // on every loop iteration — a busy spin with an fsync on every idle tick
+    // (review Task 4, round 1, F4). Reading is bounded by a separate constant
+    // SHUTDOWN_POLL_INTERVAL (200ms, replication.rs), not by this field
+    // (review Task 3, round 3, F4) — both consequences of that are spelled out
+    // in the --help text itself below, but without internal references to review
+    // rounds: the end user shouldn't see those, they're noise at the stage named
+    // wiring.
+    /// How often the durability barrier is invoked and an acknowledgement goes out.
+    /// A delayed acknowledgement does not affect correctness: invariant 1
+    /// still holds, and the contract allows duplicates after a failure. The lower
+    /// bound is 1: with zero, the "interval elapsed" condition is true on every
+    /// iteration of the loop, i.e. a busy spin with an fsync on every idle tick.
+    /// We forbid this at the parser level, not just in a comment.
     ///
-    /// Два следствия из того, что чтение ограничено отдельной константой
-    /// `SHUTDOWN_POLL_INTERVAL` (200мс, `replication.rs`), а не этим полем:
-    /// - Выше 200мс: цикл всё равно просыпается раз в 200мс, а
-    ///   keepalive-продвижение проверяется на каждой итерации — значит на
-    ///   простаивающей публикации подтверждение слоту теперь уходит с
-    ///   частотой опроса, а не с частотой этого интервала. Вероятно, к
-    ///   лучшему (слот свежее), но это поведенческое изменение.
-    /// - Ниже 200мс: elapsed-проверка барьера выполняется только после
-    ///   возврата из чтения, а чтение ограничено 200мс сверху. На
-    ///   простаивающем потоке это ставит эффективный пол периода барьера в
-    ///   200мс: при минимуме парсера (1мс) транзакция, принятая перед
-    ///   паузой в трафике, будет ждать барьера около 200мс, а не 1мс. При
-    ///   реальном потоке событий цикл управляется приходом кадров, и
-    ///   настроенный период выдерживается.
+    /// Two consequences of the fact that reading is bounded by a separate constant
+    /// `SHUTDOWN_POLL_INTERVAL` (200ms, `replication.rs`) rather than by this field:
+    /// - Above 200ms: the loop still wakes up once every 200ms, and
+    ///   keepalive advancement is checked on every iteration — so on an idle
+    ///   publication, the acknowledgement to the slot now goes out at the
+    ///   polling frequency rather than at this interval's frequency. Probably
+    ///   for the better (the slot stays fresher), but it is a behavioral change.
+    /// - Below 200ms: the barrier's elapsed check runs only after
+    ///   returning from a read, and reading is capped at 200ms. On an
+    ///   idle stream this sets the barrier period's effective floor at
+    ///   200ms: at the parser's minimum (1ms), a transaction accepted right
+    ///   before a lull in traffic will wait about 200ms for the barrier, not 1ms.
+    ///   Under a real stream of events, the loop is driven by frame arrival, and
+    ///   the configured period is honored.
     #[arg(
         long,
         env = "PGCDC_ACK_INTERVAL_MS",
@@ -181,68 +182,68 @@ pub struct Config {
     )]
     pub ack_interval_ms: u64,
 
-    /// Начальная пауза перед первой попыткой переподключения.
-    /// Намеренно НЕ выводится из `ack_interval_ms`: тот задаёт только период
-    /// барьера (таймаут чтения — отдельная, не настраиваемая константа,
-    /// см. `SHUTDOWN_POLL_INTERVAL`), и связывать паузу реконнекта с ним
-    /// значило бы, что попытка ускорить подтверждение учащает долбёжку
-    /// упавшего сервера.
+    /// Initial pause before the first reconnect attempt.
+    /// Deliberately NOT derived from `ack_interval_ms`: that one only sets the
+    /// barrier period (the read timeout is a separate, non-configurable constant,
+    /// see `SHUTDOWN_POLL_INTERVAL`), and tying the reconnect pause to it
+    /// would mean that trying to speed up acknowledgement would make hammering
+    /// a downed server more frequent.
     #[arg(long, env = "PGCDC_RECONNECT_INITIAL_MS", default_value = "100",
           value_parser = clap::value_parser!(u64).range(1..))]
     pub reconnect_initial_ms: u64,
 
-    /// Потолок паузы. Экспоненциальный рост останавливается здесь и дальше
-    /// повторяет попытки бесконечно: сетевой сбой не повод ронять процесс
-    /// (DECISIONS Q19).
+    /// Ceiling for the pause. Exponential growth stops here and further
+    /// attempts repeat indefinitely: a network failure is not a reason to bring
+    /// down the process (DECISIONS Q19).
     #[arg(long, env = "PGCDC_RECONNECT_MAX_MS", default_value = "30000",
           value_parser = clap::value_parser!(u64).range(1..))]
     pub reconnect_max_ms: u64,
 
-    /// Верхняя граница на суммарное время, которое слот подряд может отвечать
-    /// гонкой "занят" (`SQLSTATE 55006`, `ERRCODE_OBJECT_IN_USE`), прежде чем
-    /// это перестаёт считаться разрешающейся самой гонкой с нашей же прошлой
-    /// сессией и становится фатальной ошибкой (`PgcdcError::SlotBusyTimedOut`).
-    /// Postgres отвечает ОДНИМ и тем же кодом состояния в обоих случаях —
-    /// «наш собственный walsender ещё не отсоединился» и «кто-то другой
-    /// держит слот навсегда» — единственный физический различитель это
-    /// ДЛИТЕЛЬНОСТЬ, а не сам код (`SlotBusyPatience`, `replication.rs`).
+    /// Upper bound on the total time the slot can respond with a "busy" race
+    /// (`SQLSTATE 55006`, `ERRCODE_OBJECT_IN_USE`) in a row before
+    /// this stops counting as a race resolving itself with our own prior
+    /// session and becomes a fatal error (`PgcdcError::SlotBusyTimedOut`).
+    /// Postgres responds with the SAME status code in both cases —
+    /// "our own walsender hasn't disconnected yet" and "someone else
+    /// is holding the slot forever" — the only physical discriminator
+    /// is DURATION, not the code itself (`SlotBusyPatience`, `replication.rs`).
     ///
-    /// Умолчание обосновано измерением, а не догадкой: 30 циклов
-    /// «walsender держит слот → drop → тайминг до следующего успешного
-    /// `START_REPLICATION` с нуля, включая установление нового соединения»
-    /// дали 45–124мс (медиана ~76мс) — это та же операция, что выполняет
-    /// `stream_once` на каждом реконнекте. Отдельно измеренное сырое время
-    /// до сброса флага `pg_replication_slots.active` (без накладных расходов
-    /// нового соединения) — 1.1–3.5мс. Умолчание 30000мс даёт запас ~240×
-    /// над худшим наблюдением полного цикла реконнекта и ~8500× над сырым
-    /// временем освобождения слота.
+    /// The default is justified by measurement, not guesswork: 30 cycles of
+    /// "walsender holds the slot → drop → timing to the next successful
+    /// `START_REPLICATION` from scratch, including establishing a new connection"
+    /// yielded 45–124ms (median ~76ms) — this is the same operation
+    /// `stream_once` performs on every reconnect. The raw time to clear the
+    /// `pg_replication_slots.active` flag, measured separately (without the
+    /// overhead of a new connection), was 1.1–3.5ms. The default of 30000ms gives
+    /// a margin of ~240× over the worst observed full reconnect cycle and
+    /// ~8500× over the raw slot-release time.
     ///
-    /// Счётчик копит только реально непрерывное время гонки: отказ другой
-    /// природы (сбой транспорта, недоступный сервер) накопленное не отбирает,
-    /// но рвёт цепочку — весь интервал от последнего наблюдения гонки до
-    /// следующего в бюджет не идёт, потому что мы не знаем, была ли занятость
-    /// внутри него. Эскалирует поэтому не любая вечная занятость, а такая,
-    /// у которой найдётся непрерванная цепочка наблюдений длиной в бюджет:
-    /// при редких посторонних сбоях она набирается, при отказе на каждой
-    /// второй попытке — нет.
-    /// Полностью счётчик закрывает только успешный старт сессии
-    /// (`classify_start_outcome`, ветка `Ok`) — единственное наблюдение,
-    /// доказывающее, что слот прямо сейчас свободен; поэтому несвязанные
-    /// между собой редкие гонки, случившиеся за месяцы работы долгоживущего
-    /// процесса и разделённые хотя бы одним успешным подключением, не
-    /// суммируются в один фатальный выход (`SlotBusyPatience`,
-    /// `replication.rs`).
+    /// The counter accumulates only genuinely continuous race time: a failure of
+    /// a different nature (transport failure, unreachable server) does not take
+    /// away the accumulated time, but it does break the chain — the entire interval
+    /// from the last race observation to the next does not count toward the
+    /// budget, because we don't know whether busyness held throughout it.
+    /// So it is not any perpetual busyness that escalates, but one that has
+    /// an unbroken chain of observations spanning the budget: it accumulates
+    /// under rare unrelated failures, but not under a failure on every other
+    /// attempt.
+    /// Only a successful session start (`classify_start_outcome`, the `Ok`
+    /// branch) fully closes the counter — the only observation that proves
+    /// the slot is free right now; so unrelated rare races that happen over
+    /// months of a long-running process's uptime, separated by at least one
+    /// successful connection, do not sum into a single fatal exit
+    /// (`SlotBusyPatience`, `replication.rs`).
     #[arg(long, env = "PGCDC_SLOT_BUSY_BUDGET_MS", default_value = "30000",
           value_parser = clap::value_parser!(u64).range(1..))]
     pub slot_busy_budget_ms: u64,
 }
 
 impl Config {
-    /// `clap` проверяет каждую границу порознь (`range(1..)`), но не их
-    /// отношение друг к другу. Начальная пауза больше потолка означает, что
-    /// первая попытка проспит долгую паузу, а `next_backoff` тут же схлопнет
-    /// её обратно к потолку — конфигурация технически валидна для парсера, но
-    /// бессмысленна (review Task 2, round 1, F8).
+    /// `clap` checks each bound separately (`range(1..)`), but not their
+    /// relationship to each other. An initial pause greater than the ceiling means
+    /// the first attempt would sleep through the long pause, and `next_backoff`
+    /// would immediately collapse it back to the ceiling — a configuration that is
+    /// technically valid for the parser but pointless (review Task 2, round 1, F8).
     pub fn validate_reconnect_bounds(&self) -> Result<(), PgcdcError> {
         if self.reconnect_initial_ms > self.reconnect_max_ms {
             return Err(PgcdcError::InvalidReconnectBounds {
@@ -261,8 +262,8 @@ mod tests {
 
     use super::*;
 
-    /// Аргументы, минимально достаточные для успешного разбора, без
-    /// `--ack-interval-ms` — тест дописывает его сам.
+    /// The minimal set of arguments sufficient for a successful parse, without
+    /// `--ack-interval-ms` — the test appends it itself.
     fn base_args() -> Vec<&'static str> {
         vec![
             "pgcdc",
@@ -277,11 +278,11 @@ mod tests {
 
     #[test]
     fn ack_interval_ms_rejects_zero_at_the_parser_level() {
-        // F4 (review Task 4, round 1): 0 означает, что `elapsed() >= interval`
-        // истинно на каждой итерации цикла — busy spin с fsync на каждый
-        // проход. Отвергать это должен парсер, чтобы конфигурацию с нулём
-        // нельзя было выразить вовсе, а не только надеяться, что цикл
-        // как-то переживёт такое значение.
+        // F4 (review Task 4, round 1): 0 means `elapsed() >= interval` is
+        // true on every loop iteration — a busy spin with an fsync on every
+        // pass. The parser must reject this, so that a configuration with zero
+        // cannot be expressed at all, rather than merely hoping the loop
+        // somehow survives such a value.
         let mut args = base_args();
         args.extend(["--ack-interval-ms", "0"]);
         let err = Config::try_parse_from(args).unwrap_err();
@@ -292,13 +293,13 @@ mod tests {
     fn ack_interval_ms_accepts_one_as_the_lowest_valid_value() {
         let mut args = base_args();
         args.extend(["--ack-interval-ms", "1"]);
-        let cfg = Config::try_parse_from(args).expect("1 обязан быть валиден");
+        let cfg = Config::try_parse_from(args).expect("1 must be valid");
         assert_eq!(cfg.ack_interval_ms, 1);
     }
 
-    // Review Task 2, round 1, F8: у `ack_interval_ms` были два таких теста
-    // (нулю нельзя, единице можно), у новых флагов бэкоффа — ни одного, то
-    // есть пропажа ограничения парсера прошла бы незамеченной.
+    // Review Task 2, round 1, F8: `ack_interval_ms` had two such tests
+    // (zero forbidden, one allowed), the new backoff flags had none — so
+    // the disappearance of the parser constraint would have gone unnoticed.
     #[test]
     fn reconnect_initial_ms_rejects_zero_at_the_parser_level() {
         let mut args = base_args();
@@ -311,7 +312,7 @@ mod tests {
     fn reconnect_initial_ms_accepts_one_as_the_lowest_valid_value() {
         let mut args = base_args();
         args.extend(["--reconnect-initial-ms", "1"]);
-        let cfg = Config::try_parse_from(args).expect("1 обязан быть валиден");
+        let cfg = Config::try_parse_from(args).expect("1 must be valid");
         assert_eq!(cfg.reconnect_initial_ms, 1);
     }
 
@@ -327,7 +328,7 @@ mod tests {
     fn reconnect_max_ms_accepts_one_as_the_lowest_valid_value() {
         let mut args = base_args();
         args.extend(["--reconnect-max-ms", "1", "--reconnect-initial-ms", "1"]);
-        let cfg = Config::try_parse_from(args).expect("1 обязан быть валиден");
+        let cfg = Config::try_parse_from(args).expect("1 must be valid");
         assert_eq!(cfg.reconnect_max_ms, 1);
     }
 
@@ -343,20 +344,20 @@ mod tests {
     fn slot_busy_budget_ms_accepts_one_as_the_lowest_valid_value() {
         let mut args = base_args();
         args.extend(["--slot-busy-budget-ms", "1"]);
-        let cfg = Config::try_parse_from(args).expect("1 обязан быть валиден");
+        let cfg = Config::try_parse_from(args).expect("1 must be valid");
         assert_eq!(cfg.slot_busy_budget_ms, 1);
     }
 
     #[test]
     fn slot_busy_budget_ms_defaults_to_thirty_seconds() {
-        let cfg = Config::try_parse_from(base_args()).expect("минимальные аргументы валидны");
+        let cfg = Config::try_parse_from(base_args()).expect("minimal arguments are valid");
         assert_eq!(cfg.slot_busy_budget_ms, 30_000);
     }
 
     #[test]
     fn an_initial_delay_above_the_ceiling_is_rejected() {
-        // Парсер видит только каждую границу порознь; отношение между ними
-        // проверяет validate_reconnect_bounds() (review Task 2, round 1, F8).
+        // The parser only sees each bound separately; the relationship between
+        // them is checked by validate_reconnect_bounds() (review Task 2, round 1, F8).
         let mut args = base_args();
         args.extend([
             "--reconnect-initial-ms",
@@ -364,7 +365,7 @@ mod tests {
             "--reconnect-max-ms",
             "1000",
         ]);
-        let cfg = Config::try_parse_from(args).expect("обе границы порознь валидны");
+        let cfg = Config::try_parse_from(args).expect("both bounds are individually valid");
         let err = cfg.validate_reconnect_bounds().unwrap_err();
         assert!(matches!(err, PgcdcError::InvalidReconnectBounds { .. }));
         assert!(err.is_fatal());
@@ -379,21 +380,18 @@ mod tests {
             "--reconnect-max-ms",
             "1000",
         ]);
-        let cfg = Config::try_parse_from(args).expect("обе границы порознь валидны");
+        let cfg = Config::try_parse_from(args).expect("both bounds are individually valid");
         assert!(cfg.validate_reconnect_bounds().is_ok());
     }
 
     #[test]
     fn from_str_accepts_anything_so_clap_never_echoes_the_input() {
-        // clap печатает отвергнутое значение в собственной обёртке «invalid value '...'».
-        // Единственный способ этого избежать — не давать clap повода отвергнуть:
-        // разбор всегда успешен, а проверка живёт в validate().
+        // clap prints the rejected value in its own "invalid value '...'" wrapper.
+        // The only way to avoid this is to give clap no reason to reject:
+        // parsing always succeeds, and the check lives in validate().
         let libpq = "host=db user=cdc password=hunter2 dbname=app";
-        let parsed: DatabaseUrl = libpq.parse().expect("разбор обязан быть инфаллибельным");
-        assert!(
-            parsed.validate().is_err(),
-            "но validate обязан это отвергнуть"
-        );
+        let parsed: DatabaseUrl = libpq.parse().expect("parsing must be infallible");
+        assert!(parsed.validate().is_err(), "but validate must reject this");
     }
 
     #[test]
@@ -403,14 +401,14 @@ mod tests {
         assert!(matches!(err, PgcdcError::InvalidDatabaseUrl));
         assert!(
             !err.to_string().contains("hunter2"),
-            "текст ошибки не должен содержать ввод: {err}"
+            "error text must not contain the input: {err}"
         );
     }
 
     #[test]
     fn validate_rejects_a_password_containing_a_scheme_separator() {
-        // Подстрочная проверка «содержит ://» пропускала libpq-строку, в ПАРОЛЕ
-        // которой есть ://, а redacted() возвращал такую строку дословно.
+        // A substring check for "contains ://" let through a libpq string whose
+        // PASSWORD contains ://, and redacted() would return such a string verbatim.
         let url = DatabaseUrl::new("host=db password=weird://leak dbname=app".into());
         assert!(url.validate().is_err());
     }
@@ -427,27 +425,28 @@ mod tests {
 
     #[test]
     fn password_never_reaches_debug_or_display() {
-        // Требование §4 спеки — это тип, а не «не забыть»: раз Debug вырезает
-        // пароль, ни #[derive(Debug)] на конфиге, ни поле tracing не смогут его слить.
+        // The requirement from spec §4 is enforced by the type, not by "don't forget":
+        // since Debug strips the password, neither #[derive(Debug)] on the config nor
+        // a tracing field can leak it.
         let url = DatabaseUrl::new("postgres://cdc:hunter2@db.example:5432/app".into());
         assert!(!format!("{url:?}").contains("hunter2"));
         assert!(!format!("{url}").contains("hunter2"));
         assert!(
             format!("{url}").contains("cdc"),
-            "имя пользователя остаётся видимым"
+            "the username stays visible"
         );
         assert!(format!("{url}").contains("db.example"));
         assert_eq!(url.expose(), "postgres://cdc:hunter2@db.example:5432/app");
 
-        // C3: пароль может приехать и параметром запроса, а не в credentials
-        // segment. `validate()` смотрит только на схему и такой URL пропустит —
-        // редактирование обязано отдельно закрыть эту форму.
+        // C3: the password can also arrive as a query parameter, not in the
+        // credentials segment. `validate()` only looks at the scheme and would let
+        // such a URL through — redaction must separately cover this form.
         let query_form = DatabaseUrl::new("postgres://cdc@db.example/app?password=hunter2".into());
         assert!(!format!("{query_form:?}").contains("hunter2"));
         assert!(!format!("{query_form}").contains("hunter2"));
         assert!(
             format!("{query_form}").contains("password=****"),
-            "параметр остаётся в форме, но без значения: {query_form}"
+            "the parameter stays in the form, but without a value: {query_form}"
         );
         assert!(format!("{query_form}").contains("cdc@db.example"));
     }

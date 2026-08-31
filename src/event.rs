@@ -3,8 +3,8 @@ use serde::Serialize;
 
 use crate::lsn::Lsn;
 
-/// Значения колонок всегда строки либо JSON null (DECISIONS Q16).
-/// `serde_json::Map` с включённым `preserve_order` держит порядок колонок таблицы.
+/// Column values are always strings or JSON null (DECISIONS Q16).
+/// `serde_json::Map` with `preserve_order` enabled keeps the table's column order.
 pub type Row = serde_json::Map<String, serde_json::Value>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -15,8 +15,8 @@ pub enum Operation {
     Delete,
 }
 
-/// Что именно сервер прислал в старом кортеже. Потребитель обязан различать
-/// «полная старая строка» и «только ключ», иначе примет заглушку за NULL.
+/// What exactly the server sent in the old tuple. The consumer must distinguish
+/// "full old row" from "key only", otherwise it will mistake a stub for NULL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BeforeKind {
@@ -44,8 +44,8 @@ fn serialize_ts<S: serde::Serializer>(ts: &DateTime<Utc>, s: S) -> Result<S::Ok,
     s.serialize_str(&ts.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }
 
-/// Микросекунды от эпохи PostgreSQL (2000-01-01T00:00:00Z), а не от Unix-эпохи.
-/// Смещение — 946684800 секунд.
+/// Microseconds since the PostgreSQL epoch (2000-01-01T00:00:00Z), not the Unix epoch.
+/// The offset is 946684800 seconds.
 pub fn pg_micros_to_utc(micros: i64) -> DateTime<Utc> {
     const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
     let secs = micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECS;
@@ -96,8 +96,8 @@ mod tests {
 
     #[test]
     fn optional_fields_are_present_not_omitted() {
-        // Стабильная форма важнее компактности (DECISIONS Q20): потребитель
-        // не должен писать `if "unchanged_columns" in event`.
+        // A stable shape matters more than compactness (DECISIONS Q20): the consumer
+        // must not have to write `if "unchanged_columns" in event`.
         let json = serde_json::to_string(&sample_insert()).unwrap();
         assert!(json.contains(r#""before":null"#));
         assert!(json.contains(r#""before_kind":null"#));
@@ -109,14 +109,14 @@ mod tests {
         let json = serde_json::to_string(&sample_insert()).unwrap();
         let id_at = json.find(r#""id""#).unwrap();
         let bio_at = json.find(r#""bio""#).unwrap();
-        assert!(id_at < bio_at, "порядок колонок должен быть как в таблице");
+        assert!(id_at < bio_at, "column order must match the table");
     }
 
     #[test]
     fn timestamp_uses_the_2000_epoch_not_1970() {
-        // Ровно та ловушка, что описана в docs/pgoutput-notes.md §5: от эпохи 1970
-        // это же число даёт 1996-08-30 с тем же днём месяца и тем же временем суток,
-        // то есть выглядит правдоподобной датой. Поэтому сверяем точное значение.
+        // Exactly the trap described in docs/pgoutput-notes.md §5: from the 1970 epoch
+        // this same number gives 1996-08-30 with the same day of month and the same time
+        // of day, i.e. it looks like a plausible date. So we check the exact value.
         let ts = pg_micros_to_utc(841_423_351_314_489);
         assert_eq!(
             ts.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),

@@ -8,14 +8,13 @@ use crate::error::PgcdcError;
 use crate::lsn::Lsn;
 use crate::transaction::Transaction;
 
-/// Абстракция над «довести до устройства», отдельная от `std::io::Write`.
-/// Единственная причина её существования — дать барьеру подставной тип в
-/// тестах (review Task 3, round 1, F2): `sync_data` — это не второстепенная
-/// деталь, а единственная строка, которая делает `Durability::Fsync` правдой
-/// для этого sink'а, а цикл репликации отмечает позиции durable именно на её
-/// основании. Держать её к более низкому стандарту проверки, чем `flush`
-/// трубы в stdout-sink'е (у которой durability нет вовсе), было бы задом
-/// наперёд.
+/// An abstraction over "make it durable on the device", separate from `std::io::Write`.
+/// The only reason it exists is to give the barrier a test double type in
+/// tests (review Task 3, round 1, F2): `sync_data` is not a secondary
+/// detail, it is the single line that makes `Durability::Fsync` true
+/// for this sink, and the replication loop marks positions durable precisely on its
+/// basis. Holding it to a lower verification standard than the pipe's `flush`
+/// in the stdout sink (which has no durability at all) would be backwards.
 trait DurableWrite: Write {
     fn durable_sync(&self) -> std::io::Result<()>;
 }
@@ -26,18 +25,18 @@ impl DurableWrite for File {
     }
 }
 
-/// JSONL с дозаписью в файл. Единственный sink этапа, способный честно
-/// обещать `Fsync`: барьер вызывает `sync_data`, и только после его успеха
-/// позиция может быть отмечена durable.
+/// JSONL appended to a file. The only sink at this stage able to honestly
+/// promise `Fsync`: the barrier calls `sync_data`, and only after it succeeds
+/// can a position be marked durable.
 #[derive(Debug)]
 pub struct FileSink {
     writer: BufWriter<File>,
-    /// Наибольшая принятая позиция с прошлого барьера.
+    /// The highest position accepted since the last barrier.
     pending: Option<Lsn>,
 }
 
 impl FileSink {
-    /// Открывает файл на дозапись, создавая при отсутствии.
+    /// Opens the file for appending, creating it if it doesn't exist.
     pub fn open(path: &Path) -> Result<Self, PgcdcError> {
         let file = OpenOptions::new()
             .create(true)
@@ -68,22 +67,22 @@ impl Sink for FileSink {
     }
 }
 
-/// Барьер: сначала выталкивает буфер пользовательского пространства
-/// (`flush`), затем заставляет ядро довести его до носителя (`durable_sync`),
-/// и только потом отдаёт накопившуюся позицию. Порядок обязателен — пропустить
-/// второй вызов или поменять их местами значит обещать `Fsync` и не выполнять
-/// обещание. Вынесена из `FileSink::flush`, как `flush_pending` вынесена из
-/// `StdoutSink::flush`, чтобы её можно было проверить напрямую через
-/// подставной writer, а не через дублёра всего sink'а.
+/// The barrier: first flushes the user-space buffer
+/// (`flush`), then makes the kernel commit it to the storage medium (`durable_sync`),
+/// and only then returns the accumulated position. The order is mandatory — skipping
+/// the second call or swapping them means promising `Fsync` and not delivering on
+/// the promise. Extracted out of `FileSink::flush`, the same way `flush_pending` is
+/// extracted out of `StdoutSink::flush`, so it can be tested directly through a
+/// test-double writer, rather than through a test double of the whole sink.
 fn flush_durable<W: DurableWrite>(
     writer: &mut BufWriter<W>,
     pending: &mut Option<Lsn>,
 ) -> Result<Option<Lsn>, PgcdcError> {
-    // Ничего не принято с прошлого барьера => буфер пуст и уже
-    // синхронизирован — иначе было бы что принимать. Без этой проверки
-    // барьер таймера (задача 4) вызывал бы flush и fsync на каждом тике
-    // безусловно, включая полностью простаивающий поток — несколько
-    // fsync в секунду в файл, к которому никто не притрагивался (review
+    // Nothing accepted since the last barrier => the buffer is empty and already
+    // synchronized — otherwise there would be something to accept. Without this
+    // check, the timer barrier (Task 4) would call flush and fsync on every tick
+    // unconditionally, including a fully idle stream — several
+    // fsyncs a second on a file no one has touched (review
     // Task 4, round 1, F3).
     if pending.is_none() {
         return Ok(None);
@@ -159,31 +158,30 @@ mod tests {
         s.flush().await.unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "две транзакции, три изменения");
+        assert_eq!(lines.len(), 3, "two transactions, three changes");
         for line in &lines {
-            serde_json::from_str::<serde_json::Value>(line).expect("каждая строка — JSON");
+            serde_json::from_str::<serde_json::Value>(line).expect("each line is JSON");
         }
         assert!(
             lines[2].contains(r#""id":"3""#),
-            "вторая транзакция дописана, а не затёрла"
+            "the second transaction was appended, not overwritten"
         );
         let _ = std::fs::remove_file(&p);
     }
 
     #[tokio::test]
     async fn append_survives_closing_and_reopening_the_sink() {
-        // F1 (review Task 3, round 1): `OpenOptions::append` действует, только
-        // пока файл открыт — тест, который пишет дважды через ОДИН и тот же
-        // `FileSink`, не отличит `.append(true)` от `.truncate(true).write(true)`:
-        // обе формы ведут себя одинаково, пока дескриптор не закрывался и не
-        // открывался заново. Отличить их может только повторное открытие того
-        // же пути новым sink'ом.
+        // F1 (review Task 3, round 1): `OpenOptions::append` only takes effect
+        // while the file is open — a test that writes twice through ONE and the same
+        // `FileSink` cannot distinguish `.append(true)` from `.truncate(true).write(true)`:
+        // both forms behave the same as long as the descriptor hasn't been closed and
+        // reopened. Only reopening the same path with a new sink can tell them apart.
         let p = temp_path("reopen");
         {
             let mut s = FileSink::open(&p).unwrap();
             s.write_transaction(&tx(0x1030, &["1"])).await.unwrap();
             s.flush().await.unwrap();
-        } // sink роняется здесь — файл закрывается по-настоящему
+        } // the sink is dropped here — the file is truly closed
         {
             let mut s = FileSink::open(&p).unwrap();
             s.write_transaction(&tx(0x1060, &["2"])).await.unwrap();
@@ -194,15 +192,15 @@ mod tests {
         assert_eq!(
             lines.len(),
             2,
-            "повторное открытие того же пути не должно затирать прошлую запись"
+            "reopening the same path must not erase the previous write"
         );
         assert!(
             lines[0].contains(r#""id":"1""#),
-            "запись из первого открытия обязана пережить закрытие"
+            "the write from the first opening must survive the close"
         );
         assert!(
             lines[1].contains(r#""id":"2""#),
-            "запись из второго открытия обязана дописаться, а не затереть первую"
+            "the write from the second opening must be appended, not overwrite the first"
         );
         let _ = std::fs::remove_file(&p);
     }
@@ -211,44 +209,45 @@ mod tests {
     async fn flush_reports_the_last_accepted_position_then_clears_it() {
         let p = temp_path("position");
         let mut s = FileSink::open(&p).unwrap();
-        assert_eq!(s.flush().await.unwrap(), None, "принимать было нечего");
+        assert_eq!(
+            s.flush().await.unwrap(),
+            None,
+            "there was nothing to accept"
+        );
         s.write_transaction(&tx(0x1030, &["1"])).await.unwrap();
         assert_eq!(s.flush().await.unwrap(), Some(Lsn(0x1030)));
         assert_eq!(
             s.flush().await.unwrap(),
             None,
-            "повторный барьер ничего не добавляет"
+            "a repeated barrier adds nothing"
         );
         let _ = std::fs::remove_file(&p);
     }
 
     #[tokio::test]
     async fn opening_an_unwritable_path_fails_loudly() {
-        // Каталог вместо файла: открыть на запись нельзя.
+        // A directory instead of a file: cannot be opened for writing.
         let err = FileSink::open(std::path::Path::new("/")).unwrap_err();
         assert!(matches!(err, PgcdcError::Sink(_)));
-        assert!(
-            err.is_fatal(),
-            "sink, который не может писать, — фатальная ошибка"
-        );
+        assert!(err.is_fatal(), "a sink that cannot write is a fatal error");
     }
 
-    /// Подставной writer, который не хранит байты, а только фиксирует ПОРЯДОК,
-    /// в котором были вызваны `flush` и `durable_sync`. Мирроит `RecordingWriter`
-    /// из stdout-sink'а (review Task 2, round 1, F3), где дублёр доказывал, что
-    /// `flush` потока реально вызывается, а не только что барьер возвращает
-    /// верную позицию. Здесь ставка выше: `durable_sync` — единственная
-    /// строка, которая делает `Durability::Fsync` правдой, — поэтому дублёр
-    /// проверяет не только сам вызов, но и то, что он идёт СТРОГО ПОСЛЕ
-    /// `flush`. Это пришпиливает сразу два регресса: удаление вызова и
-    /// перестановку вызовов местами — рефактор двумя этапами позже, в файле,
-    /// который никто не передиффит, тихо уронивший или переставивший строку,
-    /// не пройдёт мимо этого теста.
+    /// A test-double writer that stores no bytes, only records the ORDER
+    /// in which `flush` and `durable_sync` were called. Mirrors `RecordingWriter`
+    /// from the stdout sink (review Task 2, round 1, F3), where the test double proved
+    /// that the stream's `flush` is actually called, not just that the barrier returns
+    /// the right position. Here the stakes are higher: `durable_sync` is the only
+    /// line that makes `Durability::Fsync` true — so the test double checks not just
+    /// the call itself, but also that it comes STRICTLY AFTER
+    /// `flush`. This pins down two regressions at once: dropping the call and
+    /// swapping the calls — a refactor two stages later, in a file that
+    /// no one will re-diff, that silently drops or reorders the line
+    /// will not slip past this test.
     ///
-    /// Чего этот тест НЕ доказывает: что байты реально дошли до физического
-    /// носителя. Это может показать только трассировка системного вызова или
-    /// стенд для проверки поведения при сбое (crash-consistency harness), и
-    /// этот набор тестов не пытается сделать ни то, ни другое.
+    /// What this test does NOT prove: that the bytes actually reached the physical
+    /// storage medium. Only a syscall trace or a
+    /// crash-consistency harness could show that, and
+    /// this test suite does not attempt either.
     #[derive(Default)]
     struct RecordingSyncWriter {
         calls: RefCell<Vec<&'static str>>,
@@ -273,10 +272,10 @@ mod tests {
 
     #[test]
     fn flush_durable_calls_flush_then_sync_in_order() {
-        // F2 (review Task 3, round 1): проверяет реальный код `flush_durable`,
-        // а не дублёра. Удали вызов `durable_sync` — красный. Поменяй местами
-        // `flush` и `durable_sync` — тоже красный, потому что проверяется
-        // ПОРЯДОК вызовов, а не только их количество.
+        // F2 (review Task 3, round 1): tests the real `flush_durable` code,
+        // not a test double. Remove the `durable_sync` call — red. Swap
+        // `flush` and `durable_sync` — also red, because what's checked is
+        // the ORDER of calls, not just their count.
         let mut writer = BufWriter::new(RecordingSyncWriter::default());
         let mut pending = Some(Lsn(0x1030));
         let durable = flush_durable(&mut writer, &mut pending).unwrap();
@@ -284,28 +283,28 @@ mod tests {
         assert_eq!(
             writer.get_ref().calls.borrow().as_slice(),
             ["flush", "durable_sync"],
-            "durable_sync обязан идти строго после flush, иначе Fsync — пустое обещание"
+            "durable_sync must come strictly after flush, otherwise Fsync is an empty promise"
         );
         assert_eq!(
             pending, None,
-            "барьер обязан забрать ожидающую позицию, оставив None"
+            "the barrier must take the pending position, leaving None"
         );
     }
 
     #[test]
     fn flush_durable_does_not_touch_the_device_when_nothing_is_pending() {
-        // F3 (review Task 4, round 1): барьер таймера достигается на каждом
-        // тике, включая холостые — вызывать flush/fsync безусловно означало
-        // бы синхронизировать нетронутый файл несколько раз в секунду вечно
-        // простаивающего потока. Ничего не принято => буфер уже пуст и уже
-        // синхронизирован, так что ни один вызов сюда не должен доходить.
+        // F3 (review Task 4, round 1): the timer barrier is reached on every
+        // tick, including idle ones — calling flush/fsync unconditionally would
+        // mean synchronizing an untouched file several times a second on a forever
+        // idle stream. Nothing accepted => the buffer is already empty and already
+        // synchronized, so not a single call should reach here.
         let mut writer = BufWriter::new(RecordingSyncWriter::default());
         let mut pending = None;
         let durable = flush_durable(&mut writer, &mut pending).unwrap();
         assert_eq!(durable, None);
         assert!(
             writer.get_ref().calls.borrow().is_empty(),
-            "нечего подтверждать — flush и durable_sync не должны были вызваться: {:?}",
+            "nothing to acknowledge — flush and durable_sync should not have been called: {:?}",
             writer.get_ref().calls.borrow()
         );
     }

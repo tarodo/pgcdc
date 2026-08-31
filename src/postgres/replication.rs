@@ -18,8 +18,8 @@ use crate::schema::RelationCache;
 use crate::sink::Sink;
 use crate::transaction::Assembler;
 
-/// Строка подключения для репликационного соединения требует
-/// `replication=database` — без него сервер откроет обычную сессию.
+/// The connection string for a replication connection requires
+/// `replication=database` — without it the server opens an ordinary session.
 fn replication_url(base: &str) -> String {
     if base.contains('?') {
         format!("{base}&replication=database")
@@ -28,39 +28,38 @@ fn replication_url(base: &str) -> String {
     }
 }
 
-/// Можно ли подтвердить позицию, пришедшую в keepalive.
+/// Whether the position that arrived in a keepalive may be acknowledged.
 ///
-/// «Буфер пуст» само по себе НЕ достаточно (DECISIONS Q26a). Оно было достаточным,
-/// пока запись, отметка durable и подтверждение происходили в одной итерации; с
-/// групповым барьером появляется окно, где открытых транзакций нет, а принятые
-/// sink'ом и не доведённые до носителя данные есть. Подтвердить позицию внутри
-/// этого окна — значит подтвердить сверх durable и потерять данные при крахе.
+/// "The buffer is empty" is NOT sufficient on its own (DECISIONS Q26a). It was sufficient
+/// while the write, the durable mark and the acknowledgement happened in one iteration;
+/// with the group barrier a window appears where there are no open transactions, yet
+/// there is data the sink has accepted and has not carried to the medium. Acknowledging
+/// a position inside that window means acknowledging beyond durable and losing data on a
+/// crash.
 fn may_advance_from_keepalive(assembler_empty: bool, processed: Lsn, durable: Lsn) -> bool {
     assembler_empty && processed <= durable
 }
 
-/// Состояние, которое переживает обрыв соединения.
+/// The state that survives a connection drop.
 ///
-/// Разделение здесь не косметическое. Позиции трекера **переносятся** через
-/// реконнект: они монотонны, поэтому replay уже обработанных транзакций не
-/// может сдвинуть их назад, а durable-позиция — это ровно то, с чем
-/// `check_reconnect` сравнивает `confirmed_flush_lsn` слота. Обнулить трекер
-/// значило бы уничтожить единственный вход этой проверки.
+/// The split here is not cosmetic. The tracker's positions are **carried** across a
+/// reconnect: they are monotone, so a replay of already processed transactions cannot
+/// move them backwards, and the durable position is exactly what `check_reconnect`
+/// compares the slot's `confirmed_flush_lsn` against. Zeroing the tracker would destroy
+/// the only input of that check.
 ///
-/// Кэш отношений и сборщик, наоборот, **сбрасываются**: кэш живёт в рамках
-/// сессии репликации и после разрыва может описывать устаревшую схему
-/// (DECISIONS Q19), а недособранная транзакция придёт заново целиком, потому
-/// что её BEGIN был после `confirmed_flush_lsn`.
+/// The relation cache and the assembler, by contrast, are **reset**: the cache lives
+/// within one replication session and after a drop may describe a stale schema
+/// (DECISIONS Q19), while a half-assembled transaction arrives again in full, because
+/// its BEGIN was after `confirmed_flush_lsn`.
 ///
-/// Датчик буфера (`transaction_buffer_size`) обнуляется здесь же, отдельным
-/// вызовом (F1, review Task 2, round 1): его единственный обычный сайт записи
-/// живёт в приёмной ветке `stream_once` и срабатывает только на кадре
-/// данных, а этот сброс происходит на обрыве соединения без единого нового
-/// кадра. Не обнулить его значило бы держать последнее ненулевое значение
-/// сколь угодно долго на простаивающей после обрыва публикации — гейджу, в
-/// отличие от подтверждённой позиции, разрешено иметь второй сайт записи
-/// именно потому, что он обязан уметь падать вне общего хвоста
-/// `acknowledge_durable`.
+/// The buffer gauge (`transaction_buffer_size`) is zeroed right here, by a separate call
+/// (F1, review Task 2, round 1): its only ordinary write site lives in the receiving
+/// branch of `stream_once` and fires only on a data frame, while this reset happens on a
+/// connection drop without a single new frame. Not zeroing it would mean holding the
+/// last non-zero value arbitrarily long on a publication that goes idle after the drop —
+/// the gauge, unlike the acknowledged position, is allowed a second write site precisely
+/// because it MUST be able to fall outside the common tail of `acknowledge_durable`.
 pub(crate) struct SessionState {
     tracker: LsnTracker,
     assembler: Assembler,
@@ -87,45 +86,42 @@ impl SessionState {
     }
 }
 
-/// Чем закончилась одна сессия репликации.
+/// How one replication session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionOutcome {
-    /// Соединение оборвалось. Внешний цикл решает, переподключаться ли.
+    /// The connection dropped. The outer loop decides whether to reconnect.
     Disconnected,
-    /// Пришёл сигнал завершения и текущая группа доведена до барьера.
+    /// A shutdown signal arrived and the current group has been carried through the barrier.
     ShutdownRequested,
 }
 
-/// Ставит флаг по SIGTERM или SIGINT. Флаг читается в ТРЁХ местах: внутри
-/// сессии (`stream_once`, на каждом обороте её цикла), на входе в каждый
-/// проход внешнего цикла реконнекта (`run`) и внутри нарезанной паузы
-/// бэкоффа между попытками — три, а не два, как утверждала более ранняя
-/// версия этого комментария.
+/// Raises the flag on SIGTERM or SIGINT. The flag is read in THREE places: inside the
+/// session (`stream_once`, on every turn of its loop), on entry to each pass of the
+/// outer reconnect loop (`run`), and inside the sliced backoff pause between attempts —
+/// three, not two, as an earlier version of this comment claimed.
 ///
-/// Величиной `SHUTDOWN_POLL_INTERVAL` ограничены только ДВА из них — чтение
-/// внутри сессии и нарезка паузы бэкоффа, — не по счёту, а именно эти два:
-/// не `ack_interval_ms` (тот управляет только расписанием барьера) и не
-/// длиной самой паузы. Внутри сессии этой величиной ограничено само
-/// чтение; нарезка бэкоффа проверяет флаг перед каждым куском той же
-/// длины. Проверка на входе в проход внешнего цикла в этот список НЕ
-/// входит: её период — целый оборот (сессия плюс пауза реконнекта), а не
-/// `SHUTDOWN_POLL_INTERVAL`. Она не лишняя: нарезка проверяет флаг ПЕРЕД
-/// каждым куском и ни разу ПОСЛЕ последнего, так что сигнал, попавший
-/// именно в последний кусок, доходит только через эту третью,
-/// неограниченную проверку на следующем обороте (подробности и цена такой
-/// задержки — у самой проверки, `run`).
+/// Only TWO of them are bounded by `SHUTDOWN_POLL_INTERVAL` — the read inside the
+/// session and the slicing of the backoff pause — not two by count, but these two
+/// specifically: not `ack_interval_ms` (that one drives only the barrier schedule) and
+/// not the length of the pause itself. Inside the session the value bounds the read
+/// itself; the backoff slicing checks the flag before each chunk of that same length.
+/// The check on entry to a pass of the outer loop is NOT on that list: its period is a
+/// whole turn (a session plus the reconnect pause), not `SHUTDOWN_POLL_INTERVAL`. It is
+/// not redundant: the slicing checks the flag BEFORE each chunk and never once AFTER the
+/// last one, so a signal landing in exactly that last chunk gets through only via this
+/// third, unbounded check on the next turn (the details and the cost of that delay are
+/// at the check itself, `run`).
 ///
-/// Граница держится только внутри этих мест, а не в промежутке между
-/// чтением флага на входе во внешний цикл и первым чтением флага внутри
-/// сессии: там лежит preflight, установка соединения и запуск репликации
-/// (`stream_once` до входа в свой цикл) — ни один из этих шагов не смотрит
-/// на флаг и не ограничен по времени. Против отказанного порта это не
-/// стоит ничего: TCP отвечает отказом немедленно. Против адреса, который
-/// не отвечает вовсе (чёрная дыра, файрвол, тянущий пакеты), сигнал может
-/// остаться незамеченным десятки секунд — на длительность таймаутов
-/// установления соединения, а не на `SHUTDOWN_POLL_INTERVAL`. Это проще,
-/// чем городить select вокруг чтения, и не трогает порядок операций,
-/// проверенный мутационно.
+/// The bound holds only inside these places, not in the gap between the flag read on
+/// entry to the outer loop and the first flag read inside the session: in that gap sit
+/// the pre-flight check, establishing the connection and starting replication
+/// (`stream_once` up to entering its loop) — none of these steps looks at the flag or is
+/// bounded in time. Against a refused port this costs nothing: TCP refuses immediately.
+/// Against an address that does not answer at all (a black hole, a firewall swallowing
+/// packets), the signal can go unnoticed for tens of seconds — for the length of the
+/// connection-establishment timeouts, not for `SHUTDOWN_POLL_INTERVAL`. This is simpler
+/// than building a select around the read, and it does not touch the order of operations
+/// that mutation testing has verified.
 fn spawn_shutdown_listener() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     let f = flag.clone();
@@ -147,8 +143,8 @@ fn spawn_shutdown_listener() -> Arc<AtomicBool> {
     flag
 }
 
-/// Удвоение с потолком. `saturating_mul` вместо `*` — чтобы удвоение у верха
-/// диапазона не паниковало в debug-сборке.
+/// Doubling with a ceiling. `saturating_mul` instead of `*` — so that doubling near the
+/// top of the range does not panic in a debug build.
 fn next_backoff(current: Duration, max: Duration) -> Duration {
     let doubled = current.saturating_mul(2);
     if doubled > max {
@@ -158,28 +154,27 @@ fn next_backoff(current: Duration, max: Duration) -> Duration {
     }
 }
 
-/// Есть ли уже durable-позиция, с которой можно сверять слот. На холодном
-/// старте сравнивать не с чем — durable ещё ноль; сверка осмысленна только
-/// со второго подключения и далее.
+/// Whether there is already a durable position to check the slot against. On a cold
+/// start there is nothing to compare with — durable is still zero; the check is
+/// meaningful only from the second connection onwards.
 fn is_reconnect(durable: Lsn) -> bool {
     durable > Lsn(0)
 }
 
-/// SQLSTATE гонки «слот ещё занят нашей же прошлой сессией»
-/// (`ERRCODE_OBJECT_IN_USE`, `ReplicationSlotAcquire` в `slot.c` PostgreSQL).
+/// The SQLSTATE of the "the slot is still held by our own prior session" busy race
+/// (`ERRCODE_OBJECT_IN_USE`, `ReplicationSlotAcquire` in PostgreSQL's `slot.c`).
 const SLOT_BUSY_SQLSTATE: &str = "55006";
 
-/// Достаёт SQLSTATE из строки ошибки `pg_walstream`, если он там есть.
+/// Pulls the SQLSTATE out of a `pg_walstream` error string, if there is one there.
 ///
-/// Форматирование ответа сервера в этом крейте
-/// (`connection/native/error.rs::PgErrorFields::Display`) кладёт код
-/// состояния в ту же строку, что и текст сообщения:
-/// `"{severity}: {message} (SQLSTATE {code})"`. Оба живых прогона против
-/// реального Postgres это подтвердили дословно: `SQLSTATE 55000` на
-/// инвалидированном слоте, `SQLSTATE 22023` на чужом output-плагине (round
-/// after task 4). Код состояния — пятизначный идентификатор, который
-/// протокол PostgreSQL никогда не переводит; `message` рядом с ним
-/// переводится, если у сервера локализован `lc_messages`.
+/// This crate's formatting of the server's reply
+/// (`connection/native/error.rs::PgErrorFields::Display`) puts the state code into the
+/// same string as the message text: `"{severity}: {message} (SQLSTATE {code})"`. Both
+/// live runs against a real Postgres confirmed this verbatim: `SQLSTATE 55000` on an
+/// invalidated slot, `SQLSTATE 22023` on a foreign output plugin (round after task 4).
+/// The state code is a five-character identifier that the PostgreSQL protocol never
+/// translates; the `message` next to it is translated when the server has a localized
+/// `lc_messages`.
 fn extract_sqlstate(message: &str) -> Option<&str> {
     const MARKER: &str = "(SQLSTATE ";
     let start = message.find(MARKER)? + MARKER.len();
@@ -189,65 +184,58 @@ fn extract_sqlstate(message: &str) -> Option<&str> {
     (code.len() == 5 && code.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(code)
 }
 
-/// Классифицирует отказ `stream.start()` (C1, review round after task 4).
+/// Classifies a `stream.start()` failure (C1, review round after task 4).
 ///
-/// До этой функции ЛЮБАЯ ошибка `START_REPLICATION` заворачивалась в
-/// `PgcdcError::Connection` — восстановимый вариант — и процесс уходил в
-/// вечный реконнект с потолком бэкоффа даже тогда, когда слот инвалидирован
-/// (`SQLSTATE 55000`) или несёт чужой output-плагин (`SQLSTATE 22023`):
-/// сервер ОТВЕТИЛ и явно отказал, а не бросил связь. Повторный
-/// `START_REPLICATION` с теми же параметрами получит тот же отказ и через
-/// час — ретраить его значит не восстанавливаться, а прятать необратимую
-/// потерю доступа к WAL за видимостью работающего процесса (инвариант 3,
-/// DECISIONS §1).
+/// Before this function, ANY `START_REPLICATION` error was wrapped in
+/// `PgcdcError::Connection` — the recoverable variant — and the process went into an
+/// endless reconnect at the backoff ceiling even when the slot was invalidated
+/// (`SQLSTATE 55000`) or carried a foreign output plugin (`SQLSTATE 22023`): the server
+/// ANSWERED and explicitly refused, it did not drop the connection. A repeated
+/// `START_REPLICATION` with the same parameters will get the same refusal an hour later
+/// too — retrying it is not recovering, but hiding an irreversible loss of access to the
+/// WAL behind the appearance of a working process (invariant 3, DECISIONS §1).
 ///
-/// Различение опирается на `pg_walstream::ReplicationError::is_transient()`:
-/// разрыв сокета или временная неполадка транспорта (`Io`/
+/// The distinction rests on `pg_walstream::ReplicationError::is_transient()`: a socket
+/// drop or a temporary transport fault (`Io`/
 /// `TransientConnection`/`Timeout`/`ReplicationConnection`/`Backend`)
-/// остаётся восстановимой, а `Protocol` — которым крейт заворачивает и явный
-/// отказ сервера на `START_REPLICATION`, и низкоуровневую ошибку разбора
-/// самого проволочного формата (например, недопустимую длину сообщения,
-/// `connection/native/copy.rs`) — фатален по умолчанию. Для второго случая
-/// (порча самого протокола, а не отказ, адресованный слоту) вердикт
-/// «фатально» верен так же, как и для первого — небезопасно молча ретраить
-/// поток, чьё кодирование уже разошлось с ожидаемым, — но имя варианта,
-/// `PgcdcError::SlotUnusable`, вводит в заблуждение: эта ветка шире своего
-/// названия и ловит любой `Protocol`, а не только отказ, который сервер
-/// адресовал именно слоту.
+/// stays recoverable, while `Protocol` — into which the crate wraps both an explicit
+/// server refusal of `START_REPLICATION` and a low-level parse error of the wire format
+/// itself (an illegal message length, say, `connection/native/copy.rs`) — is fatal by
+/// default. For the second case (corruption of the protocol itself, not a refusal
+/// addressed to the slot) the "fatal" verdict is just as correct as for the first — it
+/// is unsafe to silently retry a stream whose encoding has already diverged from what we
+/// expect — but the variant's name, `PgcdcError::SlotUnusable`, is misleading: this
+/// branch is wider than its name and catches any `Protocol`, not only a refusal that the
+/// server addressed to the slot itself.
 ///
-/// Единственное исключение — гонка «слот ещё занят нашей же прошлой
-/// сессией» (`SQLSTATE 55006` = `ERRCODE_OBJECT_IN_USE`,
-/// `ReplicationSlotAcquire` в `slot.c` PostgreSQL): сервер тоже отвечает, но
-/// отказ здесь не про сам слот, а про то, что предыдущий walsender ещё не
-/// успел его отпустить — наш же реконнект мог прийти раньше, чем сервер
-/// дочистил прошлую сессию (DECISIONS Q19: каждый реконнект — новое
-/// соединение и новый `START_REPLICATION`). Это разрешится само на
-/// следующей попытке; объявить его фатальным значило бы уронить процесс на
-/// гонке, которую создаёт наш собственный реконнект.
+/// The only exception is the "the slot is still held by our own prior session" busy race
+/// (`SQLSTATE 55006` = `ERRCODE_OBJECT_IN_USE`, `ReplicationSlotAcquire` in PostgreSQL's
+/// `slot.c`): the server answers here too, but the refusal is not about the slot itself,
+/// it is about the previous walsender not having released it yet — our own reconnect may
+/// have arrived before the server finished cleaning up the prior session (DECISIONS Q19:
+/// every reconnect is a new connection and a new `START_REPLICATION`). This resolves by
+/// itself on the next attempt; declaring it fatal would mean killing the process over a
+/// race that our own reconnect creates.
 ///
-/// Эта гонка различается по коду состояния (`extract_sqlstate`), а не по
-/// переводимой подстроке текста: код состояния не переводится никогда,
-/// текст сообщения — переводится, когда у сервера локализован
-/// `lc_messages`, и тогда подстрочная проверка молча перестала бы находить
-/// гонку, превращая каждый её случай в фатальный выход. Подстрока
-/// `"is active for PID"` остаётся запасным условием только на случай, если
-/// строка ошибки почему-то не несёт SQLSTATE вовсе (например, будущая
-/// версия крейта поменяет форматирование) — не потому, что она равноценна
-/// коду; расчёт на неё как на основную проверку и есть то, что было
-/// исправлено этим раундом.
+/// This race is told apart by the state code (`extract_sqlstate`), not by a translatable
+/// substring of the text: the state code is never translated, the message text is —
+/// whenever the server has a localized `lc_messages` — and then the substring check
+/// would silently stop finding the race, turning every occurrence of it into a fatal
+/// exit. The substring `"is active for PID"` remains a fallback condition only for the
+/// case where the error string somehow carries no SQLSTATE at all (a future version of
+/// the crate changing the formatting, say) — not because it is equivalent to the code;
+/// relying on it as the primary check is exactly what this round fixed.
 ///
-/// Ограничение, которое эта функция в одиночку закрыть НЕ может: слот,
-/// занятый ЧУЖИМ (не нашим) потребителем НАВСЕГДА, отвечает буквально тем же
-/// `SQLSTATE 55006` — по одному коду состояния «наша прошлая сессия ещё не
-/// отсоединилась» и «кто-то другой держит слот вечно» неотличимы, и
-/// исключение выше классифицирует оба как восстановимые. Различитель этих
-/// двух случаев физический, а не в коде состояния: наша прошлая сессия
-/// отпускает слот за десятки миллисекунд (измерено, см.
-/// `SlotBusyPatience`), чужой потребитель — нет. Именно поэтому эта функция
-/// остаётся ЧИСТОЙ (без состояния, без времени) и не решает вопрос сама:
-/// вызывающий (`classify_start_outcome`) оборачивает её решение бюджетом
-/// терпения, накопленным по длительности, и эскалирует в
-/// `PgcdcError::SlotBusyTimedOut`, когда терпение исчерпано.
+/// The limitation this function CANNOT close on its own: a slot held FOREVER by a
+/// FOREIGN (not our own) consumer answers with literally the same `SQLSTATE 55006` — by
+/// the state code alone, "our prior session has not disconnected yet" and "someone else
+/// holds the slot forever" are indistinguishable, and the exception above classifies
+/// both as recoverable. What tells these two cases apart is physical, not in the state
+/// code: our prior session releases the slot within tens of milliseconds (measured, see
+/// `SlotBusyPatience`), a foreign consumer does not. That is exactly why this function
+/// stays PURE (no state, no time) and does not settle the question itself: the caller
+/// (`classify_start_outcome`) wraps its decision in a patience budget accumulated by
+/// duration and escalates to `PgcdcError::SlotBusyTimedOut` once the patience is spent.
 fn classify_start_error(slot: &str, e: ReplicationError) -> PgcdcError {
     let reason = e.to_string();
     if e.is_transient() || is_busy_race_reason(&reason) {
@@ -260,10 +248,10 @@ fn classify_start_error(slot: &str, e: ReplicationError) -> PgcdcError {
     }
 }
 
-/// Общий признак гонки "занят" (`SQLSTATE 55006`), вынесенный из
-/// `classify_start_error` отдельно, чтобы `classify_start_outcome` мог
-/// проверить его ДО того, как ошибка будет классифицирована и текст
-/// сообщения станет недоступен без повторного `to_string()`.
+/// The shared test for the busy race (`SQLSTATE 55006`), pulled out of
+/// `classify_start_error` separately so that `classify_start_outcome` can check it
+/// BEFORE the error is classified and the message text becomes unreachable without
+/// another `to_string()`.
 fn is_busy_race_reason(reason: &str) -> bool {
     match extract_sqlstate(reason) {
         Some(code) => code == SLOT_BUSY_SQLSTATE,
@@ -271,62 +259,60 @@ fn is_busy_race_reason(reason: &str) -> bool {
     }
 }
 
-/// Отслеживает, сколько времени ПОДРЯД слот отвечает гонкой "занят"
-/// (`SQLSTATE 55006`). Код состояния не различает «наша прошлая сессия ещё
-/// не отсоединилась» (разрешается за десятки миллисекунд) от «кто-то другой
-/// держит слот навсегда» (не разрешается никогда) — единственный физический
-/// различитель это ДЛИТЕЛЬНОСТЬ, поэтому бюджет терпения задан временем, а
-/// не числом попыток: число попыток зависит от длины паузы бэкоффа, а не от
-/// природы отказа.
+/// Tracks how long the slot has been answering with the busy race (`SQLSTATE 55006`)
+/// IN A ROW. The state code does not distinguish "our prior session has not disconnected
+/// yet" (resolves within tens of milliseconds) from "someone else holds the slot
+/// forever" (never resolves) — the only physical discriminator is DURATION, which is why
+/// the patience budget is given in time and not in a number of attempts: the number of
+/// attempts depends on the length of the backoff pause, not on the nature of the
+/// failure.
 ///
-/// Измерено (30 циклов «walsender держит слот → drop → тайминг до
-/// следующего успешного `START_REPLICATION` с нуля, включая установление
-/// нового соединения» — та же операция, что выполняет `stream_once` на
-/// каждом реконнекте): 45–124мс, медиана ~76мс. Отдельно измерено сырое
-/// время до сброса флага `pg_replication_slots.active`, без накладных
-/// расходов нового соединения: 1.1–3.5мс, медиана ~1.8мс — то есть почти
-/// весь след из первого замера это не задержка освобождения слота, а
-/// накладные расходы TCP + аутентификации + `START_REPLICATION` самого
-/// пробного соединения. Умолчание бюджета (`--slot-busy-budget-ms`,
-/// 30000мс, `Config`) взято с запасом ~240× над худшим наблюдением полного
-/// цикла реконнекта и ~8500× над сырым временем освобождения слота.
+/// Measured (30 cycles of "walsender holds the slot → drop → time to the next successful
+/// `START_REPLICATION` from scratch, including establishing a new connection" — the same
+/// operation `stream_once` performs on every reconnect): 45–124ms, median ~76ms.
+/// Measured separately, the raw time until the `pg_replication_slots.active` flag
+/// clears, without the overhead of a new connection: 1.1–3.5ms, median ~1.8ms — that is,
+/// almost the whole trace in the first measurement is not the slot-release delay but the
+/// TCP + authentication + `START_REPLICATION` overhead of the probe connection itself.
+/// The budget default (`--slot-busy-budget-ms`, 30000ms, `Config`) is taken with a
+/// margin of ~240× over the worst observation of a full reconnect cycle and ~8500× over
+/// the raw slot-release time.
 ///
-/// Наблюдения гонки внутри одного эпизода не обязаны идти совсем без
-/// перерыва: отказ другой природы (сбой транспорта, отказ preflight, разрыв
-/// TCP) может вклиниться между двумя наблюдениями гонки, не закрывая эпизод
-/// целиком. Полное обнуление на ЛЮБОМ таком отказе (первая версия этого
-/// исправления, review round 2 after task 4 finale, I1) чинило одну дыру и
-/// открывало противоположную: слот, занятый ЧУЖИМ потребителем НАВСЕГДА на
-/// сервере, который вдобавок изредка роняет соединение по не связанной
-/// причине, никогда не копил бы времени больше, чем интервал между двумя
-/// такими отказами — воспроизведено юнит-тестом с бюджетом по умолчанию
-/// (30000мс), непрерывной занятостью слота и посторонним сбоем раз в 29
-/// секунд: под полным обнулением эскалации не происходит ни разу за
-/// смоделированный час.
+/// Observations of the race within one episode need not follow with no break at all: a
+/// failure of a different nature (a transport fault, a pre-flight check failure, a TCP
+/// drop) may wedge itself between two observations of the race without closing the
+/// episode entirely. Zeroing everything on ANY such failure (the first version of this
+/// fix, review round 2 after task 4 finale, I1) fixed one hole and opened the opposite
+/// one: a slot held FOREVER by a FOREIGN consumer on a server that on top of that
+/// occasionally drops the connection for an unrelated reason would never accumulate more
+/// time than the interval between two such failures — reproduced by a unit test with the
+/// default budget (30000ms), a continuously busy slot and an unrelated failure once
+/// every 29 seconds: under full zeroing no escalation happens even once over a simulated
+/// hour.
 ///
-/// Поэтому отказ другой природы (`interrupt`) не обнуляет эпизод, а лишь
-/// РАЗРЫВАЕТ цепочку подряд идущих наблюдений: накопленное время
-/// (`accumulated`) сохраняется, но интервал МЕЖДУ последним наблюдением
-/// гонки и следующим — целиком, а не только его часть после самого отказа —
-/// в накопленное не идёт. Это и есть вычитание простоя: мы физически не
-/// знаем, что происходило внутри интервала ДО отказа, он мог быть таким же
-/// простоем от начала и до конца, поэтому в счёт идёт только время между
-/// двумя наблюдениями гонки, между которыми не было ни одного стороннего
-/// отказа. Полностью закрывает эпизод (обнуляет и накопленное, и цепочку)
-/// только `reset()` — он зовётся ЕДИНСТВЕННО на успешном старте сессии
-/// (`classify_start_outcome`, ветка `Ok`): это единственное наблюдение,
-/// которое физически доказывает, что слот прямо сейчас свободен, а не
-/// просто что подряд не было ответа гонкой.
+/// So a failure of a different nature (`interrupt`) does not zero the episode, it only
+/// BREAKS the chain of consecutive observations: the accumulated time (`accumulated`) is
+/// kept, but the interval BETWEEN the last observation of the race and the next one — in
+/// full, not only the part of it after the failure itself — does not go into the
+/// accumulated total. That is exactly the subtraction of the idle interval: we
+/// physically do not know what happened inside the interval BEFORE the failure, it could
+/// have been the same idle interval from beginning to end, so only the time between two
+/// observations of the race with not a single foreign failure in between counts. The
+/// episode is closed entirely (zeroing both the accumulated total and the chain) only by
+/// `reset()` — which is called SOLELY on a successful session start
+/// (`classify_start_outcome`, the `Ok` branch): that is the only observation which
+/// physically proves the slot is free right now, and not merely that there was no
+/// busy-race answer in a row.
 struct SlotBusyPatience {
-    /// Сумма длительностей всех подряд идущих (без вклинившегося отказа
-    /// другой природы) промежутков между наблюдениями гонки "занят" внутри
-    /// текущего эпизода.
+    /// The sum of the durations of all consecutive (with no failure of a different
+    /// nature wedged in) gaps between observations of the busy race inside the current
+    /// episode.
     accumulated: Duration,
-    /// Момент последнего наблюдения гонки "занят" в текущей, ещё не
-    /// прерванной цепочке. `None` — либо эпизода ещё не было вовсе, либо
-    /// цепочка прервана отказом другой природы: следующее наблюдение гонки
-    /// обязано начать счёт заново, не приписывая эпизоду интервал с момента
-    /// этого прерывания.
+    /// The moment of the last observation of the busy race in the current, not yet
+    /// broken chain. `None` means either there has been no episode at all yet, or the
+    /// chain was broken by a failure of a different nature: the next observation of the
+    /// race MUST start counting anew, without charging the episode with the interval
+    /// since that break.
     last_busy: Option<Instant>,
 }
 
@@ -338,20 +324,19 @@ impl SlotBusyPatience {
         }
     }
 
-    /// Отмечает очередное наблюдение гонки "занят" в момент `now`. Если
-    /// цепочка не прервана (`last_busy` есть), к накопленному добавляется
-    /// интервал с прошлого наблюдения; если прервана или это первое
-    /// наблюдение вовсе — интервал не добавляется, копить нечего. Возвращает
-    /// `Some(accumulated)`, когда накопленное достигло или превысило
-    /// `budget` — вызывающий обязан считать это исчерпанием терпения и
-    /// фатальной ошибкой.
+    /// Records another observation of the busy race at the moment `now`. If the chain is
+    /// unbroken (`last_busy` is present), the interval since the previous observation is
+    /// added to the accumulated total; if it is broken, or this is the very first
+    /// observation at all, no interval is added — there is nothing to accumulate.
+    /// Returns `Some(accumulated)` once the accumulated total has reached or exceeded
+    /// `budget` — the caller MUST treat that as the patience being spent and as a fatal
+    /// error.
     ///
-    /// `saturating_duration_since`/`saturating_add` защищают от
-    /// отрицательной или переполненной длительности при любом порядке
-    /// событий: если `now` придёт раньше предыдущего наблюдения (событие не
-    /// в том порядке) или суммарное время упрётся в потолок представления
-    /// `Duration`, обе операции насыщаются, а не паникуют и не уходят в
-    /// отрицательные числа.
+    /// `saturating_duration_since`/`saturating_add` guard against a negative or
+    /// overflowed duration under any ordering of events: if `now` arrives earlier than
+    /// the previous observation (events out of order) or the total time hits the ceiling
+    /// of the `Duration` representation, both operations saturate instead of panicking
+    /// or going negative.
     fn observe_busy(&mut self, now: Instant, budget: Duration) -> Option<Duration> {
         if let Some(prev) = self.last_busy {
             self.accumulated = self
@@ -362,38 +347,36 @@ impl SlotBusyPatience {
         (self.accumulated >= budget).then_some(self.accumulated)
     }
 
-    /// Разрывает цепочку подряд идущих наблюдений гонки, НЕ закрывая эпизод:
-    /// накопленное время остаётся как было, но интервал с последнего
-    /// наблюдения гонки до следующего в накопленное не войдёт — вычитание
-    /// простоя, а не обнуление. Зовётся на любом отказе, который не является
-    /// ни гонкой "занят", ни успешным стартом сессии: отказ другой природы
-    /// внутри `classify_start_outcome` и любой отказ `stream_once` ДО того,
-    /// как классификация вообще состоялась
-    /// (`interrupt_patience_on_early_failure`: preflight слота, сверка
-    /// реконнекта, открытие соединения).
+    /// Breaks the chain of consecutive observations of the race WITHOUT closing the
+    /// episode: the accumulated time stays as it was, but the interval from the last
+    /// observation of the race to the next one will not enter the accumulated total —
+    /// subtraction of the idle interval, not zeroing. Called on any failure that is
+    /// neither the busy race nor a successful session start: a failure of a different
+    /// nature inside `classify_start_outcome`, and any `stream_once` failure BEFORE the
+    /// classification even happened (`interrupt_patience_on_early_failure`: the slot
+    /// pre-flight check, the reconnect check, opening the connection).
     fn interrupt(&mut self) {
         self.last_busy = None;
     }
 
-    /// Закрывает эпизод целиком: накопленное время обнуляется вместе с
-    /// цепочкой. Единственный источник вызова в проде — успешный старт
-    /// сессии (`classify_start_outcome`, ветка `Ok`): это единственное
-    /// наблюдение, которое доказывает, что слот прямо сейчас свободен, а не
-    /// просто что подряд не было гонки.
+    /// Closes the episode entirely: the accumulated time is zeroed along with the chain.
+    /// The only call site in production is a successful session start
+    /// (`classify_start_outcome`, the `Ok` branch): that is the only observation which
+    /// proves the slot is free right now, and not merely that there was no race in a
+    /// row.
     fn reset(&mut self) {
         self.accumulated = Duration::ZERO;
         self.last_busy = None;
     }
 }
 
-/// Классифицирует исход `stream.start()` вместе с решением о терпении к
-/// занятому слоту — хвост, общий для обоих полей задачи: `classify_start_error`
-/// решает recoverable/fatal по ОДНОЙ попытке, эта функция добавляет
-/// накопленное по ВРЕМЕНИ решение поверх него. Вынесена отдельно от
-/// `stream_once`, чтобы мутация "убрать сброс терпения на успешном старте"
-/// ловилась юнит-тестом уровня значений, а не только интеграционным
-/// сценарием на реальном Postgres (тот же приём, что и у
-/// `session_was_productive`/`ReconnectBackoff` выше).
+/// Classifies the outcome of `stream.start()` together with the decision about patience
+/// for a busy slot — the tail shared by both halves of the problem:
+/// `classify_start_error` decides recoverable/fatal from ONE attempt, this function adds
+/// the decision accumulated by TIME on top of it. Pulled out of `stream_once` so that
+/// the mutation "remove the patience reset on a successful start" is caught by a
+/// value-level unit test and not only by an integration scenario against a real Postgres
+/// (the same device as with `session_was_productive`/`ReconnectBackoff` above).
 fn classify_start_outcome(
     slot: &str,
     result: Result<(), ReplicationError>,
@@ -416,37 +399,36 @@ fn classify_start_outcome(
                 budget_ms: budget.as_millis() as u64,
             });
         }
-        // Гонка ещё в бюджете: единственная ветка, которая обязана НЕ
-        // трогать патиенс — иначе эпизод никогда бы не накопил достаточно
-        // времени, чтобы вообще сработать.
+        // The race is still within budget: the only branch that MUST NOT touch the
+        // patience — otherwise an episode would never accumulate enough time to fire
+        // at all.
         return Err(classify_start_error(slot, e));
     }
-    // P1 (review round 2 after task 4 finale): отказ другой природы (не
-    // гонка "занят") ПРЕРЫВАЕТ цепочку подряд идущих наблюдений, а не
-    // закрывает эпизод целиком — полное закрытие здесь чинило бы суммирование
-    // несвязанных эпизодов, но открывало бы противоположную дыру: слот,
-    // занятый чужим потребителем навсегда вперемешку с редкими отказами
-    // другой природы, никогда не накопил бы времени для эскалации.
+    // P1 (review round 2 after task 4 finale): a failure of a different nature (not the
+    // busy race) BREAKS the chain of consecutive observations, it does not close the
+    // episode entirely — closing it fully here would fix the summing of unrelated
+    // episodes, but would open the opposite hole: a slot held forever by a foreign
+    // consumer, interleaved with rare failures of a different nature, would never
+    // accumulate enough time to escalate.
     patience.interrupt();
     Err(classify_start_error(slot, e))
 }
 
-/// Общий хвост для ЛЮБОГО отказа `stream_once`, случившегося ДО того, как
-/// `classify_start_outcome` успела классифицировать `stream.start()`:
-/// preflight-проверка слота, сверка реконнекта, открытие самого соединения.
-/// Ни один из этих отказов не может быть гонкой "занят" — SQLSTATE 55006
-/// возвращает только ответ сервера на сам `START_REPLICATION`, — поэтому
-/// такой отказ безусловно ПРЕРЫВАЕТ цепочку подряд идущих наблюдений гонки
-/// (P1, review round 2 after task 4 finale): без этого часы, накопленные
-/// прошлой гонкой, продолжали бы идти всё то время, пока сервер недоступен
-/// по совсем другой причине, и интервал недоступности сложился бы в
-/// накопленное как будто слот всё это время отвечал гонкой. Прерывание НЕ
-/// закрывает эпизод — накопленное раньше время сохраняется, эскалация
-/// непрерывно занятого слота с редкими посторонними сбоями по-прежнему
-/// произойдёт, просто без прибавления интервала самого отказа. `Ok` здесь
-/// нарочно не трогает патиенс: успех preflight/сверки/открытия соединения
-/// ещё не значит, что сессия стартовала — это решает только
-/// `classify_start_outcome` дальше по `stream_once`.
+/// The common tail for ANY `stream_once` failure that happened BEFORE
+/// `classify_start_outcome` got to classify `stream.start()`: the slot pre-flight check,
+/// the reconnect check, opening the connection itself. None of these failures can be the
+/// busy race — SQLSTATE 55006 comes back only in the server's answer to
+/// `START_REPLICATION` itself — so such a failure unconditionally BREAKS the chain of
+/// consecutive observations of the race (P1, review round 2 after task 4 finale):
+/// without this, the clock accumulated by a past race would keep running for the whole
+/// time the server is unreachable for an entirely different reason, and the interval of
+/// unreachability would add into the accumulated total as if the slot had been answering
+/// with the race all along. The break does NOT close the episode — the time accumulated
+/// earlier is kept, the escalation of a continuously busy slot with rare unrelated
+/// failures still happens, just without adding the interval of the failure itself. `Ok`
+/// here deliberately does not touch the patience: success of the pre-flight check/the
+/// reconnect check/opening the connection does not yet mean the session started — only
+/// `classify_start_outcome` further along `stream_once` decides that.
 fn interrupt_patience_on_early_failure<T>(
     result: Result<T, PgcdcError>,
     patience: &mut SlotBusyPatience,
@@ -457,25 +439,24 @@ fn interrupt_patience_on_early_failure<T>(
     result
 }
 
-/// Была ли только что закончившаяся сессия продуктивной для целей сброса
-/// бэкоффа реконнекта. Читает ПОДТВЕРЖДЁННУЮ трекером позицию (`acked`), а
-/// не принятую (`received`), намеренно: и групповой барьер, и keepalive-
-/// продвижение на простаивающей публикации двигают `acked`, а `received`
-/// реагирует только на приход кадра данных. Вынесена в отдельную функцию,
-/// принимающую сам трекер, а не голые `Lsn`, ровно затем, чтобы это чтение
-/// можно было закрепить юнит-тестом на этом уровне: живое доказательство,
-/// что расхождение реально, — спокойный прогон, где сводка показала `acked`
-/// продвинутым при `received` на нуле, keepalive подтвердил WAL, не приняв
-/// ни одного кадра (review Task 2, round 1, F1; review Task 3, round 1,
-/// F3).
+/// Whether the session that has just ended was productive for the purposes of resetting
+/// the reconnect backoff. It reads the tracker's ACKNOWLEDGED position (`acked`), not
+/// the received one (`received`), deliberately: both the group barrier and the
+/// keepalive advance on an idle publication move `acked`, while `received` reacts only
+/// to the arrival of a data frame. Pulled into its own function taking the tracker
+/// itself rather than bare `Lsn`s precisely so that this read can be pinned by a unit
+/// test at this level: the live proof that the divergence is real is a quiet run where
+/// the metrics report showed `acked` advanced with `received` at zero, the keepalive
+/// acknowledged WAL without accepting a single frame (review Task 2, round 1, F1;
+/// review Task 3, round 1, F3).
 fn session_was_productive(tracker: &LsnTracker, acked_before: Lsn) -> bool {
     tracker.acked() > acked_before
 }
 
-/// Пауза перед следующей попыткой подключения. Обёрнута в тип, а не голый
-/// `Duration`, живущий внутри бесконечного цикла `run()` с настоящими
-/// `sleep`, — ради тестируемости: в таком виде мутация "убрать сброс" не
-/// ловилась ни одним тестом (review Task 2, round 1, F2).
+/// The pause before the next connection attempt. Wrapped in a type rather than a bare
+/// `Duration` living inside the infinite loop of `run()` with real `sleep`s — for
+/// testability: in that form the mutation "remove the reset" was caught by no test at
+/// all (review Task 2, round 1, F2).
 struct ReconnectBackoff {
     current: Duration,
     initial: Duration,
@@ -491,16 +472,16 @@ impl ReconnectBackoff {
         }
     }
 
-    /// Продуктивная сессия сбрасывает паузу на начальную: без этого один
-    /// долгий простой навсегда оставлял бы паузу на потолке, и следующий
-    /// одиночный сбой через неделю ждал бы полминуты впустую. Что считать
-    /// продуктивностью — решает вызывающий; передавать сюда нужно движение
-    /// ПОДТВЕРЖДЁННОЙ позиции, а не принятой: keepalive-продвижение простаивающей
-    /// публикации подтверждает WAL, ничего не читая, и было бы ошибочно
-    /// признано непродуктивным (review Task 2, round 1, F1).
+    /// A productive session resets the pause to the initial one: without that, one long
+    /// outage would leave the pause at the ceiling forever, and the next isolated
+    /// failure a week later would wait half a minute for nothing. What counts as
+    /// productivity is up to the caller; what must be passed in here is movement of the
+    /// ACKNOWLEDGED position, not of the received one: the keepalive advance on an idle
+    /// publication acknowledges WAL without reading anything, and would be wrongly
+    /// judged unproductive (review Task 2, round 1, F1).
     ///
-    /// Возвращает паузу, которую нужно выждать ПЕРЕД этой попыткой, и сама
-    /// продвигается для следующего вызова.
+    /// Returns the pause to wait BEFORE this attempt, and advances itself for the next
+    /// call.
     fn next_delay(&mut self, productive: bool) -> Duration {
         if productive {
             self.current = self.initial;
@@ -511,46 +492,45 @@ impl ReconnectBackoff {
     }
 }
 
-/// Хвост, общий для обоих способов доказать durable-позицию: барьер
-/// (`Sink::flush`) и keepalive-продвижение доказывают её по-разному, но раз
-/// позиция решена, дальше оба места отмечают её, подтверждают трекером и
-/// отправляют feedback — дословно одинаковыми четырьмя шагами. Барьер
-/// НЕ входит сюда и не может: только вызывающий решает, что считать
-/// durable, эта функция лишь записывает решение (review Task 3, round 1,
-/// F1 — иначе keepalive-путь мог бы незаметно приобрести барьер).
+/// The tail common to both ways of proving a durable position: the barrier
+/// (`Sink::flush`) and the keepalive advance prove it differently, but once the position
+/// is settled, both places go on to mark it, acknowledge it in the tracker and send
+/// feedback — by word-for-word identical four steps. The barrier is NOT part of this and
+/// cannot be: only the caller decides what counts as durable, this function merely
+/// records the decision (review Task 3, round 1, F1 — otherwise the keepalive path could
+/// quietly acquire a barrier).
 ///
-/// Возвращает ПОДТВЕРЖДЁННУЮ трекером позицию (acked), а не переданный
-/// `durable`: сегодня они совпадают, но с реконнектом внутри процесса
-/// (следующий этап) replay уже подтверждённой транзакции может отличаться —
-/// отправить в feedback не то, что подтвердил трекер, значило бы откатить
-/// сервер назад. Подтверждаем acked, НЕ commit_lsn: commit_lsn указывает на
-/// начало записи коммита, и рестарт перечитал бы ту же транзакцию.
+/// Returns the tracker's ACKNOWLEDGED position (acked), not the `durable` passed in:
+/// today they coincide, but with a reconnect inside the process (the next stage) a
+/// replay of an already acknowledged transaction may differ — sending in feedback
+/// something other than what the tracker acknowledged would mean rolling the server
+/// backwards. We acknowledge acked, NOT commit_lsn: commit_lsn points at the start of
+/// the commit record, and a restart would re-read the same transaction.
 async fn acknowledge_durable(
     state: &mut SessionState,
     stream: &mut LogicalReplicationStream,
     durable: Lsn,
     metrics: &Arc<Metrics>,
 ) -> Result<Lsn, PgcdcError> {
-    // Порядок держит инвариант 1 в этой точке вызова по построению:
-    // `note_durable` только что подняла durable как минимум до `durable`,
-    // так что `try_ack(durable)` ниже отказать здесь не может — guard
-    // внутри `try_ack` не выполняет живую работу на ЭТОМ пути. Он остаётся
-    // защитой не для этого места, а для будущего вызывающего, который
-    // позовёт `try_ack`, пропустив отметку durable.
+    // The order holds invariant 1 at this call site by construction: `note_durable` has
+    // just raised durable to at least `durable`, so `try_ack(durable)` below cannot
+    // refuse here — the guard inside `try_ack` does no live work on THIS path. It stays
+    // as protection not for this place, but for a future caller that calls `try_ack`
+    // having skipped the durable mark.
     state.tracker.note_durable(durable);
     state.tracker.try_ack(durable)?;
     let acked = state.tracker.acked();
 
-    // Единственное место записи этой позиции (см. бриф задачи 2): и
-    // групповой барьер, и keepalive-продвижение проходят через этот общий
-    // хвост, так что второго сайта записи не появится ни у одного из них.
+    // The only write site for this position (see the Task 2 brief): both the group
+    // barrier and the keepalive advance go through this common tail, so neither of them
+    // will grow a second write site.
     metrics.set_last_acknowledged_lsn(acked.0);
 
     stream.shared_lsn_feedback.update_flushed_lsn(acked.0);
     stream.shared_lsn_feedback.update_applied_lsn(acked.0);
 
-    // Обязательство Q25(в): без явного вызова подтверждение уходит
-    // с задержкой 18–22 с по внутреннему расписанию крейта.
+    // Commitment Q25(3): without an explicit call the acknowledgement goes out
+    // with an 18–22 s delay, on the crate's internal schedule.
     stream
         .send_feedback()
         .await
@@ -559,19 +539,18 @@ async fn acknowledge_durable(
     Ok(acked)
 }
 
-/// Доводит принятое sink'ом до барьера и, если было что подтверждать,
-/// прогоняет результат через общий хвост `acknowledge_durable`. Общий код
-/// для группового таймера и для завершения по сигналу: без извлечения в
-/// отдельную функцию эти два места разошлись бы, а мутационное покрытие,
-/// снятое против таймерной ветки, не защищало бы вторую копию (см. бриф
-/// задачи 3).
+/// Carries what the sink has accepted through the barrier and, if there was anything to
+/// acknowledge, runs the result through the common tail `acknowledge_durable`. Shared
+/// code for the group timer and for shutdown on a signal: without extracting it into a
+/// separate function these two places would drift apart, and the mutation coverage taken
+/// against the timer branch would not protect the second copy (see the Task 3 brief).
 async fn flush_and_acknowledge(
     sink: &mut Box<dyn Sink>,
     state: &mut SessionState,
     stream: &mut LogicalReplicationStream,
     metrics: &Arc<Metrics>,
 ) -> Result<(), PgcdcError> {
-    // Отметить durable имеет право только успешный барьер, а не приём записи.
+    // Only a successful barrier may mark durable, not the acceptance of a write.
     if let Some(durable) = sink.flush().await? {
         let acked = acknowledge_durable(state, stream, durable, metrics).await?;
         debug!(lsn = %acked, "group_acknowledged");
@@ -584,7 +563,7 @@ pub async fn run(
     mut sink: Box<dyn Sink>,
     metrics: Arc<Metrics>,
 ) -> Result<(), PgcdcError> {
-    // Первым делом — до любого подключения и любого лога, где могла бы всплыть строка.
+    // First of all — before any connection and any log where the string could surface.
     config.database_url.validate()?;
     config.validate_reconnect_bounds()?;
 
@@ -595,49 +574,49 @@ pub async fn run(
     );
     let mut attempt: u32 = 0;
 
-    // Живёт РЯДОМ с `backoff`, а не внутри `SessionState`: `reset_for_reconnect`
-    // зовётся на КАЖДОМ обрыве соединения независимо от того, был ли этот
-    // обрыв гонкой "занят" — если бы терпение жило там, оно обнулялось бы на
-    // каждой попытке и никогда не смогло бы накопить достаточно времени,
-    // чтобы вообще сработать (SlotBusyPatience).
+    // Lives NEXT TO `backoff`, not inside `SessionState`: `reset_for_reconnect` is
+    // called on EVERY connection drop regardless of whether that drop was the busy race
+    // — if the patience lived there, it would be zeroed on every attempt and could never
+    // accumulate enough time to fire at all (SlotBusyPatience).
     let mut slot_busy_patience = SlotBusyPatience::new();
 
-    // Флаг создаётся один раз ДО внешнего цикла и передаётся одной и той же
-    // ссылкой в каждую сессию: если создавать его заново на каждом реконнекте,
-    // после первого обрыва процесс перестал бы реагировать на сигнал.
+    // The flag is created once BEFORE the outer loop and handed to every session by the
+    // same reference: if it were created anew on every reconnect, the process would stop
+    // reacting to the signal after the first drop.
     let shutdown = spawn_shutdown_listener();
 
-    // Тем же приёмом, что и `shutdown`: отсчёт до сводки создаётся один раз
-    // ДО внешнего цикла и передаётся одной и той же ссылкой в каждую сессию.
-    // Счётчики, которые сводка печатает, процессные и переживают реконнект;
-    // если заводить отсчёт заново внутри `stream_once` на каждой сессии,
-    // процесс, переподключающийся чаще `METRICS_REPORT_INTERVAL`, никогда не
-    // проживёт достаточно долго внутри одной сессии, чтобы сводка вообще
-    // вышла (review Task 3, round 1, F1) — именно в этой ситуации она нужнее
-    // всего, потому что `reconnects`/`errors` в строке существуют ради неё.
+    // By the same device as `shutdown`: the countdown to the metrics report is created
+    // once BEFORE the outer loop and handed to every session by the same reference. The
+    // counters the report prints are process-wide and survive a reconnect; if the
+    // countdown were started anew inside `stream_once` for each session, a process
+    // reconnecting more often than `METRICS_REPORT_INTERVAL` would never live long
+    // enough inside a single session for the report to come out at all (review Task 3,
+    // round 1, F1) — and that is exactly the situation where it is needed most, because
+    // `reconnects`/`errors` in the line exist for its sake.
     let mut last_report = tokio::time::Instant::now();
 
     loop {
-        // I1: первое из двух мест, где внешний цикл реконнекта смотрит на
-        // флаг завершения (второе — нарезанная пауза бэкоффа чуть ниже).
-        // Нарезка проверяет флаг ПЕРЕД каждым куском и ни разу ПОСЛЕ
-        // последнего — сигнал, попавший именно в последний кусок паузы, до
-        // неё не доходит. Эта проверка и есть то место, которое его ловит:
-        // без неё такой сигнал стоит одной лишней, не ограниченной по
-        // времени попытки подключения (`stream_once` заново пройдёт
-        // preflight) — против отказанного порта мгновенно, а против
-        // адреса, который не отвечает вовсе, растягивается на длительность
-        // таймаута соединения (см. `spawn_shutdown_listener`). Та же
-        // проверка ловит и сигнал, пришедший до самой первой попытки —
-        // раньше, чем цикл вообще побывал внутри `stream_once`.
+        // I1: the first of two places where the outer reconnect loop looks at the
+        // shutdown flag (the second is the sliced backoff pause just below). The
+        // slicing checks the flag BEFORE each chunk and never once AFTER the last
+        // one — a signal landing in exactly that last chunk of the pause never
+        // reaches it. This check is the place that catches it: without it such a
+        // signal costs one extra, time-unbounded connection attempt (`stream_once`
+        // will go through the pre-flight check again) — against a refused port that
+        // is instant, while against an address that does not answer at all it
+        // stretches to the length of the connection timeout (see
+        // `spawn_shutdown_listener`). The same check also catches a signal that
+        // arrived before the very first attempt — before the loop has ever been
+        // inside `stream_once`.
         //
-        // Сигнал во внешнем цикле. Выходим с нулём, но НЕ потому, что доводить
-        // нечего — после обрыва посреди окна подтверждения в буфере писателя
-        // вполне может лежать принятая, но не слитая транзакция, и этот путь
-        // пропускает слив, который делает ветка внутри сессии. Ноль корректен
-        // по другой причине: непроведённое через барьер не было и подтверждено,
-        // поэтому слот отдаст его заново, а дубликаты разрешает инвариант 2.
-        // Терять здесь нечего, и это не то же самое, что «нечего доводить».
+        // A signal in the outer loop. We exit with zero, but NOT because there is
+        // nothing to carry through — after a drop in the middle of the acknowledgement
+        // window the writer's buffer may well hold an accepted but unflushed
+        // transaction, and this path skips the flush that the in-session branch
+        // performs. Zero is correct for a different reason: what was not carried through
+        // the barrier was not acknowledged either, so the slot will hand it over again,
+        // and duplicates are permitted by invariant 2. There is nothing to lose here,
+        // and that is not the same thing as "there is nothing to carry through".
         if shutdown.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -657,8 +636,8 @@ pub async fn run(
         {
             Ok(SessionOutcome::ShutdownRequested) => return Ok(()),
             Ok(SessionOutcome::Disconnected) => {}
-            // Восстановимые ошибки ведут в реконнект, фатальные — наружу.
-            // Классификация живёт в типе (`is_fatal`), а не в разборе текста.
+            // Recoverable errors lead into a reconnect, fatal ones out.
+            // The classification lives in the type (`is_fatal`), not in parsing text.
             Err(e) if !e.is_fatal() => {
                 warn!(error = %e, error_kind = e.kind(), "postgres_connection_lost");
                 metrics.add_error();
@@ -666,11 +645,11 @@ pub async fn run(
             Err(e) => return Err(e),
         }
 
-        // Признак продуктивности вынесен в `session_was_productive` (review
-        // Task 3, round 1, F3): решение о том, что считать продуктивностью,
-        // читает acked, а не received (review Task 2, round 1, F1), и это
-        // чтение закреплено юнит-тестом на уровне самой функции, а не только
-        // косвенно через интеграционный сценарий.
+        // The productivity flag is pulled out into `session_was_productive` (review
+        // Task 3, round 1, F3): the decision about what counts as productivity reads
+        // acked, not received (review Task 2, round 1, F1), and that read is pinned by a
+        // unit test at the level of the function itself, not only indirectly through an
+        // integration scenario.
         let productive = session_was_productive(&state.tracker, acked_before);
         if productive {
             attempt = 0;
@@ -684,14 +663,14 @@ pub async fn run(
             "reconnecting"
         );
 
-        // I1: второе из двух мест (первое — проверка в начале прохода
-        // выше). Пауза нарезана на куски по SHUTDOWN_POLL_INTERVAL вместо
-        // одного sleep(delay) — иначе сигнал, пришедший посреди паузы
-        // длиной вплоть до reconnect_max_ms (по умолчанию 30с), был бы
-        // замечен только по её истечении. Как и в проверке выше, ноль
-        // здесь корректен не потому, что нечего доводить, а потому, что
-        // недоведённое до барьера не было подтверждено — слот отдаст его
-        // заново, а дубликаты разрешает инвариант 2.
+        // I1: the second of the two places (the first is the check at the start of
+        // the pass above). The pause is sliced into chunks of SHUTDOWN_POLL_INTERVAL
+        // instead of one sleep(delay) — otherwise a signal arriving in the middle of
+        // a pause of up to reconnect_max_ms (30s by default) would be noticed only
+        // once it ran out. As in the check above, zero here is correct not because
+        // there is nothing to carry through, but because what was not carried
+        // through the barrier was not acknowledged — the slot will hand it over
+        // again, and duplicates are permitted by invariant 2.
         let mut remaining = delay;
         while remaining > Duration::ZERO {
             if shutdown.load(Ordering::Relaxed) {
@@ -702,32 +681,31 @@ pub async fn run(
             remaining = remaining.saturating_sub(chunk);
         }
 
-        // Кэш и сборщик сбрасываются, позиции переносятся, датчик буфера
-        // обнуляется вместе с ними (F1, review Task 2, round 1).
+        // The cache and the assembler are reset, the positions are carried forward, the
+        // buffer gauge is zeroed along with them (F1, review Task 2, round 1).
         state.reset_for_reconnect(&metrics);
     }
 }
 
-/// Верхняя граница ожидания в чтении — и тем самым верхняя граница задержки
-/// реакции на флаг завершения. НЕ связывать с `ack_interval_ms`: тот задаёт
-/// расписание барьера и не должен диктовать, как быстро процесс замечает
-/// сигнал. Раньше чтение было ограничено самим `ack_interval`, поэтому флаг
-/// проверялся не чаще периодического барьера — при проде на несколько
-/// секунд это делало задержку штатной остановки равной длине интервала
-/// подтверждения, и супервизор с коротким grace period убивал процесс
-/// раньше, чем тот вообще замечал сигнал (review Task 3, round 2, F2). При
-/// значении по умолчанию (`ack_interval_ms = 200`) цикл и так просыпался с
-/// этой частотой — константа ничего не удорожает, только отвязывает частоту
-/// пробуждения от периода барьера.
+/// The upper bound on waiting inside a read — and thereby the upper bound on the delay
+/// in reacting to the shutdown flag. Do NOT tie it to `ack_interval_ms`: that one sets
+/// the barrier schedule and must not dictate how fast the process notices a signal.
+/// Previously the read was bounded by `ack_interval` itself, so the flag was checked no
+/// more often than the periodic barrier — with a production setting of several seconds
+/// that made the delay of an orderly stop equal to the length of the acknowledgement
+/// interval, and a supervisor with a short grace period killed the process before it
+/// even noticed the signal (review Task 3, round 2, F2). At the default value
+/// (`ack_interval_ms = 200`) the loop woke up at this frequency anyway — the constant
+/// costs nothing extra, it only unties the wake-up frequency from the barrier period.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Как часто выходит сводная строка. Не конфигурируется: это не поведение, а
-/// громкость, и десять секунд — компромисс между «видно, что процесс жив» и
-/// «лог не забивается» (DECISIONS Q23).
+/// How often the metrics report line comes out. Not configurable: this is not behavior
+/// but volume, and ten seconds is the compromise between "you can see the process is
+/// alive" and "the log does not get flooded" (DECISIONS Q23).
 const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Одна сессия репликации: preflight, подключение, цикл. Возвращается при
-/// обрыве соединения или при штатном завершении.
+/// One replication session: pre-flight check, connect, loop. Returns on a connection
+/// drop or on an orderly shutdown.
 async fn stream_once(
     config: &Config,
     sink: &mut Box<dyn Sink>,
@@ -737,20 +715,20 @@ async fn stream_once(
     last_report: &mut tokio::time::Instant,
     slot_busy_patience: &mut SlotBusyPatience,
 ) -> Result<SessionOutcome, PgcdcError> {
-    // Захватываем ДО preflight, а не проверяем `state.durable()` заново
-    // позже: решение "это реконнект" принимается на входе в функцию и не
-    // должно незаметно подстроиться под то, что случится дальше внутри неё
-    // (review Task 2, round 1, F7).
+    // Captured BEFORE the pre-flight check rather than re-reading `state.durable()`
+    // later: the "this is a reconnect" decision is made on entry to the function and
+    // must not quietly adjust itself to whatever happens further inside it (review
+    // Task 2, round 1, F7).
     let reconnecting = is_reconnect(state.durable());
 
-    // Обязательство Q25(а): guard ДО start(), потому что start() безусловно
-    // зовёт ensure_replication_slot() и при отсутствующем слоте молча создаст
-    // новый на текущей позиции WAL, потеряв всё закоммиченное раньше.
-    // I1/P1: обёрнуто в interrupt_patience_on_early_failure, а не голый `?` —
-    // отказ здесь физически не может быть гонкой "занят" (тот код приходит
-    // только в ответ на START_REPLICATION дальше), поэтому обязан прервать
-    // цепочку подряд идущих наблюдений, а не оставлять её часы тикать, пока
-    // сервер недоступен по совсем другой причине.
+    // Commitment Q25(1): the guard goes BEFORE start(), because start() unconditionally
+    // calls ensure_replication_slot() and, with the slot missing, will silently create a
+    // new one at the current WAL position, losing everything committed earlier.
+    // I1/P1: wrapped in interrupt_patience_on_early_failure rather than a bare `?` — a
+    // failure here physically cannot be the busy race (that code comes back only in
+    // answer to START_REPLICATION further on), so it MUST break the chain of consecutive
+    // observations instead of leaving its clock ticking while the server is unreachable
+    // for an entirely different reason.
     let info_slot = interrupt_patience_on_early_failure(
         preflight_slot(config.database_url.expose(), &config.slot).await,
         slot_busy_patience,
@@ -762,17 +740,16 @@ async fn stream_once(
         "slot_preflight_ok"
     );
 
-    // Проверка реконнекта: на холодном старте сравнивать не с чем, durable ещё
-    // ноль. На повторном подключении позиция в памяти есть, и сверка ничего не
-    // стоит. Слот ВПЕРЁД нашей durable-точки означает, что кто-то подтвердил
-    // WAL, который мы не довели до sink, — падаем. Слот ПОЗАДИ — ожидаемый
-    // исход обрыва: последний feedback мог не дойти. Пишем предупреждение и
-    // продолжаем, промежуток перечитается дубликатами — это разрешает
-    // инвариант 2 (DECISIONS §1) вместе со строкой транспортных
-    // обязательств спайка (DECISIONS Q25).
+    // The reconnect check: on a cold start there is nothing to compare with, durable is
+    // still zero. On a repeat connection the position is in memory and the check costs
+    // nothing. A slot AHEAD of our durable point means someone acknowledged WAL that we
+    // did not carry through to the sink — we die. A slot BEHIND is the expected outcome
+    // of a drop: the last feedback may not have arrived. We log a warning and continue,
+    // the gap is re-read as duplicates — this is permitted by invariant 2 (DECISIONS §1)
+    // together with the line of the spike's transport commitments (DECISIONS Q25).
     if reconnecting {
-        // I1/P1: тем же приёмом, что и preflight выше — сверка реконнекта не
-        // может вернуть гонку "занят", только SlotAhead или ничего.
+        // I1/P1: by the same device as the pre-flight check above — the reconnect check
+        // cannot return the busy race, only SlotAhead or nothing.
         if let Some(warning) = interrupt_patience_on_early_failure(
             check_reconnect(&config.slot, &info_slot, state.durable()),
             slot_busy_patience,
@@ -791,15 +768,15 @@ async fn stream_once(
         Duration::from_secs(60),
         RetryConfig::default(),
     )
-    // Наш декодер понимает только текстовые значения (pgoutput.rs) и не подписан
-    // на pg_logical_emit_message — оба уже выключены значениями по умолчанию
-    // крейта, но фиксируем это явно здесь, а не полагаемся молча на них.
+    // Our decoder understands text values only (pgoutput.rs) and is not subscribed to
+    // pg_logical_emit_message — both are already off by the crate's defaults, but we pin
+    // it explicitly here instead of relying on them silently.
     .with_binary(false)
     .with_messages(false);
 
     let url = replication_url(config.database_url.expose());
-    // I1/P1: тем же приёмом — открытие TCP-соединения тоже не может вернуть
-    // гонку "занят", она приходит только в ответ на сам START_REPLICATION.
+    // I1/P1: by the same device — opening the TCP connection cannot return the busy race
+    // either, it comes back only in answer to START_REPLICATION itself.
     let mut stream = interrupt_patience_on_early_failure(
         LogicalReplicationStream::new(&url, stream_config)
             .await
@@ -807,16 +784,15 @@ async fn stream_once(
         slot_busy_patience,
     )?;
 
-    // start_lsn = None означает 0/0: сервер возьмёт confirmed_flush_lsn слота.
-    // Слот — единственный источник истины (DECISIONS Q4, Q19).
+    // start_lsn = None means 0/0: the server takes the slot's confirmed_flush_lsn.
+    // The slot is the single source of truth (DECISIONS Q4, Q19).
     //
-    // classify_start_outcome оборачивает classify_start_error бюджетом
-    // терпения к занятому слоту (SlotBusyPatience): гонка "занят" сама по
-    // себе остаётся восстановимой, но если она тянется дольше
-    // `slot_busy_budget_ms` суммарно, это эскалируется в фатальный
-    // SlotBusyTimedOut — единственный сигнал, отличающий вечно занятый
-    // чужим потребителем слот от мгновенно разрешающейся гонки с нашей же
-    // прошлой сессией, это ДЛИТЕЛЬНОСТЬ, а не код ошибки.
+    // classify_start_outcome wraps classify_start_error in a patience budget for a busy
+    // slot (SlotBusyPatience): the busy race by itself stays recoverable, but if it
+    // drags on longer than `slot_busy_budget_ms` in total, that escalates to a fatal
+    // SlotBusyTimedOut — the only signal telling a slot held forever by a foreign
+    // consumer from an instantly resolving race with our own prior session is DURATION,
+    // not the error code.
     classify_start_outcome(
         &config.slot,
         stream.start(None).await,
@@ -827,11 +803,10 @@ async fn stream_once(
     info!(slot = %config.slot, publication = %config.publication, "replication_started");
 
     if reconnecting {
-        // Только теперь: поток реально открыт и запущен сервером. Залогировать
-        // это сразу после проверки слота означало бы заявить восстановление
-        // раньше, чем сервер его подтвердил, — на нестабильном сервере лог
-        // обещал бы восстановление, за которым тут же следует новый обрыв
-        // (review Task 2, round 1, F7).
+        // Only now: the stream is genuinely open and started by the server. Logging this
+        // right after the slot check would mean declaring recovery before the server
+        // confirmed it — on an unstable server the log would promise a recovery
+        // immediately followed by another drop (review Task 2, round 1, F7).
         info!(slot = %config.slot, "postgres_connection_restored");
     }
 
@@ -843,26 +818,26 @@ async fn stream_once(
 
     let cancel = CancellationToken::new();
 
-    // Барьер на каждой транзакции означает fsync на каждую транзакцию —
-    // потолок порядка сотни транзакций в секунду. Группируем по таймеру, не
-    // трогая порядок операций внутри одного прохода: sink, потом барьер,
-    // потом durable, только потом ack, только потом feedback.
+    // A barrier on every transaction means an fsync per transaction — a ceiling of the
+    // order of a hundred transactions per second. We group by timer without touching the
+    // order of operations within one pass: sink, then barrier, then durable, only then
+    // ack, only then feedback.
     let ack_interval = Duration::from_millis(config.ack_interval_ms);
     let mut last_flush = tokio::time::Instant::now();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            // Довести принятое до барьера и подтвердить, прежде чем выйти.
-            // Выйти раньше значило бы потерять уже принятые транзакции.
+            // Carry what was accepted through the barrier and acknowledge it before
+            // exiting. Exiting earlier would mean losing already accepted transactions.
             flush_and_acknowledge(sink, state, &mut stream, metrics).await?;
             info!("shutdown_requested");
             return Ok(SessionOutcome::ShutdownRequested);
         }
 
-        // Сводка на INFO раз в METRICS_REPORT_INTERVAL — не на каждое событие
-        // (то на DEBUG, ниже). Стоит на входе в оборот цикла, вне порядка
-        // запись→processed→(таймер)барьер→durable→ack→feedback, потому что
-        // только читает снимок и ни на что не влияет (§16, DECISIONS Q23).
+        // The metrics report at INFO once per METRICS_REPORT_INTERVAL — not on every
+        // event (that is at DEBUG, below). It sits at the start of a loop turn, outside
+        // the order write→processed→(timer)barrier→durable→ack→feedback, because it only
+        // reads a snapshot and affects nothing (§16, DECISIONS Q23).
         if last_report.elapsed() >= METRICS_REPORT_INTERVAL {
             *last_report = tokio::time::Instant::now();
             let s = metrics.snapshot();
@@ -879,26 +854,25 @@ async fn stream_once(
             );
         }
 
-        // Ограниченное чтение здесь безопасно, потому что прод работает на
-        // многопоточном рантайме: транспорт выбирает Inline-драйвер по
-        // флейвору рантайма, и его буфер чтения живёт на соединении, а не в
-        // сброшенной future, — отменённое чтение не теряет уже прочитанный,
-        // но не отданный кадр (проверено против исходника крейта,
-        // docs/spike-findings.md, «Обходной путь 6»). Поведение драйвера
-        // однопоточного рантайма при таком же падении future НЕ установлено;
-        // интеграционные тесты несут `flavor = "multi_thread"` не потому, что
-        // там доказана потеря кадров, а по общему принципу: тест обязан
-        // гонять тот же драйвер, что и прод (задача 1; формулировка уточнена
-        // в задаче 4, review round 1, F2).
+        // A bounded read is safe here because production runs on the multi-threaded
+        // runtime: the transport picks the Inline driver by the runtime flavor, and its
+        // read buffer lives on the connection, not in the dropped future — a cancelled
+        // read does not lose a frame that has been read but not handed over (verified
+        // against the crate's source, docs/spike-findings.md, "Workaround 6"). The
+        // behavior of the single-threaded runtime's driver under the same future drop is
+        // NOT established; the integration tests carry `flavor = "multi_thread"` not
+        // because frame loss has been proven there, but on the general principle: a test
+        // MUST drive the same driver as production (Task 1; the wording was refined in
+        // Task 4, review round 1, F2).
         //
-        // Разрешён ТОЛЬКО next_raw_event: остальные пять API ведут в
-        // recover_connection, который рестартует с last_received_lsn —
-        // принятой, а не durable позиции (Q25(б)).
+        // ONLY next_raw_event is permitted: the other five APIs lead into
+        // recover_connection, which restarts from last_received_lsn — the received
+        // position, not the durable one (Q25(2)).
         //
-        // Таймаут — SHUTDOWN_POLL_INTERVAL, а не ack_interval: барьер копит
-        // события по своему расписанию (elapsed-проверка ниже), а это
-        // ограничение существует только для того, чтобы не проспать флаг
-        // завершения дольше положенного.
+        // The timeout is SHUTDOWN_POLL_INTERVAL, not ack_interval: the barrier gathers
+        // events on its own schedule (the elapsed check below), while this bound exists
+        // only so that the shutdown flag is not slept through for longer than it should
+        // be.
         let read =
             tokio::time::timeout(SHUTDOWN_POLL_INTERVAL, stream.next_raw_event(&cancel)).await;
 
@@ -909,10 +883,10 @@ async fn stream_once(
                 metrics.set_last_received_lsn(raw.wal_end.0);
 
                 let msg = decode(&raw.data)?;
-                // F4 (review Task 2, round 1): захватываем длину буфера ДО
-                // `?`, а не только независимо от Some/None результата — иначе
-                // ошибка внутри `handle` пропускает обновление датчика вовсе,
-                // и он остаётся при последнем значении из прошлого кадра.
+                // F4 (review Task 2, round 1): the buffer length is captured BEFORE
+                // `?`, not merely independently of a Some/None result — otherwise an
+                // error inside `handle` skips the gauge update entirely, and it stays
+                // at the last value from the previous frame.
                 let handled = state
                     .assembler
                     .handle(msg, Lsn(raw.wal_start.0), &mut state.cache);
@@ -921,7 +895,7 @@ async fn stream_once(
                     let changes = tx.changes.len();
                     let end_lsn = tx.end_lsn;
 
-                    // Порядок нерушим: сначала sink, потом барьер, потом durable, только потом ack.
+                    // The order MUST NOT change: sink first, then barrier, then durable, only then ack.
                     sink.write_transaction(&tx).await?;
                     state.tracker.note_processed(end_lsn);
                     metrics.add_transaction();
@@ -933,7 +907,7 @@ async fn stream_once(
                 warn!(error = %e, "postgres_connection_lost");
                 return Ok(SessionOutcome::Disconnected);
             }
-            // Тик: читать было нечего. Не ошибка — повод дойти до барьера.
+            // A tick: there was nothing to read. Not an error — a reason to reach the barrier.
             Err(_elapsed) => {}
         }
 
@@ -942,9 +916,9 @@ async fn stream_once(
             flush_and_acknowledge(sink, state, &mut stream, metrics).await?;
         }
 
-        // Продвижение по keepalive: если мы ничего не должны sink'у, вся позиция,
-        // которую сервер уже отдал, вакуумно durable — в ней не было ни одной
-        // строки нашей публикации. Отмечаем это явно, а не ослабляем try_ack
+        // The keepalive advance: if we owe the sink nothing, the whole position the
+        // server has already handed over is vacuously durable — it held not a single row
+        // of our publication. We mark that explicitly instead of weakening try_ack
         // (DECISIONS Q26b).
         let server_lsn = Lsn(stream.current_lsn());
         if may_advance_from_keepalive(
@@ -965,12 +939,12 @@ mod tests {
 
     #[test]
     fn start_replication_rejected_by_the_server_is_fatal_wrong_plugin() {
-        // Дешёвая ветка C1: слот несёт чужой output-плагин, сервер отвечает
-        // "option \"proto_version\" = \"1\" is unknown" (SQLSTATE 22023), а
-        // pg_walstream заворачивает это в Protocol (не транзиентный вариант).
-        // Строка сконструирована как настоящая: "(SQLSTATE 22023)" в хвосте —
-        // ровно то, что кладёт туда PgErrorFields::Display крейта транспорта
-        // (connection/native/error.rs), а не синтетическое упрощение.
+        // The cheap C1 branch: the slot carries a foreign output plugin, the server
+        // answers "option \"proto_version\" = \"1\" is unknown" (SQLSTATE 22023), and
+        // pg_walstream wraps that in Protocol (the non-transient variant). The string
+        // is constructed as a real one: "(SQLSTATE 22023)" at the tail is exactly what
+        // the transport crate's PgErrorFields::Display puts there
+        // (connection/native/error.rs), not a synthetic simplification.
         let e = ReplicationError::protocol(
             "START_REPLICATION did not enter COPY mode: ERROR:  option \"proto_version\" = \"1\" is unknown (SQLSTATE 22023)",
         );
@@ -981,10 +955,10 @@ mod tests {
 
     #[test]
     fn start_replication_rejected_by_the_server_is_fatal_invalidated_slot() {
-        // Дорогая ветка C1: слот инвалидирован превышением
-        // max_slot_wal_keep_size, сервер отвечает SQLSTATE 55000 (дословно
-        // воспроизведено живым прогоном в task-4-report.md). Тот же
-        // Protocol-конверт, тот же вердикт.
+        // The expensive C1 branch: the slot is invalidated by exceeding
+        // max_slot_wal_keep_size, the server answers SQLSTATE 55000 (reproduced
+        // verbatim by a live run in task-4-report.md). The same Protocol envelope, the
+        // same verdict.
         let e = ReplicationError::protocol(
             "START_REPLICATION did not enter COPY mode: ERROR:  can no longer get changes from replication slot \"pgcdc_slot\" (SQLSTATE 55000)",
         );
@@ -995,9 +969,9 @@ mod tests {
 
     #[test]
     fn start_replication_transport_drop_stays_recoverable() {
-        // Обрыв связи (сокет, а не ответ сервера) обязан остаться
-        // восстановимым — иначе тесты на реконнект покраснели бы (см. отчёт
-        // по C1: мутация "сделать транспортный обрыв фатальным").
+        // A connection drop (the socket, not a server answer) MUST stay recoverable —
+        // otherwise the reconnect tests would go red (see the C1 report: the mutation
+        // "make a transport drop fatal").
         let e = ReplicationError::transient_connection("connection reset by peer");
         let err = classify_start_error("pgcdc_slot", e);
         assert!(matches!(err, PgcdcError::Connection(_)), "{err:?}");
@@ -1006,12 +980,12 @@ mod tests {
 
     #[test]
     fn start_replication_slot_still_held_by_our_own_prior_session_stays_recoverable() {
-        // Сервер тоже ОТВЕТИЛ, но это не про непригодность слота — предыдущий
-        // walsender ещё не отпустил его. Разрешится само на следующей
-        // попытке. SQLSTATE 55006 в хвосте строки — настоящий код гонки
-        // (ERRCODE_OBJECT_IN_USE), различение обязано опираться на него, а
-        // не на подстроку "is active for PID" (P1, re-review round after
-        // task 4): без него в строке этот тест ловил бы только запасной путь.
+        // The server ANSWERED here too, but this is not about the slot being unusable —
+        // the previous walsender has not released it yet. It resolves by itself on the
+        // next attempt. SQLSTATE 55006 at the tail of the string is the real code of the
+        // race (ERRCODE_OBJECT_IN_USE); the distinction MUST rest on it and not on the
+        // substring "is active for PID" (P1, re-review round after task 4): without it
+        // in the string this test would exercise only the fallback path.
         let e = ReplicationError::protocol(
             "START_REPLICATION did not enter COPY mode: ERROR:  replication slot \"pgcdc_slot\" is active for PID 4242 (SQLSTATE 55006)",
         );
@@ -1022,10 +996,10 @@ mod tests {
 
     #[test]
     fn start_replication_slot_busy_race_is_recognized_without_sqlstate_via_fallback() {
-        // Запасной путь: строка не несёт SQLSTATE вовсе (гипотетическая
-        // будущая версия крейта поменяла форматирование, или ошибка пришла
-        // не через PgErrorFields). Подстрока остаётся резервным условием —
-        // именно оно и обязано сработать здесь.
+        // The fallback path: the string carries no SQLSTATE at all (a hypothetical
+        // future version of the crate changed the formatting, or the error did not come
+        // through PgErrorFields). The substring remains the fallback condition — and it
+        // is exactly that condition which MUST fire here.
         let e = ReplicationError::protocol(
             "START_REPLICATION did not enter COPY mode: ERROR:  replication slot \"pgcdc_slot\" is active for PID 4242",
         );
@@ -1036,11 +1010,10 @@ mod tests {
 
     #[test]
     fn start_replication_wrong_sqlstate_with_the_race_substring_is_still_fatal() {
-        // Когда SQLSTATE присутствует, но не совпадает с гонкой (55006), он
-        // обязан решать — даже если по случайности в тексте тоже нашлась бы
-        // подстрока "is active for PID" где-то дальше по сообщению (DETAIL,
-        // например). Проверяем, что primary-путь не даёт запасному пути
-        // перекрыть себя.
+        // When a SQLSTATE is present but does not match the race (55006), it MUST
+        // decide — even if by coincidence the substring "is active for PID" also turned
+        // up somewhere further along the message (in a DETAIL, say). We check that the
+        // primary path does not let the fallback path override it.
         let e = ReplicationError::protocol(
             "START_REPLICATION did not enter COPY mode: ERROR:  can no longer get changes from replication slot \"pgcdc_slot\" (SQLSTATE 55000)\nDETAIL: another slot is active for PID 4242 elsewhere",
         );
@@ -1049,9 +1022,9 @@ mod tests {
         assert!(err.is_fatal());
     }
 
-    /// Строит ту же самую ошибку гонки "занят", что и живой прогон против
-    /// реального Postgres (см. `start_replication_slot_still_held_by_our_own_prior_session_stays_recoverable`
-    /// выше и `task-4-report.md`).
+    /// Builds the very same busy-race error as a live run against a real Postgres (see
+    /// `start_replication_slot_still_held_by_our_own_prior_session_stays_recoverable`
+    /// above and `task-4-report.md`).
     fn busy_race_error() -> ReplicationError {
         ReplicationError::protocol(
             "START_REPLICATION did not enter COPY mode: ERROR:  replication slot \"pgcdc_slot\" is active for PID 4242 (SQLSTATE 55006)",
@@ -1077,7 +1050,7 @@ mod tests {
         assert!(p.observe_busy(t0, budget).is_none());
         let waited = p
             .observe_busy(t0 + Duration::from_millis(1000), budget)
-            .expect("бюджет исчерпан");
+            .expect("the budget is spent");
         assert_eq!(waited, Duration::from_millis(1000));
     }
 
@@ -1088,7 +1061,8 @@ mod tests {
         let budget = Duration::from_millis(1000);
         assert!(p.observe_busy(t0, budget).is_none());
         p.reset();
-        // Без сброса это наблюдение (ровно на границе бюджета от t0) сработало бы.
+        // Without the reset this observation (exactly at the budget boundary from t0)
+        // would fire.
         assert!(p
             .observe_busy(t0 + Duration::from_millis(1000), budget)
             .is_none());
@@ -1113,11 +1087,10 @@ mod tests {
 
     #[test]
     fn classify_start_outcome_escalates_to_fatal_once_the_busy_race_outlives_the_budget() {
-        // Ровно то, что видел живой прогон "что осталось открытым" в
-        // task-4-report.md: 34 цикла подряд SQLSTATE 55006 без единого
-        // ненулевого кода выхода. Здесь тот же наблюдаемый ряд ошибок, но
-        // растянутый по времени дольше бюджета — эскалация обязана
-        // сработать.
+        // Exactly what the live run "what stayed open" in task-4-report.md saw: 34
+        // cycles of SQLSTATE 55006 in a row without a single non-zero exit code. Here
+        // is the same observed series of errors, but stretched over time beyond the
+        // budget — the escalation MUST fire.
         let mut patience = SlotBusyPatience::new();
         let budget = Duration::from_millis(1000);
         let t0 = Instant::now();
@@ -1129,10 +1102,7 @@ mod tests {
             t0,
         )
         .unwrap_err();
-        assert!(
-            !err.is_fatal(),
-            "первое наблюдение не должно быть фатальным"
-        );
+        assert!(!err.is_fatal(), "the first observation must not be fatal");
 
         let err = classify_start_outcome(
             "pgcdc_slot",
@@ -1151,16 +1121,16 @@ mod tests {
 
     #[test]
     fn a_successful_start_resets_the_slot_busy_patience_so_unrelated_episodes_dont_sum() {
-        // Отдельный тест на требование "счётчик терпения обязан сбрасываться
-        // на успешном старте сессии": без сброса в Ok-ветке
-        // `classify_start_outcome` эпизод из первого наблюдения продолжил бы
-        // копиться и после успешной сессии, и второй, никак не связанный с
-        // первым эпизод сложился бы с ним в один фатальный выход.
+        // A dedicated test for the requirement "the patience counter MUST be reset on a
+        // successful session start": without the reset in the `Ok` branch of
+        // `classify_start_outcome` the episode from the first observation would keep
+        // accumulating past a successful session too, and a second episode, in no way
+        // related to the first, would add up with it into a single fatal exit.
         let mut patience = SlotBusyPatience::new();
         let budget = Duration::from_millis(1000);
         let t0 = Instant::now();
 
-        // Эпизод 1: одно наблюдение гонки, бюджет ещё не исчерпан.
+        // Episode 1: one observation of the race, the budget is not spent yet.
         let err = classify_start_outcome(
             "pgcdc_slot",
             Err(busy_race_error()),
@@ -1171,7 +1141,7 @@ mod tests {
         .unwrap_err();
         assert!(!err.is_fatal());
 
-        // Сессия успешно стартует 900мс спустя — обязана закрыть эпизод 1.
+        // The session starts successfully 900ms later — it MUST close episode 1.
         classify_start_outcome(
             "pgcdc_slot",
             Ok(()),
@@ -1179,12 +1149,12 @@ mod tests {
             budget,
             t0 + Duration::from_millis(900),
         )
-        .expect("успешный старт не может быть ошибкой");
+        .expect("a successful start cannot be an error");
 
-        // Эпизод 2 начинается 1800мс после t0 — то есть 900мс после сброса.
-        // Без сброса цепочка унаследовала бы прошлое наблюдение (t0) и уже
-        // превысило бы бюджет (1800мс >= 1000мс). Со сбросом это новый,
-        // самостоятельный эпизод, ещё далёкий от бюджета.
+        // Episode 2 begins 1800ms after t0 — that is, 900ms after the reset. Without
+        // the reset the chain would have inherited the previous observation (t0) and
+        // would already be past the budget (1800ms >= 1000ms). With the reset this is a
+        // new, independent episode, still far from the budget.
         let err = classify_start_outcome(
             "pgcdc_slot",
             Err(busy_race_error()),
@@ -1195,31 +1165,30 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, PgcdcError::Connection(_)),
-            "сброс обязан был начать эпизод 2 заново: {err:?}"
+            "the reset MUST have started episode 2 anew: {err:?}"
         );
         assert!(!err.is_fatal());
     }
 
     #[test]
     fn a_non_busy_failure_inside_classify_start_outcome_interrupts_without_summing() {
-        // P1 scenario "посторонний сбой между двумя гонками не
-        // суммируется" (review round 2 after task 4 finale). Изначально это
-        // было тестом на I1 ("сбрасывается ТОЛЬКО в Ok-ветке"), но полный
-        // сброс на любом отказе другой природы сам был чрезмерным — он
-        // закрывал эпизод целиком, а не только вычитал сам простой. Здесь
-        // числа подобраны так, чтобы проверить именно вычитание: отказ
-        // случается через 900мс после первого наблюдения, а второе
-        // наблюдение гонки — ещё через 900мс после отказа. Правильный ответ
-        // "не фатально" получается ОБОИМИ способами (полным сбросом и
-        // вычитанием простоя) при этих числах — отдельная проверка, что это
-        // именно вычитание, а не сброс, ниже
+        // P1 scenario "an unrelated failure between two races does not sum" (review
+        // round 2 after task 4 finale). Originally this was a test for I1 ("reset ONLY
+        // in the Ok branch"), but a full reset on any failure of a different nature was
+        // itself excessive — it closed the episode entirely instead of only subtracting
+        // the idle interval itself. The numbers here are chosen to check exactly the
+        // subtraction: the failure happens 900ms after the first observation, and the
+        // second observation of the race another 900ms after the failure. The correct
+        // answer "not fatal" comes out BOTH ways (a full reset and the subtraction of
+        // the idle interval) with these numbers — the separate check that it is the
+        // subtraction and not the reset is below
         // (`slot_busy_patience_escalates_despite_a_periodic_unrelated_failure`,
         // `classify_start_outcome_still_escalates_when_one_unrelated_failure_interleaves`).
         let mut patience = SlotBusyPatience::new();
         let budget = Duration::from_millis(1000);
         let t0 = Instant::now();
 
-        // Эпизод 1: одно наблюдение гонки, бюджет ещё далёк.
+        // Episode 1: one observation of the race, the budget is still far off.
         let err = classify_start_outcome(
             "pgcdc_slot",
             Err(busy_race_error()),
@@ -1230,9 +1199,9 @@ mod tests {
         .unwrap_err();
         assert!(!err.is_fatal());
 
-        // Отказ другой природы 900мс спустя — НЕ гонка "занят". Обязан
-        // прервать цепочку (не закрыть эпизод целиком), чтобы следующее
-        // наблюдение гонки не приписало себе интервал с этого момента.
+        // A failure of a different nature 900ms later — NOT the busy race. It MUST
+        // break the chain (not close the episode entirely) so that the next observation
+        // of the race does not charge itself with the interval since this moment.
         let err = classify_start_outcome(
             "pgcdc_slot",
             Err(ReplicationError::transient_connection(
@@ -1243,13 +1212,17 @@ mod tests {
             t0 + Duration::from_millis(900),
         )
         .unwrap_err();
-        assert!(!err.is_fatal(), "отказ другой природы сам не фатален");
+        assert!(
+            !err.is_fatal(),
+            "a failure of a different nature is not itself fatal"
+        );
 
-        // Наблюдение гонки 1800мс после t0 (900мс после прерывания): без
-        // прерывания цепочка унаследовала бы last_busy = t0 и накопила бы
-        // 1800мс — уже за бюджетом (1000мс). С прерыванием интервал с t0 до
-        // отказа в накопленное не идёт вовсе — копить нечему, это фактически
-        // первое наблюдение новой цепочки.
+        // An observation of the race 1800ms after t0 (900ms after the break): without
+        // the break the chain would have inherited last_busy = t0 and accumulated
+        // 1800ms — already past the budget (1000ms). With the break the interval from
+        // t0 to the failure does not go into the accumulated total at all — there is
+        // nothing to accumulate, this is effectively the first observation of a new
+        // chain.
         let err = classify_start_outcome(
             "pgcdc_slot",
             Err(busy_race_error()),
@@ -1260,7 +1233,7 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, PgcdcError::Connection(_)),
-            "прерывание обязано было начать цепочку заново: {err:?}"
+            "the break MUST have started the chain anew: {err:?}"
         );
         assert!(!err.is_fatal());
     }
@@ -1270,14 +1243,14 @@ mod tests {
         let mut patience = SlotBusyPatience::new();
         let budget = Duration::from_millis(1000);
         let t0 = Instant::now();
-        assert!(patience.observe_busy(t0, budget).is_none(), "эпизод открыт");
+        assert!(patience.observe_busy(t0, budget).is_none(), "episode open");
 
         let unreachable: Result<(), PgcdcError> =
             Err(PgcdcError::Connection("preflight connect: refused".into()));
         interrupt_patience_on_early_failure(unreachable, &mut patience).unwrap_err();
 
-        // Без прерывания это наблюдение (ровно на границе бюджета от t0)
-        // сработало бы — тем же приёмом, что и `SlotBusyPatience::interrupt`.
+        // Without the break this observation (exactly at the budget boundary from t0)
+        // would fire — by the same device as `SlotBusyPatience::interrupt`.
         assert!(patience
             .observe_busy(t0 + Duration::from_millis(1000), budget)
             .is_none());
@@ -1285,9 +1258,10 @@ mod tests {
 
     #[test]
     fn interrupt_patience_on_early_failure_leaves_the_chain_alone_on_ok() {
-        // Успех preflight/сверки/открытия соединения ещё не значит, что
-        // сессия стартовала — трогать патиенс здесь на Ok было бы неверно:
-        // решение "старт успешен" принимает только classify_start_outcome.
+        // Success of the pre-flight check/the reconnect check/opening the connection
+        // does not yet mean the session started — touching the patience here on Ok
+        // would be wrong: only classify_start_outcome makes the "the start succeeded"
+        // decision.
         let mut patience = SlotBusyPatience::new();
         let budget = Duration::from_millis(1000);
         let t0 = Instant::now();
@@ -1297,30 +1271,30 @@ mod tests {
 
         let waited = patience
             .observe_busy(t0 + Duration::from_millis(1000), budget)
-            .expect("цепочка обязана была остаться непрерванной");
+            .expect("the chain MUST have stayed unbroken");
         assert_eq!(waited, Duration::from_millis(1000));
     }
 
     #[test]
     fn a_busy_episode_does_not_survive_an_unrelated_pre_start_failure_in_between() {
-        // I1 reproduction (дословно из ревью): гонка "занят" в момент ноль;
-        // затем сервер недоступен — каждая попытка падает РАНЬШЕ, чем
-        // доходит до classify_start_outcome (preflight слота или открытие
-        // соединения, а не ответ на START_REPLICATION); затем сервер
-        // вернулся, и наш же прежний walsender снова держит слот 76мс
-        // (измеренная медиана, см. SlotBusyPatience). Второй эпизод не
-        // должен унаследовать часы первого — суммирования быть не должно.
+        // I1 reproduction (verbatim from the review): the busy race at moment zero;
+        // then the server is unreachable — every attempt fails EARLIER than it gets to
+        // classify_start_outcome (the slot pre-flight check or opening the connection,
+        // not the answer to START_REPLICATION); then the server came back, and our own
+        // former walsender holds the slot for another 76ms (the measured median, see
+        // SlotBusyPatience). The second episode must not inherit the first one's clock
+        // — there must be no summing.
         //
-        // Показательно, что прерывание (а не полный сброс) даёт тот же
-        // ответ здесь: интервал МЕЖДУ последним наблюдением гонки (t0) и
-        // следующим (t0+5076мс) отбрасывается ЦЕЛИКОМ, а не только его часть
-        // после самого отказа (t0+5000мс) — мы не знаем, что происходило в
-        // интервале [t0; t0+5000мс), он мог быть точно таким же простоем.
+        // It is telling that the break (and not a full reset) gives the same answer
+        // here: the interval BETWEEN the last observation of the race (t0) and the next
+        // one (t0+5076ms) is discarded ENTIRELY, not only the part of it after the
+        // failure itself (t0+5000ms) — we do not know what happened in the interval
+        // [t0; t0+5000ms), it could have been exactly the same idle interval.
         let mut patience = SlotBusyPatience::new();
         let budget = Duration::from_millis(1000);
         let t0 = Instant::now();
 
-        // Эпизод 1: гонка "занят" в момент ноль, бюджет ещё далёк.
+        // Episode 1: the busy race at moment zero, the budget is still far off.
         let err = classify_start_outcome(
             "pgcdc_slot",
             Err(busy_race_error()),
@@ -1331,18 +1305,17 @@ mod tests {
         .unwrap_err();
         assert!(!err.is_fatal());
 
-        // Сервер недоступен: отказ до классификации старта (preflight/
-        // открытие соединения), 5 секунд спустя — то же самое, что стоит
-        // на пути stream_once ДО classify_start_outcome.
+        // The server is unreachable: a failure before the start is classified (the
+        // pre-flight check/opening the connection), 5 seconds later — the same thing
+        // that stands on stream_once's path BEFORE classify_start_outcome.
         let unreachable: Result<(), PgcdcError> =
             Err(PgcdcError::Connection("preflight connect: refused".into()));
         interrupt_patience_on_early_failure(unreachable, &mut patience).unwrap_err();
 
-        // Эпизод 2: сервер снова отвечает гонкой "занят" ещё 76мс спустя.
-        // Суммарно от t0 прошло бы 5076мс — далеко за бюджетом, и БЕЗ
-        // прерывания это наблюдение эскалировало бы в SlotBusyTimedOut
-        // ошибочно: процесс, который восстановился бы со следующей попытки,
-        // умер бы.
+        // Episode 2: the server answers with the busy race again another 76ms later. In
+        // total 5076ms would have passed since t0 — far past the budget, and WITHOUT
+        // the break this observation would escalate to SlotBusyTimedOut wrongly: a
+        // process that would have recovered on the next attempt would die.
         let err = classify_start_outcome(
             "pgcdc_slot",
             Err(busy_race_error()),
@@ -1353,26 +1326,25 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, PgcdcError::Connection(_)),
-            "второй эпизод не должен унаследовать часы первого: {err:?}"
+            "the second episode must not inherit the first one's clock: {err:?}"
         );
         assert!(
             !err.is_fatal(),
-            "несвязанные эпизоды не должны суммироваться в фатальный выход"
+            "unrelated episodes must not sum into a fatal exit"
         );
     }
 
     #[test]
     fn slot_busy_patience_escalates_despite_a_periodic_unrelated_failure() {
-        // P1 scenario "непрерывно занятый слот с периодическим посторонним
-        // сбоем эскалирует, а не крутится вечно" (review round 2 after task
-        // 4 finale). Воспроизводит буквально описанный ревьюером сценарий:
-        // бюджет по умолчанию (30000мс), слот занят на каждой попытке КРОМЕ
-        // одного постороннего отказа раз в 29 секунд, одна попытка в
-        // секунду, смоделированный час. Под первой версией этого
-        // исправления (полный сброс на любом отказе другой природы,
-        // `e66f6d4`) это наблюдение не эскалирует НИ РАЗУ за час — сюда
-        // заведена мутация, воспроизводящая именно тот код, в разделе
-        // "мутации" отчёта задачи.
+        // P1 scenario "a continuously busy slot with a periodic unrelated failure
+        // escalates instead of spinning forever" (review round 2 after task 4 finale).
+        // Reproduces literally the scenario the reviewer described: the default budget
+        // (30000ms), the slot busy on every attempt EXCEPT one unrelated failure once
+        // every 29 seconds, one attempt per second, a simulated hour. Under the first
+        // version of this fix (a full reset on any failure of a different nature,
+        // `e66f6d4`) this observation does not escalate EVEN ONCE over the hour — a
+        // mutation reproducing exactly that code is filed here, in the "mutations"
+        // section of the task report.
         let mut patience = SlotBusyPatience::new();
         let budget = Duration::from_millis(30_000);
         let t0 = Instant::now();
@@ -1382,8 +1354,9 @@ mod tests {
         for second in 0u64..3600 {
             let now = t0 + attempt_interval * second as u32;
             if second != 0 && second % 29 == 0 {
-                // Отказ другой природы: preflight/сверка/открытие соединения
-                // упали не из-за гонки "занят".
+                // A failure of a different nature: the pre-flight check/the reconnect
+                // check/opening the connection failed for a reason other than the busy
+                // race.
                 patience.interrupt();
             } else if let Some(accumulated) = patience.observe_busy(now, budget) {
                 escalated = Some((second, accumulated));
@@ -1392,27 +1365,27 @@ mod tests {
         }
 
         let (second, accumulated) = escalated.expect(
-            "непрерывно занятый слот с периодическим посторонним сбоем обязан \
-             эскалировать в течение часа, а не крутиться вечно",
+            "a continuously busy slot with a periodic unrelated failure MUST \
+             escalate within the hour instead of spinning forever",
         );
-        // Детерминированное значение при этой раскладке: эскалация случается
-        // на 32-й секунде смоделированного прогона (28с накоплено до первого
-        // прерывания, 2с потеряны на прерывании и предшествовавший ему
-        // интервал, ещё 2с добирают до бюджета) — задолго до часа.
-        assert_eq!(second, 32, "эскалация обязана произойти на 32-й секунде");
+        // A deterministic value under this layout: the escalation happens at second 32
+        // of the simulated run (28s accumulated before the first break, 2s lost to the
+        // break and the interval preceding it, another 2s to reach the budget) — long
+        // before the hour.
+        assert_eq!(second, 32, "the escalation MUST happen at second 32");
         assert_eq!(accumulated, budget);
     }
 
     #[test]
     fn classify_start_outcome_still_escalates_when_one_unrelated_failure_interleaves() {
-        // Дополняет `slot_busy_patience_escalates_despite_a_periodic_unrelated_failure`:
-        // доказывает, что реальная проводка через `classify_start_outcome`
-        // (её ветка "отказ другой природы" зовёт `interrupt`, а не `reset`)
-        // тоже эскалирует, а не только тип в изоляции. Шесть наблюдений
-        // гонки по 100мс, один посторонний отказ посреди пробега, ещё шесть
-        // наблюдений гонки — прерывание стоит ровно одного 100мс интервала
-        // (отброшенного), а не всего пробега: накопленное всё равно
-        // достигает бюджета в 1000мс к последнему наблюдению.
+        // Complements `slot_busy_patience_escalates_despite_a_periodic_unrelated_failure`:
+        // proves that the real wiring through `classify_start_outcome` (whose "a
+        // failure of a different nature" branch calls `interrupt`, not `reset`)
+        // escalates too, and not only the type in isolation. Six observations of the
+        // race 100ms apart, one unrelated failure in the middle of the run, six more
+        // observations of the race — the break costs exactly one 100ms interval
+        // (discarded), not the whole run: the accumulated total still reaches the
+        // 1000ms budget by the last observation.
         let mut patience = SlotBusyPatience::new();
         let budget = Duration::from_millis(1000);
         let t0 = Instant::now();
@@ -1428,7 +1401,7 @@ mod tests {
             .unwrap_err();
         }
 
-        // Отказ другой природы посреди пробега — не гонка "занят".
+        // A failure of a different nature in the middle of the run — not the busy race.
         classify_start_outcome(
             "pgcdc_slot",
             Err(ReplicationError::transient_connection(
@@ -1470,9 +1443,9 @@ mod tests {
 
     #[test]
     fn extract_sqlstate_reads_the_code_from_pg_walstreams_error_formatting() {
-        // Формат подтверждён чтением исходника крейта
-        // (connection/native/error.rs::PgErrorFields::Display) и живым
-        // прогоном на реальном Postgres (task-4-report.md).
+        // The format is confirmed by reading the crate's source
+        // (connection/native/error.rs::PgErrorFields::Display) and by a live run
+        // against a real Postgres (task-4-report.md).
         assert_eq!(
             extract_sqlstate(
                 "ERROR:  can no longer get changes from replication slot \"s\" (SQLSTATE 55000)"
@@ -1498,26 +1471,24 @@ mod tests {
 
     #[test]
     fn session_is_productive_when_acked_advances_via_keepalive_without_new_frames() {
-        // Живое доказательство расхождения (review Task 3, round 1, F3): в
-        // спокойном прогоне сводка показала подтверждённую позицию
-        // продвинутой при принятой на нуле — keepalive подтвердил WAL, не
-        // приняв ни одного кадра. Признак обязан считать эту сессию
-        // продуктивной, а мутация, подменяющая acked на received внутри
-        // `session_was_productive`, этот тест провалит.
+        // The live proof of the divergence (review Task 3, round 1, F3): in a quiet run
+        // the metrics report showed the acknowledged position advanced with the
+        // received one at zero — the keepalive acknowledged WAL without accepting a
+        // single frame. The flag MUST count this session as productive, and a mutation
+        // swapping acked for received inside `session_was_productive` fails this test.
         let mut t = LsnTracker::new();
         let acked_before = t.acked();
         t.note_durable(Lsn(0x1000));
         t.try_ack(Lsn(0x1000)).unwrap();
-        assert_eq!(t.received(), Lsn(0), "ни один кадр не был принят");
+        assert_eq!(t.received(), Lsn(0), "not a single frame was received");
         assert!(session_was_productive(&t, acked_before));
     }
 
     #[test]
     fn session_is_not_productive_when_only_received_moves() {
-        // Обратная сторона того же расхождения: кадр пришёл (received ушёл
-        // вперёд), но барьер его ещё не подтвердил — по acked сессия
-        // непродуктивна, и признак обязан согласиться с acked, а не с
-        // received.
+        // The other side of the same divergence: a frame arrived (received moved
+        // forward), but the barrier has not acknowledged it yet — by acked the session
+        // is unproductive, and the flag MUST agree with acked, not with received.
         let mut t = LsnTracker::new();
         let acked_before = t.acked();
         t.note_received(Lsn(0x1000));
@@ -1527,30 +1498,29 @@ mod tests {
     #[test]
     fn backoff_resets_to_initial_after_a_productive_session() {
         let mut b = ReconnectBackoff::new(Duration::from_millis(100), Duration::from_millis(1000));
-        // Взбираемся к потолку серией непродуктивных попыток.
+        // Climb to the ceiling with a series of unproductive attempts.
         for _ in 0..10 {
             b.next_delay(false);
         }
         assert_eq!(
             b.next_delay(true),
             Duration::from_millis(100),
-            "продуктивная сессия обязана сбросить паузу на начальную"
+            "a productive session MUST reset the pause to the initial one"
         );
     }
 
     #[test]
     fn backoff_keeps_growing_across_unproductive_attempts() {
-        // Закрывает разрыв, который переживал прежний набор тестов (review
-        // Task 3, round 1, F2): мутация «сделать сброс безусловным» —
-        // `next_delay` всегда обнуляет `current` вне зависимости от
-        // `productive` — оставляла зелёными оба существующих теста на
-        // бэкофф, потому что ни один из них не смотрит на промежуточные
-        // значения при `productive = false`. Под этой мутацией каждый вызов
-        // с `productive = false` тоже возвращал бы начальную задержку
-        // (100мс) навсегда — вечная долбёжка мёртвого сервера каждые сто
-        // миллисекунд вместо экспоненты. Этот тест читает именно
-        // промежуточные значения серии непродуктивных попыток на уровне
-        // метода типа, а не свободной функции `next_backoff`.
+        // Closes the gap that the previous test set survived (review Task 3, round 1,
+        // F2): the mutation "make the reset unconditional" — `next_delay` always resets
+        // `current` regardless of `productive` — left both existing backoff tests
+        // green, because neither of them looks at the intermediate values when
+        // `productive = false`. Under that mutation every call with
+        // `productive = false` would return the initial delay (100ms) too, forever — an
+        // endless hammering of a dead server every hundred milliseconds instead of an
+        // exponent. This test reads exactly the intermediate values of a series of
+        // unproductive attempts at the level of the type's method, not of the free
+        // function `next_backoff`.
         let mut b = ReconnectBackoff::new(Duration::from_millis(100), Duration::from_millis(1000));
         assert_eq!(b.next_delay(false), Duration::from_millis(100));
         assert_eq!(b.next_delay(false), Duration::from_millis(200));
@@ -1572,14 +1542,14 @@ mod tests {
         assert_eq!(
             next_backoff(Duration::from_millis(800), max),
             max,
-            "упирается в потолок"
+            "it hits the ceiling"
         );
-        assert_eq!(next_backoff(max, max), max, "и остаётся на нём");
+        assert_eq!(next_backoff(max, max), max, "and stays on it");
     }
 
     #[test]
     fn backoff_cannot_overflow() {
-        // Удвоение у самого верха диапазона не должно паниковать в debug-сборке.
+        // Doubling at the very top of the range must not panic in a debug build.
         let huge = Duration::from_millis(u64::MAX / 2 + 1);
         assert_eq!(
             next_backoff(huge, Duration::from_millis(1000)),
@@ -1589,14 +1559,15 @@ mod tests {
 
     #[test]
     fn keepalive_advance_requires_an_empty_buffer() {
-        // Открытая транзакция означает, что часть WAL мы ещё должны sink'у.
+        // An open transaction means we still owe the sink part of the WAL.
         assert!(!may_advance_from_keepalive(false, Lsn(0x1000), Lsn(0x1000)));
     }
 
     #[test]
     fn keepalive_advance_requires_processed_to_have_caught_up() {
-        // Буфер пуст, но транзакция принята sink'ом и ещё не доведена барьером.
-        // Подтвердить позицию из keepalive здесь — значит подтвердить сверх durable.
+        // The buffer is empty, but the transaction has been accepted by the sink and not
+        // yet carried through the barrier. Acknowledging a position from a keepalive
+        // here means acknowledging beyond durable.
         assert!(!may_advance_from_keepalive(true, Lsn(0x2000), Lsn(0x1000)));
     }
 
@@ -1607,9 +1578,10 @@ mod tests {
 
     #[test]
     fn reconnect_resets_the_cache_and_the_assembler() {
-        // Кэш живёт в рамках сессии: сервер перешлёт RELATION в новой сессии,
-        // а старое описание могло устареть, пока нас не было. Недособранная
-        // транзакция придёт заново целиком — её BEGIN был после confirmed_flush_lsn.
+        // The cache lives within one session: the server resends RELATION in the new
+        // session, and the old description could have gone stale while we were away. A
+        // half-assembled transaction arrives again in full — its BEGIN was after
+        // confirmed_flush_lsn.
         let mut s = SessionState::new(1000);
         s.cache.put(crate::schema::Relation {
             id: 1,
@@ -1634,18 +1606,19 @@ mod tests {
 
         s.reset_for_reconnect(&Metrics::new());
 
-        assert_eq!(s.cache.len(), 0, "кэш сбрасывается целиком");
+        assert_eq!(s.cache.len(), 0, "the cache is reset entirely");
         assert!(
             s.assembler.is_empty(),
-            "недособранная транзакция выбрасывается"
+            "the half-assembled transaction is thrown away"
         );
     }
 
     #[test]
     fn reconnect_carries_the_tracker_positions_forward() {
-        // Позиции НЕ сбрасываются. Обнулить трекер значило бы потерять
-        // durable-позицию, с которой check_reconnect сравнивает слот, — и
-        // заодно открыть гейт keepalive в момент, когда replay ещё не догнал.
+        // The positions are NOT reset. Zeroing the tracker would mean losing the
+        // durable position that check_reconnect compares the slot against — and, along
+        // with it, opening the keepalive gate at a moment when the replay has not
+        // caught up yet.
         let mut s = SessionState::new(1000);
         s.tracker.note_received(Lsn(0x3000));
         s.tracker.note_processed(Lsn(0x2000));
@@ -1654,16 +1627,24 @@ mod tests {
 
         s.reset_for_reconnect(&Metrics::new());
 
-        assert_eq!(s.durable(), Lsn(0x2000), "durable переносится");
-        assert_eq!(s.tracker.acked(), Lsn(0x2000), "подтверждённая переносится");
-        assert_eq!(s.tracker.processed(), Lsn(0x2000), "processed переносится");
+        assert_eq!(s.durable(), Lsn(0x2000), "durable is carried forward");
+        assert_eq!(
+            s.tracker.acked(),
+            Lsn(0x2000),
+            "the acknowledged position is carried forward"
+        );
+        assert_eq!(
+            s.tracker.processed(),
+            Lsn(0x2000),
+            "processed is carried forward"
+        );
     }
 
     #[test]
     fn replayed_transactions_cannot_move_positions_backwards() {
-        // После реконнекта сервер отдаёт заново всё после confirmed_flush_lsn.
-        // Позиции монотонны, поэтому повторная обработка их не откатывает,
-        // а гейт keepalive остаётся закрытым, пока replay не догонит processed.
+        // After a reconnect the server hands over everything after confirmed_flush_lsn
+        // again. The positions are monotone, so reprocessing does not roll them back,
+        // and the keepalive gate stays shut until the replay catches up with processed.
         let mut s = SessionState::new(1000);
         s.tracker.note_processed(Lsn(0x2000));
         s.tracker.note_durable(Lsn(0x2000));
@@ -1674,12 +1655,11 @@ mod tests {
 
     #[test]
     fn reconnect_zeroes_the_buffer_gauge_even_with_an_open_transaction() {
-        // F1 (review Task 2, round 1): сброс на реконнекте не проходит через
-        // приёмную ветку stream_once, где обычно выставляется этот датчик, —
-        // он обязан обнулить его сам. Без этого на простаивающей после
-        // обрыва публикации датчик держал бы последнее ненулевое значение
-        // бесконечно, вместо того чтобы честно показать пустой буфер новой
-        // сессии.
+        // F1 (review Task 2, round 1): the reset on a reconnect does not go through the
+        // receiving branch of stream_once, where this gauge is normally set — it MUST
+        // zero it itself. Without that, on a publication that goes idle after a drop the
+        // gauge would hold the last non-zero value forever, instead of honestly showing
+        // the empty buffer of the new session.
         let mut s = SessionState::new(1000);
         s.assembler
             .handle(
@@ -1700,7 +1680,7 @@ mod tests {
         assert_eq!(
             metrics.snapshot().transaction_buffer_size,
             0,
-            "датчик обязан упасть до нуля вместе со сбросом сборщика"
+            "the gauge MUST fall to zero along with the reset of the assembler"
         );
     }
 }

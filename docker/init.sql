@@ -1,5 +1,5 @@
--- Демонстрационная таблица. REPLICA IDENTITY FULL, чтобы в UPDATE/DELETE
--- приходил полный старый кортеж (before_kind = "full").
+-- Demo table. REPLICA IDENTITY FULL, so UPDATE/DELETE carry the full old
+-- tuple (before_kind = "full").
 CREATE TABLE public.users (
     id    BIGINT PRIMARY KEY,
     name  TEXT,
@@ -8,13 +8,14 @@ CREATE TABLE public.users (
 );
 ALTER TABLE public.users REPLICA IDENTITY FULL;
 
--- STORAGE EXTERNAL отключает сжатие: любое значение больше ~2 КБ
--- гарантированно уезжает в TOAST. Без этого pglz сожмёт тестовую строку
--- обратно в строку, и маркер 'u' в UPDATE никогда не появится.
+-- STORAGE EXTERNAL disables compression: any value larger than ~2 KB is
+-- guaranteed to move out to TOAST. Without this, pglz would compress the
+-- test string back into the row, and the 'u' marker would never appear in
+-- an UPDATE.
 ALTER TABLE public.users ALTER COLUMN bio SET STORAGE EXTERNAL;
 
--- Вторая таблица с REPLICA IDENTITY DEFAULT, чтобы снять фикстуры
--- с before_kind = "key" (в старом кортеже только PK).
+-- Second table with REPLICA IDENTITY DEFAULT, to capture fixtures with
+-- before_kind = "key" (only the PK in the old tuple).
 CREATE TABLE public.items (
     id    BIGINT PRIMARY KEY,
     title TEXT,

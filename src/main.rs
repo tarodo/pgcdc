@@ -12,26 +12,26 @@ use tracing::error;
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
-            // pg_walstream логирует на INFO создание/наличие слота — при default
-            // фильтре это в нашем же stderr читалось бы как противоречие заявленной
-            // гарантии "мы никогда не создаём слоты". Глушим его INFO, оставляя
-            // WARN/ERROR из библиотеки видимыми.
+            // pg_walstream logs slot creation/presence at INFO — under the default
+            // filter this would read in our own stderr as contradicting the stated
+            // guarantee "we never create slots". We mute its INFO, leaving
+            // WARN/ERROR from the library visible.
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,pg_walstream=warn".into()),
         )
         .with_writer(std::io::stderr)
-        // Раскраска только для реального терминала: без этой проверки
-        // ANSI-коды безусловно уходят и в перенаправленный в файл вывод, и в
-        // трубу любого сборщика логов (review Task 3, round 1, F4) — этот
-        // этап называется «обвязка», и такой вывод обязан оставаться
-        // машиночитаемым.
+        // Coloring only for a real terminal: without this check, ANSI codes
+        // would unconditionally leak into output redirected to a file and into
+        // any log collector's pipe (review Task 3, round 1, F4) — this
+        // stage is called wiring, and such output must remain
+        // machine-readable.
         .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     let config = Config::parse();
-    // Исчерпывающий match по (output, output_path) намеренный: появление
-    // третьего варианта вывода заставит компилятор потребовать решения,
-    // а не провалиться сквозь молчаливую ветку по умолчанию.
+    // The exhaustive match on (output, output_path) is deliberate: the appearance
+    // of a third output variant will force the compiler to demand a decision,
+    // rather than falling through a silent default branch.
     let sink: Box<dyn Sink> = match (config.output, &config.output_path) {
         (OutputKind::Stdout, _) => Box::new(StdoutSink::new()),
         (OutputKind::File, Some(path)) => match FileSink::open(path) {

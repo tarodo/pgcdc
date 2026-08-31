@@ -2,8 +2,8 @@ use std::fmt;
 
 use crate::error::PgcdcError;
 
-/// Позиция в WAL. PostgreSQL печатает её как две шестнадцатеричные половины
-/// через слэш, без ведущих нулей: `0/19300D0`.
+/// A position in the WAL. PostgreSQL prints it as two hexadecimal halves
+/// separated by a slash, with no leading zeros: `0/19300D0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Lsn(pub u64);
 
@@ -19,10 +19,10 @@ impl serde::Serialize for Lsn {
     }
 }
 
-/// Четыре позиции, которые нельзя путать (DECISIONS Q4, Q26a). `processed` —
-/// работа этапа 3 (`DECISIONS.md` §4): она может опережать `durable`, и это
-/// разрыв, ради которого её завели. Персистентности нет: слот PostgreSQL —
-/// единственный источник истины, трекер живёт только в памяти процесса.
+/// Four positions that must not be confused (DECISIONS Q4, Q26a). `processed` is
+/// the work of stage 3 (`DECISIONS.md` §4): it can run ahead of `durable`, and that
+/// is the gap it was introduced for. There is no persistence: the PostgreSQL slot is
+/// the sole source of truth, the tracker lives only in the process's memory.
 #[derive(Debug, Default)]
 pub struct LsnTracker {
     received: Lsn,
@@ -42,26 +42,26 @@ impl LsnTracker {
         }
     }
 
-    /// Вызывается ровно из двух мест, и оба обязаны сохраниться при любом
-    /// рефакторинге цикла репликации. Первое — успешный барьер `Sink::flush`:
-    /// позиция, которую sink действительно подтвердил как записанную. Второе —
-    /// продвижение по keepalive на простаивающей публикации: позиция сервера,
-    /// которую sink не писал вовсе, но которая тем не менее вакуумно durable —
-    /// диапазон между прежним durable и ней доказуемо не содержит ни одной
-    /// строки нашей публикации (DECISIONS Q26b). Это предусловие — не деталь
-    /// реализации: реконнект-guard будущего этапа читает `durable()` как
-    /// «что можно безопасно взять за отправную точку», и для keepalive-ветки
-    /// это верно только потому, что там нечего было терять, а не потому, что
-    /// кто-то это записал.
+    /// Called from exactly two places, and both must survive any
+    /// refactoring of the replication loop. The first is a successful `Sink::flush`
+    /// barrier: a position the sink has actually confirmed as written. The second is
+    /// keepalive advancement on an idle publication: a server position that
+    /// the sink never wrote at all, but which is nonetheless vacuously durable —
+    /// the range between the previous durable position and this one provably contains
+    /// not a single row of our publication (DECISIONS Q26b). This precondition is not an
+    /// implementation detail: a future stage's reconnect guard reads `durable()` as
+    /// "what can be safely taken as a starting point", and for the keepalive branch
+    /// this holds only because there was nothing to lose there, not because
+    /// someone wrote it down.
     pub fn note_durable(&mut self, lsn: Lsn) {
         if lsn > self.durable {
             self.durable = lsn;
         }
     }
 
-    /// Отвергает попытку подтвердить позицию дальше durable. Это не
-    /// оборонительное программирование, а тот самый инвариант: пройди такое
-    /// подтверждение, и крах между ним и записью означал бы тихую потерю.
+    /// Rejects an attempt to acknowledge a position beyond durable. This is not
+    /// defensive programming, it is the invariant itself: let such an acknowledgement
+    /// through, and a crash between it and the write would mean a silent loss.
     pub fn try_ack(&mut self, lsn: Lsn) -> Result<(), PgcdcError> {
         if lsn > self.durable {
             return Err(PgcdcError::AckBeyondDurable {
@@ -87,10 +87,10 @@ impl LsnTracker {
         self.acked
     }
 
-    /// Позиция, до которой сообщения разобраны и отданы sink'у. Может опережать
-    /// `durable`: между записью и fsync существует окно, и именно из-за него
-    /// условие продвижения по keepalive (Q26a) требует `processed == durable`,
-    /// а не только пустого буфера сборщика.
+    /// The position up to which messages have been parsed and handed to the sink. Can
+    /// run ahead of `durable`: a window exists between the write and the fsync, and it
+    /// is precisely because of it that the keepalive advancement condition (Q26a)
+    /// requires `processed == durable`, not just an empty assembler buffer.
     pub fn note_processed(&mut self, lsn: Lsn) {
         if lsn > self.processed {
             self.processed = lsn;
@@ -108,33 +108,33 @@ mod tests {
 
     #[test]
     fn lsn_display_matches_postgres_format() {
-        // Значения из docs/pgoutput-notes.md §4, 0004_commit.bin
+        // Values from docs/pgoutput-notes.md §4, 0004_commit.bin
         assert_eq!(Lsn(0x0000_0000_0193_00D0).to_string(), "0/19300D0");
         assert_eq!(Lsn(0x0000_0000_0193_0100).to_string(), "0/1930100");
-        // Старшая половина не нулевая
+        // High half is non-zero
         assert_eq!(Lsn(0x0000_0001_0000_00FF).to_string(), "1/FF");
         assert_eq!(Lsn(0).to_string(), "0/0");
     }
 
     #[test]
     fn tracker_refuses_to_ack_beyond_durable() {
-        // Единственный инвариант, ради которого существует проект:
-        // никогда не подтверждать позицию, которую sink не записал.
+        // The single invariant the project exists for:
+        // never acknowledge a position the sink has not written.
         let mut t = LsnTracker::new();
         t.note_received(Lsn(0x2000));
         t.note_durable(Lsn(0x1000));
         assert!(
             t.try_ack(Lsn(0x1000)).is_ok(),
-            "подтвердить ровно durable можно"
+            "acknowledging exactly durable is allowed"
         );
         assert!(
             t.try_ack(Lsn(0x1001)).is_err(),
-            "на байт дальше durable — нельзя"
+            "one byte past durable is not allowed"
         );
         assert_eq!(
             t.acked(),
             Lsn(0x1000),
-            "неудачная попытка не сдвигает acked"
+            "a failed attempt does not move acked"
         );
     }
 
@@ -147,7 +147,7 @@ mod tests {
         assert_eq!(
             t.acked(),
             Lsn(0x2000),
-            "откат подтверждения молча игнорируется"
+            "a rollback of the acknowledgement is silently ignored"
         );
     }
 
@@ -166,20 +166,24 @@ mod tests {
         t.note_processed(Lsn(0x2000));
         assert_eq!(t.processed(), Lsn(0x2000));
         t.note_processed(Lsn(0x1000));
-        assert_eq!(t.processed(), Lsn(0x2000), "позиция не откатывается");
+        assert_eq!(
+            t.processed(),
+            Lsn(0x2000),
+            "the position does not roll back"
+        );
     }
 
     #[test]
     fn processed_may_run_ahead_of_durable() {
-        // Ровно та ситуация, ради которой позиция и заведена: транзакция
-        // отдана в sink, но fsync ещё не случился.
+        // Exactly the situation this position was introduced for: a transaction
+        // has been handed to the sink, but the fsync hasn't happened yet.
         let mut t = LsnTracker::new();
         t.note_processed(Lsn(0x2000));
         assert_eq!(t.durable(), Lsn(0));
         assert!(t.processed() > t.durable());
         assert!(
             t.try_ack(Lsn(0x2000)).is_err(),
-            "подтверждать по processed нельзя"
+            "acknowledging by processed is not allowed"
         );
     }
 }

@@ -1,110 +1,110 @@
-# Как это работает — для дата-инженера, впервые открывшего Rust
+# How it works — for a data engineer opening Rust for the first time
 
-Ты умеешь читать Python, знаешь, что такое Kafka и offset, но синтаксис Rust видишь
-впервые. Этот документ — маршрут по коду. Прочитать за двадцать минут, после чего
-открывать `src/` и понимать, на что смотришь.
+You can read Python, you know what Kafka and an offset are, but you are seeing Rust syntax for the
+first time. This document is a route through the code. Twenty minutes to read, after which you can
+open `src/` and understand what you are looking at.
 
-Здесь нет ничего про то, «как правильно писать на Rust». Только то, что нужно, чтобы
-читать **этот** код.
+There is nothing here about "how to write Rust properly". Only what you need in order to read
+**this** code.
 
 ---
 
-## 1. Что делает эта программа
+## 1. What this program does
 
-Подключается к PostgreSQL, читает поток изменений (кто что вставил, обновил, удалил) и
-выкладывает их наружу строчками JSON.
+It connects to PostgreSQL, reads the stream of changes (who inserted, updated, deleted what) and
+lays them out as lines of JSON.
 
 ```
 INSERT INTO users VALUES (1, 'Alice');
 ```
-превращается в
+turns into
 ```json
 {"schema":"public","table":"users","operation":"insert","after":{"id":"1","name":"Alice"},
  "transaction_id":748,"lsn":"0/19742B8","commit_lsn":"0/19743B0","commit_timestamp":"..."}
 ```
 
-Это CDC — change data capture. Промышленный аналог, который ты, возможно, видел, —
-Debezium. Мы делаем то же самое, только маленькое и своё.
+This is CDC — change data capture. The industrial equivalent you have probably seen is
+Debezium. We do the same thing, only small and our own.
 
-### Аналогия, которая тебе всё объяснит
+### The analogy that explains everything
 
-PostgreSQL внутри устроен как Kafka, и если держать это в голове, дальше всё складывается:
+Inside, PostgreSQL is built like Kafka, and if you keep that in mind everything else falls into place:
 
-| В Kafka | В PostgreSQL | Что это у нас |
+| In Kafka | In PostgreSQL | What it is for us |
 |---|---|---|
-| Лог партиции | **WAL** — журнал предзаписи | То, что мы читаем |
-| Offset | **LSN** — позиция в WAL, `0/19742B8` (это hex) | `src/lsn.rs` |
-| Consumer group (хранит закоммиченный offset) | **Слот репликации** | Создаётся до старта, снаружи |
-| Retention | Сервер хранит WAL до позиции слота | Отстанешь — слот убьют |
-| `commit()` offset | **Подтверждение** позиции слоту | Самое опасное место в коде |
-| Формат сообщения | **`pgoutput`** — бинарный протокол | `src/postgres/pgoutput.rs` |
+| The partition log | **WAL** — the write-ahead log | What we read |
+| Offset | **LSN** — a position in the WAL, `0/19742B8` (that is hex) | `src/lsn.rs` |
+| Consumer group (holds the committed offset) | **Replication slot** | Created before the start, from outside |
+| Retention | The server keeps WAL up to the slot's position | Fall behind and the slot gets killed |
+| `commit()` an offset | **Acknowledging** a position to the slot | The most dangerous place in the code |
+| Message format | **`pgoutput`** — a binary protocol | `src/postgres/pgoutput.rs` |
 
-Держи в уме одну вещь, и половина решений в коде станет очевидной:
+Hold on to one thing and half the decisions in the code become obvious:
 
-> **Подтвердить позицию = разрешить серверу удалить журнал до неё. Необратимо.**
+> **Acknowledging a position = allowing the server to delete the log up to it. Irreversible.**
 
-Ровно как закоммитить offset в Kafka раньше, чем ты записал сообщение в приёмник.
-Классический баг «at-most-once вместо at-least-once». Весь этот проект — про то, чтобы
-такого не случилось.
+Exactly like committing an offset in Kafka before you have written the message to the sink.
+The classic "at-most-once instead of at-least-once" bug. This whole project is about making sure
+that never happens.
 
 ---
 
-## 2. Аварийный курс Rust
+## 2. A crash course in Rust
 
-Только то, что встретишь в нашем коде. Примеры настоящие, из `src/`.
+Only what you will meet in our code. The examples are real, taken from `src/`.
 
-### 2.1. Ошибки — это возвращаемое значение, а не исключение
+### 2.1. Errors are a return value, not an exception
 
-В Python функция может кинуть что угодно и ниоткуда, а сигнатура об этом молчит.
-В Rust ошибка — часть типа возврата:
+In Python a function can throw anything from anywhere, and the signature says nothing about it.
+In Rust an error is part of the return type:
 
 ```rust
 pub fn try_ack(&mut self, lsn: Lsn) -> Result<(), PgcdcError>
 ```
 
-`Result<T, E>` — «либо `Ok(T)`, либо `Err(E)`». Здесь `T` — это `()`, пустышка (аналог
-`None` как результата процедуры). Читается так: «функция ничего не возвращает при успехе,
-а при неудаче отдаёт `PgcdcError`».
+`Result<T, E>` means "either `Ok(T)` or `Err(E)`". Here `T` is `()`, the empty placeholder (the
+equivalent of `None` as the result of a procedure). It reads as: "the function returns nothing on
+success, and hands back a `PgcdcError` on failure".
 
-Игнорировать нельзя — компилятор заругается. Разворачивают знаком вопроса:
+You cannot ignore it — the compiler will complain. You unwrap it with a question mark:
 
 ```rust
 sink.write_transaction(&tx).await?;
 ```
 
-`?` значит: если внутри `Err` — **немедленно выйти из текущей функции**, вернув эту
-ошибку наверх. Если `Ok` — достать значение и идти дальше. Это питоновский
-`raise` + `except: raise` в один символ, но видимый в коде.
+`?` means: if there is an `Err` inside, **leave the current function immediately**, returning that
+error upwards. If it is `Ok`, take the value out and carry on. This is Python's
+`raise` + `except: raise` in a single character, but visible in the code.
 
-**Почему это для нас важно.** Взгляни на строку выше ещё раз. Убери из неё `?` —
-получится `let _ = sink.write_transaction(&tx).await;`, и отказ записи будет молча
-проглочен. Мы на этом реально попались: набор из 168 тестов оставался зелёным. Подробности
-в §7.
+**Why this matters for us.** Look at the line above once more. Take the `?` out of it and you get
+`let _ = sink.write_transaction(&tx).await;`, and a write failure is swallowed in silence.
+We really did get caught by this: a suite of 168 tests stayed green. The details are
+in §7.
 
-### 2.2. `Option<T>` — вместо `None`, но обязательный к разбору
+### 2.2. `Option<T>` — instead of `None`, but you MUST handle it
 
 ```rust
 pub before: Option<Row>,
 ```
 
-«Либо `Some(строка)`, либо `None`». В Python ты бы написал `before: dict | None` и забыл
-проверить. Здесь достать значение, не разобрав случай `None`, компилятор не даст.
+"Either `Some(row)` or `None`". In Python you would write `before: dict | None` and forget
+to check. Here the compiler will not let you take the value out without handling the `None` case.
 
-Часто встречается вместе с `if let`:
+It often turns up together with `if let`:
 
 ```rust
 if let Some(tx) = handled? {
-    // сюда попадаем, только если транзакция действительно собралась
+    // we only get here if a transaction really did come together
 }
 ```
 
-### 2.3. `enum` — это НЕ питоновский Enum
+### 2.3. `enum` is NOT Python's Enum
 
-Это самое важное расхождение, и на нём спотыкаются все.
+This is the most important divergence, and everybody trips over it.
 
-Питоновский `Enum` — набор именованных констант. Rust'овский `enum` — **размеченное
-объединение**, ближе к `typing.Union` или к дата-классам с тегом. Каждый вариант несёт
-свои поля:
+Python's `Enum` is a set of named constants. Rust's `enum` is a **tagged
+union**, closer to `typing.Union` or to dataclasses with a tag. Each variant carries
+its own fields:
 
 ```rust
 pub enum PgcdcError {
@@ -118,69 +118,69 @@ pub enum PgcdcError {
 }
 ```
 
-Один тип, тринадцать форм, у каждой свои данные.
+One type, thirteen shapes, each with its own data.
 
-### 2.4. `match` исчерпывающий — и это наша защита
+### 2.4. `match` is exhaustive — and that is our defence
 
 ```rust
 match read {
-    Ok(Ok(raw))  => { /* пришли данные */ }
-    Ok(Err(e))   => { /* соединение оборвалось */ }
-    Err(_elapsed) => { /* таймаут, читать было нечего */ }
+    Ok(Ok(raw))  => { /* data arrived */ }
+    Ok(Err(e))   => { /* the connection dropped */ }
+    Err(_elapsed) => { /* timeout, there was nothing to read */ }
 }
 ```
 
-Как `match` в Python 3.10, но с разницей: **компилятор требует покрыть все варианты**.
-Забыл один — код не собирается.
+Like `match` in Python 3.10, with one difference: **the compiler requires every variant to be
+covered**. Forget one and the code does not build.
 
-Мы этим пользуемся намеренно. Вот комментарий из `src/error.rs`:
+We use this deliberately. Here is a comment from `src/error.rs`:
 
 ```rust
-/// `is_fatal` реализован исчерпывающим match без `_ =>`, поэтому компилятор
-/// заставит классифицировать каждый новый вариант. Забытая классификация —
-/// это путь «поехали по ветке ретрая и молча потеряли события».
+/// `is_fatal` is implemented as an exhaustive match with no `_ =>`, so the compiler forces
+/// classification of every new variant. A forgotten classification is the path
+/// to "went down the retry branch and silently lost events".
 ```
 
-То есть: добавишь новый вид ошибки — компилятор не даст собрать проект, пока не скажешь,
-фатальна она или её надо ретраить. В Python это был бы `else: pass` и баг через полгода.
+That is: add a new kind of error and the compiler will not let the project build until you say
+whether it is fatal or has to be retried. In Python this would be `else: pass` and a bug six months later.
 
-Тот же приём в `src/main.rs` при выборе приёмника:
+The same trick in `src/main.rs` when the sink is chosen:
 
 ```rust
-// Появление третьего варианта вывода заставит компилятор потребовать решения,
-// а не провалиться сквозь молчаливую ветку по умолчанию.
+// The appearance of a third output variant will force the compiler to demand a decision,
+// rather than falling through a silent default branch.
 let sink: Box<dyn Sink> = match (config.output, &config.output_path) {
     (OutputKind::Stdout, _)       => Box::new(StdoutSink::new()),
     (OutputKind::File, Some(path)) => { /* ... */ }
-    (OutputKind::File, None)       => { /* ошибка: нужен --output-path */ }
+    (OutputKind::File, None)       => { /* error: --output-path is required */ }
 };
 ```
 
-### 2.5. `&` и `&mut` — кто имеет право менять
+### 2.5. `&` and `&mut` — who has the right to change things
 
-Здесь Rust сильнее всего отличается от Python, но для чтения кода хватит одного правила:
+This is where Rust differs from Python the most, but one rule is enough to read the code:
 
-- `&Metrics` — «одолжили посмотреть», менять нельзя, читателей может быть много;
-- `&mut SessionState` — «одолжили изменить», **и в этот момент больше никто эту вещь не
-  держит**, это проверяется при компиляции.
+- `&Metrics` — "borrowed to look at", must not be changed, there may be many readers;
+- `&mut SessionState` — "borrowed to change", **and at that moment nobody else is holding this
+  thing**, which is checked at compile time.
 
-В Python два потока могут спокойно портить один словарь, и ты узнаешь об этом в проде. В
-Rust такой код просто не соберётся.
+In Python two threads can happily corrupt one dictionary and you find out in production. In
+Rust such code simply does not build.
 
-Поэтому сигнатуры выглядят так:
+That is why the signatures look like this:
 
 ```rust
 async fn acknowledge_durable(
-    state: &mut SessionState,   // будем менять
+    state: &mut SessionState,   // will be changed
     stream: &mut LogicalReplicationStream,
-    durable: Lsn,               // копия, число
-    metrics: &Metrics,          // только читаем
+    durable: Lsn,               // a copy, a number
+    metrics: &Arc<Metrics>,     // read only, shared between tasks
 ) -> Result<Lsn, PgcdcError>
 ```
 
-Сигнатуру можно читать как документацию: видно, кто здесь мутируется, а кто нет.
+A signature reads as documentation: you can see who gets mutated here and who does not.
 
-### 2.6. `trait` — это `Protocol` / `ABC`
+### 2.6. `trait` is `Protocol` / `ABC`
 
 ```rust
 #[async_trait::async_trait]
@@ -191,200 +191,202 @@ pub trait Sink: Send {
 }
 ```
 
-Интерфейс. Кто его реализует — тот приёмник. У нас двое: `StdoutSink` и `FileSink`.
+An interface. Whoever implements it is a sink. We have two: `StdoutSink` and `FileSink`.
 
-`Box<dyn Sink>` — переменная, в которой лежит **какая-то** реализация, решённая в рантайме.
-Прямой аналог питоновской переменной, аннотированной протоколом.
+`Box<dyn Sink>` is a variable holding **some** implementation, decided at runtime.
+A direct analogue of a Python variable annotated with a protocol.
 
-### 2.7. `impl` — методы живут отдельно от полей
+### 2.7. `impl` — methods live apart from fields
 
-В Python поля и методы в одном `class`. В Rust — раздельно:
+In Python fields and methods sit in one `class`. In Rust they are separate:
 
 ```rust
-pub struct LsnTracker {          // поля
+pub struct LsnTracker {          // fields
     received: Lsn,
     durable: Lsn,
     acked: Lsn,
     processed: Lsn,
 }
 
-impl LsnTracker {                // методы
+impl LsnTracker {                // methods
     pub fn acked(&self) -> Lsn { self.acked }
 }
 ```
 
-Полей без `pub` снаружи не видно вообще — не соглашение с подчёркиванием, а запрет
-компилятора. Именно поэтому `acked` можно изменить **только** через `try_ack`, и это не
-дисциплина команды, а свойство типа.
+Fields without `pub` are not visible from outside at all — not an underscore convention, but a
+compiler prohibition. That is exactly why `acked` can be changed **only** through `try_ack`, and that
+is not team discipline but a property of the type.
 
-### 2.8. `async` / `.await` — почти как в Python
+### 2.8. `async` / `.await` — almost like Python
 
 ```rust
 sink.write_transaction(&tx).await?;
 ```
 
-Читается как `await sink.write_transaction(tx)` в питоне, плюс `?` на конце. Роль
-`asyncio` играет **tokio**.
+Reads like `await sink.write_transaction(tx)` in Python, plus the `?` at the end. The role of
+`asyncio` is played by **tokio**.
 
-Одна ловушка, которая нас укусила: у tokio есть два режима — однопоточный и многопоточный.
-Библиотека репликации выбирает внутри себя разный код в зависимости от режима. Тесты по
-умолчанию запускаются в однопоточном, продакшен — в многопоточном, и мы полдня гоняли не
-тот код, что в проде. Поэтому **все** интеграционные тесты помечены явно:
+One trap that bit us: tokio has two flavors — single-threaded and multi-threaded.
+The replication library picks different code inside itself depending on the flavor. Tests by
+default run single-threaded, production runs multi-threaded, and we spent half a day exercising
+code that was not the production one. So **every** integration test is marked explicitly:
 
 ```rust
 #[tokio::test(flavor = "multi_thread")]
 ```
 
-### 2.9. `Arc<Metrics>` и `AtomicU64`
+### 2.9. `Arc<Metrics>` and `AtomicU64`
 
 ```rust
 let metrics = Arc::new(Metrics::new());
 ```
 
-`Arc` = «атомарный счётчик ссылок». Один объект, который безопасно держат несколько задач
-одновременно. В Python рефкаунтинг спрятан внутри интерпретатора, здесь он в типе.
+`Arc` = "atomic reference count". One object safely held by several tasks
+at once. In Python refcounting is hidden inside the interpreter; here it is in the type.
 
-Внутри `Metrics` — восемь `AtomicU64`, счётчики, которые можно менять из разных потоков
-без блокировок.
+Inside `Metrics` there are eight `AtomicU64`s, counters that can be changed from different threads
+without locks.
 
-### 2.10. `#[derive(...)]` — декораторы
+### 2.10. `#[derive(...)]` — decorators
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChangeEvent { /* ... */ }
 ```
 
-Как `@dataclass`: компилятор дописывает за тебя печать для отладки, копирование,
-сравнение и сериализацию в JSON. `Serialize` — это ровно то, что делает событие
-JSON-пригодным.
+Like `@dataclass`: the compiler writes debug printing, copying, comparison and JSON
+serialization for you. `Serialize` is exactly what makes an event
+JSON-ready.
 
 ---
 
-## 3. Маршрут одной строки
+## 3. The journey of a single row
 
-От `INSERT` в психике базы до строчки в твоём файле.
+From an `INSERT` in the database's mind to a line in your file.
 
 ```
-   PostgreSQL                     наш процесс
+   PostgreSQL                     our process
  ┌──────────────┐
  │ INSERT ...   │
  │      ↓       │
  │     WAL      │   START_REPLICATION
  │      ↓       │ ─────────────────────→  ① next_raw_event
- │  walsender   │      сырые байты            ↓
+ │  walsender   │       raw bytes             ↓
  └──────────────┘                        ② decode          src/postgres/pgoutput.rs
         ↑                                     ↓
         │                                ③ Assembler       src/transaction.rs
-        │                                     ↓   (копит до COMMIT)
+        │                                     ↓   (buffers until COMMIT)
         │                                ④ Sink::write     src/sink/
         │                                     ↓
-        │                                ⑤ Sink::flush     ← БАРЬЕР (fsync)
+        │                                ⑤ Sink::flush     ← BARRIER (fsync)
         │                                     ↓
-        └──────────────────────────────  ⑥ подтверждение   src/lsn.rs
-              «можешь удалить WAL до сюда»
+        └──────────────────────────────  ⑥ acknowledge     src/lsn.rs
+              "you may delete WAL up to here"
 ```
 
-### ① Читаем сырой кадр
+### ① Read a raw frame
 
 ```rust
 let read = tokio::time::timeout(SHUTDOWN_POLL_INTERVAL, stream.next_raw_event(&cancel)).await;
 ```
 
-Обёртка в таймаут — не потому что боимся зависнуть, а чтобы не проспать сигнал завершения
-дольше 200 мс. Истёкший таймаут здесь **не ошибка**, а просто «читать было нечего»:
+The timeout wrapper is not there because we are afraid of hanging, but so that we do not sleep
+through a shutdown signal for more than 200 ms. An expired timeout here is **not an error**, just
+"there was nothing to read":
 
 ```rust
-// Тик: читать было нечего. Не ошибка — повод дойти до барьера.
+// A tick: there was nothing to read. Not an error — a reason to reach the barrier.
 Err(_elapsed) => {}
 ```
 
-### ② Разбираем `pgoutput`
+### ② Decode `pgoutput`
 
-`decode()` превращает байты в одно из шести сообщений: `Begin`, `Commit`, `Relation`,
+`decode()` turns bytes into one of six messages: `Begin`, `Commit`, `Relation`,
 `Insert`, `Update`, `Delete`.
 
-Это бинарный протокол, разобранный вручную по байтам. Как он устроен — в
-[pgoutput-notes.md](pgoutput-notes.md), 963 строки, выведенных из 31 замороженного дампа
-реальных байтов (`tests/fixtures/`). Пример оттуда, чтобы ты понял уровень занудства:
+This is a binary protocol, read by hand byte by byte. How it is built is in
+[pgoutput-notes.md](pgoutput-notes.md), 963 lines derived from 31 frozen dumps of
+real bytes (`tests/fixtures/`). An example from there, so you get the level of pedantry:
 
-> Отметка времени считается от **2000-01-01**, а не от Unix-эпохи. Если ошибиться и взять
-> 1970, число `841423351314489` даст 1996-08-30 — **тот же день месяца и то же время
-> суток**. Неправильная эпоха выглядит как правдоподобная дата.
+> The timestamp counts from **2000-01-01**, not from the Unix epoch. Get it wrong and take
+> 1970, and the number `841423351314489` gives 1996-08-30 — **the same day of the month and the same
+> time of day**. The wrong epoch looks like a plausible date.
 
-### ③ Собираем транзакцию
+### ③ Assemble the transaction
 
-`Assembler` копит изменения в памяти и отдаёт транзакцию целиком **только по `Commit`**.
+The `Assembler` buffers changes in memory and hands out a transaction as a whole **only on `Commit`**.
 
-Зачем: пока `COMMIT` не пришёл, транзакция может откатиться. Отдав `INSERT` наружу раньше,
-ты опубликуешь то, чего в базе никогда не было.
+Why: until the `COMMIT` arrives the transaction may be rolled back. Hand an `INSERT` out earlier and
+you publish something that never existed in the database.
 
 ```rust
 pub struct Transaction {
     pub xid: u32,
-    pub commit_lsn: Lsn,   // начало записи коммита
-    pub end_lsn: Lsn,      // сразу ЗА ней  ← подтверждаем именно эту
+    pub commit_lsn: Lsn,   // the start of the commit record
+    pub end_lsn: Lsn,      // immediately PAST it  ← this is the one we acknowledge
     pub commit_timestamp: DateTime<Utc>,
     pub changes: Vec<ChangeEvent>,
 }
 ```
 
-**Две позиции, которые нельзя путать.** `commit_lsn` — где запись коммита началась,
-`end_lsn` — сразу за ней. Подтверждать надо `end_lsn`. Подтвердишь `commit_lsn` — и после
-каждого перезапуска будешь заново перечитывать последнюю транзакцию, вечно. Работать будет,
-данные не потеряются — просто тихо и бесконечно неправильно. У нас есть тесты, которые
-краснеют ровно на этой подмене.
+**Two positions that must not be confused.** `commit_lsn` is where the commit record started,
+`end_lsn` is immediately past it. What you have to acknowledge is `end_lsn`. Acknowledge `commit_lsn`
+and after every restart you will re-read the last transaction again, forever. It will work,
+no data is lost — it is just quietly and endlessly wrong. We have tests that go red on exactly
+this substitution.
 
-### ④ Отдаём в приёмник
+### ④ Hand it to the sink
 
 ```rust
 sink.write_transaction(&tx).await?;
 ```
 
-`Ok` здесь значит **«принято»**, а не «на диске». Это прямо написано в трейте:
+`Ok` here means **"accepted"**, not "on disk". That is written out in the trait:
 
 ```rust
-/// Возврат `Ok` означает «принято», а НЕ «durable»: между приёмом и барьером
-/// существует окно, и подтверждать позицию внутри него запрещено инвариантом 1.
+/// Returning `Ok` means "accepted", NOT "durable":
+/// a window exists between acceptance and the barrier, and acknowledging a position
+/// inside it is forbidden by invariant 1.
 ```
 
-### ⑤ Барьер
+### ⑤ The barrier
 
 ```rust
 async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError>;
 ```
 
-У `FileSink` это `flush()` (выгнать из буфера программы в ядро) и следом `durable_sync()`
-(заставить ядро дописать на диск) — **строго в этом порядке**, есть тест, который краснеет
-при перестановке.
+For `FileSink` this is `flush()` (push it out of the program's buffer into the kernel) followed by
+`durable_sync()` (make the kernel finish writing it to disk) — **strictly in that order**; there is
+a test that goes red if they are swapped.
 
-У `StdoutSink` настоящего барьера нет — байты ушли в трубу, а дальше программа знать не
-может. Поэтому приёмники честно объявляют, чем могут поручиться:
+`StdoutSink` has no real barrier — the bytes went into a pipe, and beyond that the program cannot
+know. So the sinks honestly declare what they can vouch for:
 
 ```rust
 pub enum Durability {
-    Fsync,        // после flush данные на диске: подтверждать безопасно
-    BestEffort,   // байты отданы ядру, судьба неизвестна. Для разработки.
+    Fsync,        // after flush the data is committed to disk: acknowledging is safe
+    BestEffort,   // bytes handed to the kernel, their fate unknown. For development.
 }
 ```
 
-и при старте с `--output stdout` в лог выходит предупреждение:
+and when started with `--output stdout` a warning goes into the log:
 
 ```
 WARN sink is best-effort, not durable: acknowledged positions may outlive unwritten output
 ```
 
-### ⑥ Подтверждаем
+### ⑥ Acknowledge
 
-Четыре позиции, за которыми следит `LsnTracker`:
+Four positions that `LsnTracker` watches:
 
-| Позиция | Смысл |
+| Position | Meaning |
 |---|---|
-| `received` | сервер прислал байты |
-| `processed` | разобрали и отдали приёмнику |
-| `durable` | приёмник поручился, что это переживёт падение |
-| `acked` | сказали серверу «можешь удалять» |
+| `received` | the server sent the bytes |
+| `processed` | decoded and handed to the sink |
+| `durable` | the sink vouched that this will survive a crash |
+| `acked` | we told the server "you may delete" |
 
-Каждая только растёт и не может обогнать предыдущую. Правило зашито в тип:
+Each only grows, and none can overtake the previous one. The rule is baked into the type:
 
 ```rust
 pub fn try_ack(&mut self, lsn: Lsn) -> Result<(), PgcdcError> {
@@ -395,170 +397,173 @@ pub fn try_ack(&mut self, lsn: Lsn) -> Result<(), PgcdcError> {
 }
 ```
 
-С комментарием, который стоит прочитать целиком:
+With a comment worth reading in full:
 
-> Это не оборонительное программирование, а тот самый инвариант: пройди такое
-> подтверждение, и крах между ним и записью означал бы тихую потерю.
+> This is not defensive programming, it is the invariant itself: let such an
+> acknowledgement through, and a crash between it and the write would mean a silent loss.
 
 ---
 
-## 4. Карта кода
+## 4. Map of the code
 
-| Файл | Строк | Что там |
+| File | Lines | What is in it |
 |---|---|---|
-| [src/main.rs](../src/main.rs) | 58 | точка входа: разобрать флаги, выбрать приёмник, запустить, вернуть код выхода |
-| [src/config.rs](../src/config.rs) | 491 | десять флагов CLI и парные переменные окружения |
-| [src/postgres/replication.rs](../src/postgres/replication.rs) | 1706 | **сердце**: два цикла, переподключение, подтверждение, завершение |
-| [src/postgres/pgoutput.rs](../src/postgres/pgoutput.rs) | 627 | разбор бинарного протокола |
-| [src/postgres/guard.rs](../src/postgres/guard.rs) | 142 | предстартовая проверка слота |
-| [src/transaction.rs](../src/transaction.rs) | 1145 | `Assembler` — копит до `COMMIT` |
-| [src/lsn.rs](../src/lsn.rs) | 185 | четыре позиции и правила между ними |
-| [src/schema.rs](../src/schema.rs) | 109 | кэш описаний таблиц (`RELATION`) |
-| [src/event.rs](../src/event.rs) | 126 | `ChangeEvent` — то, что уедет в JSON |
-| [src/sink/](../src/sink/) | 703 | трейт `Sink` + две реализации |
-| [src/error.rs](../src/error.rs) | 164 | все виды ошибок и деление fatal / recoverable |
-| [src/metrics.rs](../src/metrics.rs) | 133 | восемь счётчиков |
+| [src/main.rs](../src/main.rs) | 58 | entry point: parse the flags, pick a sink, run, return an exit code |
+| [src/config.rs](../src/config.rs) | 493 | ten CLI flags and their paired environment variables |
+| [src/postgres/replication.rs](../src/postgres/replication.rs) | 1686 | **the heart**: two loops, reconnect, acknowledgement, shutdown |
+| [src/postgres/pgoutput.rs](../src/postgres/pgoutput.rs) | 627 | binary protocol decoding |
+| [src/postgres/guard.rs](../src/postgres/guard.rs) | 142 | the pre-flight check on the slot |
+| [src/transaction.rs](../src/transaction.rs) | 1148 | `Assembler` — buffers until `COMMIT` |
+| [src/lsn.rs](../src/lsn.rs) | 185 | the four positions and the rules between them |
+| [src/schema.rs](../src/schema.rs) | 109 | cache of table descriptions (`RELATION`) |
+| [src/event.rs](../src/event.rs) | 126 | `ChangeEvent` — what goes out as JSON |
+| [src/sink/](../src/sink/) | 701 | the `Sink` trait + two implementations |
+| [src/error.rs](../src/error.rs) | 164 | every kind of error and the fatal / recoverable split |
+| [src/metrics.rs](../src/metrics.rs) | 133 | eight counters |
 
-Начинать читать: `main.rs` → `run()` в `replication.rs` → `stream_once()` там же.
+Where to start reading: `main.rs` → `run()` in `replication.rs` → `stream_once()` in the same file.
 
 ---
 
-## 5. Два цикла
+## 5. Two loops
 
-### Внешний — `run()`: живучесть
+### The outer one — `run()`: staying alive
 
 ```rust
 loop {
-    if shutdown.load(Ordering::Relaxed) { return Ok(()); }   // сигнал?
+    if shutdown.load(Ordering::Relaxed) { return Ok(()); }   // signal?
 
     match stream_once(...).await {
         Ok(SessionOutcome::ShutdownRequested) => return Ok(()),
-        Ok(SessionOutcome::Disconnected)      => {}           // оборвалось — переподключаемся
-        Err(e) if !e.is_fatal()               => { /* лечится ретраем */ }
-        Err(e)                                => return Err(e),  // не лечится — выходим
+        Ok(SessionOutcome::Disconnected)      => {}           // dropped — reconnect
+        Err(e) if !e.is_fatal()               => { /* a retry cures it */ }
+        Err(e)                                => return Err(e),  // nothing cures it — exit
     }
 
-    let delay = backoff.next_delay(productive);   // 100мс, 200, 400, ... до 30с
-    // пауза, нарезанная кусками по 200мс, чтобы не проспать сигнал
+    let delay = backoff.next_delay(productive);   // 100ms, 200, 400, ... up to 30s
+    // a pause sliced into 200ms chunks, so we do not sleep through the signal
 }
 ```
 
-Обрати внимание на `Err(e) if !e.is_fatal()` — это `match` с условием (`guard`). Вся
-разница между «подождём и попробуем снова» и «выходим с кодом 1» решается **здесь**, и
-решается по типу ошибки, а не по разбору текста сообщения.
+Note the `Err(e) if !e.is_fatal()` — that is a `match` with a condition (a `guard`). The whole
+difference between "wait and try again" and "exit with code 1" is decided **here**, and it is
+decided by the type of the error, not by picking apart the text of a message.
 
-### Внутренний — `stream_once()`: одна сессия
+### The inner one — `stream_once()`: a single session
 
-Порядок операторов, который в этом проекте объявлен нерушимым:
+The order of statements that this project declares must not change:
 
 ```
-sink.write_transaction   →  note_processed  →  [по таймеру] flush
+sink.write_transaction   →  note_processed  →  [on the timer] flush
    →  note_durable  →  try_ack  →  send_feedback
 ```
 
-В коде это помечено прямо:
+In the code it is marked outright:
 
 ```rust
-// Порядок нерушим: сначала sink, потом барьер, потом durable, только потом ack.
+// The order MUST NOT change: sink first, then barrier, then durable, only then ack.
 ```
 
-Поменяешь местами — тесты покраснеют. Мы это проверяли мутацией: подтверждение до барьера
-роняет три теста.
+Swap them around and the tests go red. We checked this with a mutation: acknowledging before the
+barrier drops three tests.
 
 ---
 
-## 6. Три инварианта
+## 6. Three invariants
 
-Из [DECISIONS.md](../DECISIONS.md). Это конституция проекта.
+From [DECISIONS.md](../DECISIONS.md). This is the project's constitution.
 
-**1. `acked <= durable`.** Нельзя сказать серверу «удаляй» про то, что ещё не на диске.
-Держится типом `LsnTracker`.
+**1. `acked <= durable`.** You must not tell the server "delete" about something that is not yet on
+disk. Held by the `LsnTracker` type.
 
-**2. Дубликаты допустимы, тихая потеря — нет.** Если мы упадём между записью и
-подтверждением, слот отдаст те же транзакции ещё раз. Это нормально: потребитель обязан
-быть идемпотентным. А вот потерять нельзя никогда.
+**2. Duplicates are allowed, silent loss is not.** If we crash between the write and the
+acknowledgement, the slot will hand the same transactions over again. That is fine: the consumer MUST
+be idempotent. Losing data, on the other hand, is never allowed.
 
-**3. Ничто, способное потерять события, не выходит с нулём.** Код выхода — единственный
-язык, на котором программа говорит с Kubernetes. Ноль значит «сделал работу». Программа,
-которая тихо ничего не делает, — худший из отказов: дашборд зелёный, лаг растёт, никто не
-приходит.
-
----
-
-## 7. На чём мы реально попались
-
-Самая полезная часть. Все эти дефекты нашлись ревью и **ни один — зелёными тестами**.
-
-### Тест, зелёный под мутацией того, что он проверяет
-
-Пять раз за проект. Приём, которым ловили: **испортить код нарочно и посмотреть, покраснеет
-ли набор.** Не покраснел — значит покрытия нет, что бы там ни говорил отчёт.
-
-Три случая подряд на финале, все на центральных утверждениях:
-
-- удалили **целиком** блок периодической сводки метрик — 168 тестов зелёные;
-- заменили `sink.write_transaction(&tx).await?` на `let _ = ...` (проглотить отказ записи) —
-  168 зелёные. А для файлового приёмника это настоящая тихая потеря;
-- отправили серверу `received` вместо `acked` — 168 зелёные, при том что слот при этом
-  обгонял нас на десятки мегабайт.
-
-Последнее особенно поучительно. Тест, который якобы это покрывал, читал **наш собственный
-счётчик** — то есть наше решение, а не то, что реально ушло на провод.
-
-> Счётчик, записывающий намерение, доказывает намерение, но никогда — следствие.
-
-### Пароль в `--help`
-
-`clap` (библиотека разбора аргументов) печатает в справке значения переменных окружения.
-Строка подключения с паролем уезжала в `--help`. Починили `hide_env_values`, потом
-выяснилось, что clap печатает и **отвергнутые** значения в тексте ошибки, — пришлось
-сделать разбор строки подключения принципиально неотказывающим.
-
-### Слот, который молча пересоздали
-
-Библиотека транспорта при старте безусловно зовёт `ensure_replication_slot()`. Если слота
-нет — она создаёт его **на текущей позиции WAL**, и всё, что закоммичено до старта, не
-приходит никогда. Молча. Мы это измерили, а не предположили, и написали предстартовую
-проверку, которая падает вместо такого «удобства». Отсюда же список из пяти запрещённых к
-использованию вызовов этой библиотеки в [spike-findings.md](spike-findings.md) §3.
-
-### Вечный ретрай вместо кода выхода
-
-На инвалидированном слоте (сервер удалил нужный нам WAL) процесс переподключался бесконечно
-вместо выхода с единицей. Разница, которую код не видел: **сервер, который не отвечает, и
-сервер, который отвечает отказом, — это разные вещи**. Первое лечится ретраем, второе — нет
-никогда.
-
-### Комментарий, описывающий механизм, которого нет
-
-Одиннадцать раз. Каждый нашёл читатель, а не автор, — и дважды подряд комментарий врал
-внутри той самой конструкции, которую в этот момент чинили.
-
-> Тот, кто меняет механизм, — последний человек, способный заметить, что описание перестало
-> ему соответствовать.
+**3. Nothing capable of losing events exits with a zero.** The exit code is the only
+language in which the program speaks to Kubernetes. Zero means "did the job". A program
+that quietly does nothing is the worst kind of failure: the dashboard is green, the lag grows, nobody
+comes.
 
 ---
 
-## 8. Запустить и посмотреть
+## 7. What actually caught us out
+
+The most useful part. All of these defects were found by review and **not one of them by green tests**.
+
+### A test that stays green under a mutation of the very thing it checks
+
+Five times over the project. The technique that caught them: **break the code deliberately and see
+whether the suite goes red.** It did not go red, so there is no coverage, whatever the report says.
+
+Three cases in a row at the finish, all on central claims. The count below is the size of the
+suite **at the time those mutations were run** — do not "correct" it to today's number: the point
+is that 168 tests were green while the code was broken. All three mutations are caught now,
+because the fix round that followed added tests that pin them.
+
+- we deleted the periodic metrics report block **entirely** — 168 tests green;
+- we replaced `sink.write_transaction(&tx).await?` with `let _ = ...` (swallow the write failure) —
+  168 green. And for the file sink that is a real silent loss;
+- we sent the server `received` instead of `acked` — 168 green, even though the slot was
+  running tens of megabytes ahead of us.
+
+The last one is especially instructive. The test that supposedly covered it read **our own
+counter** — that is, our decision, not what actually went out on the wire.
+
+> A counter that records intent proves intent, but never consequence.
+
+### The password in `--help`
+
+`clap` (the argument-parsing library) prints environment variable values in the help text. The
+connection string with the password was leaking into `--help`. We fixed it with `hide_env_values`, and
+then it turned out clap also prints **rejected** values in the error text — so we had to
+make connection-string parsing fundamentally non-rejecting.
+
+### The slot that got silently re-created
+
+At start-up the transport library unconditionally calls `ensure_replication_slot()`. If the slot is
+missing, it creates it **at the current WAL position**, and everything committed before the start never
+arrives. Silently. We measured this rather than assumed it, and wrote a pre-flight
+check that fails instead of being that "helpful". Hence, too, the list of five calls of this library
+that are forbidden to use, in [spike-findings.md](spike-findings.md) §3.
+
+### An endless retry instead of an exit code
+
+On an invalidated slot (the server deleted the WAL we needed) the process reconnected forever
+instead of exiting with a one. The difference the code did not see: **a server that does not answer and
+a server that answers with a refusal are different things**. The first is cured by a retry, the second
+never is.
+
+### A comment describing a mechanism that does not exist
+
+Eleven times. Every one was found by a reader, not by the author — and twice in a row the comment lied
+inside the very construct that was being fixed at that moment.
+
+> Whoever changes a mechanism is the last person able to notice that the description has stopped
+> matching it.
+
+---
+
+## 8. Run it and see
 
 ```bash
-docker compose up -d --wait                  # только Postgres
-docker compose --profile demo up -d pgcdc    # и наш инструмент
+docker compose up -d --wait                  # Postgres only
+docker compose --profile demo up -d pgcdc    # and our tool
 
 psql -h 127.0.0.1 -U postgres -d app -c "INSERT INTO users VALUES (1,'Alice',NULL,NULL);"
 docker compose logs pgcdc | grep '"operation"'
 ```
 
-Полезная нагрузка идёт в **stdout**, логи — в **stderr**. Всегда. Поэтому работает:
+The payload goes to **stdout**, the logs to **stderr**. Always. Which is why this works:
 
 ```bash
 pgcdc --output stdout ... | jq -r '.table'
 ```
 
-Труба получает только JSON, логи остаются на экране. Есть тест, который стережёт это даже
-на пути фатальной ошибки.
+The pipe gets only JSON, the logs stay on screen. There is a test guarding this even
+on the fatal-error path.
 
-### Что читать в логах
+### What to read in the logs
 
 ```
 INFO  slot_preflight_ok slot=pgcdc_slot restart_lsn=Some("0/192FED8") ...
@@ -567,49 +572,49 @@ INFO  metrics_report events=3 transactions=3 bytes=395 reconnects=0 errors=0
       last_received_lsn=0/1974170 last_acknowledged_lsn=0/19741A8 buffer=0
 ```
 
-Сводка выходит раз в десять секунд. Пособытийные строки — на `DEBUG`
-(`RUST_LOG=debug`), потому что на тысяче транзакций в секунду это тысяча строк в секунду.
+The report comes out once every ten seconds. Per-event lines are at `DEBUG`
+(`RUST_LOG=debug`), because at a thousand transactions a second that is a thousand lines a second.
 
-Тревожные признаки:
-- `buffer` не падает до нуля — застряла открытая транзакция;
-- `last_received_lsn` растёт, а `last_acknowledged_lsn` стоит — не доходим до барьера;
-- `reconnects` растёт равномерно — что-то рвёт соединение;
-- `error_kind="slot_unusable"` или `"slot_busy_timed_out"` — процесс сейчас выйдет с 1,
-  и это правильно.
-
----
-
-## 9. Куда лезть, если надо что-то добавить
-
-**Новый приёмник (Kafka, S3, что угодно).** Реализуй трейт `Sink` — три метода. Компилятор
-сам заставит дописать ветку в `match` внутри `main.rs`, забыть не даст.
-
-Единственный вопрос, на который придётся ответить честно, — `durability()`. У Kafka
-настоящий барьер — это `acks=all` и подтверждение от нужного числа реплик. Ответишь
-`Fsync`, не дождавшись их, — получишь ровно ту тихую потерю, ради запрета которой всё это
-построено.
-
-**Новое поле в JSON.** `ChangeEvent` в `src/event.rs`. `#[derive(Serialize)]` подхватит его
-сам.
-
-**Новый вид ошибки.** Добавь вариант в `PgcdcError` — компилятор потребует
-классифицировать его в `is_fatal()`.
+Warning signs:
+- `buffer` does not drop to zero — an open transaction is stuck;
+- `last_received_lsn` grows while `last_acknowledged_lsn` stands still — we are not reaching the barrier;
+- `reconnects` grows steadily — something is tearing the connection;
+- `error_kind="slot_unusable"` or `"slot_busy_timed_out"` — the process is about to exit with a 1,
+  and that is right.
 
 ---
 
-## 10. Что унести с собой
+## 9. Where to dig if you need to add something
 
-1. **Подтверждение позиции необратимо.** Всё остальное в этом коде — следствие.
-2. **`Ok` от записи ≠ данные на диске.** Между ними окно, и подтверждать внутри него нельзя.
-3. **Зелёный набор тестов — это утверждение о тестах, а не о коде.** Хочешь знать, покрыто
-   ли что-то, — сломай это нарочно и посмотри.
-4. **Компилятор Rust — не бюрократ, а второй ревьюер.** Половина решений здесь принята
-   так, чтобы забывчивость ловилась при сборке, а не в проде.
-5. **Тихий отказ хуже громкого.** Программа, вечно повторяющая обречённую попытку,
-   выглядит работающей ровно до вопроса «а что она за неделю сделала?».
+**A new sink (Kafka, S3, anything).** Implement the `Sink` trait — three methods. The compiler
+will make you add a branch to the `match` inside `main.rs` itself; it will not let you forget.
+
+The only question you will have to answer honestly is `durability()`. For Kafka the real
+barrier is `acks=all` plus acknowledgement from the required number of replicas. Answer
+`Fsync` without waiting for them and you get exactly the silent loss that all of this was
+built to forbid.
+
+**A new field in the JSON.** `ChangeEvent` in `src/event.rs`. `#[derive(Serialize)]` will pick it up
+itself.
+
+**A new kind of error.** Add a variant to `PgcdcError` — the compiler will require it to be
+classified in `is_fatal()`.
 
 ---
 
-Дальше: [DECISIONS.md](../DECISIONS.md) — почему сделано именно так (29 решений),
-[spike-findings.md](spike-findings.md) — что выяснили про библиотеку транспорта и чем
-нельзя пользоваться, [pgoutput-notes.md](pgoutput-notes.md) — байты протокола.
+## 10. What to take away
+
+1. **Acknowledging a position is irreversible.** Everything else in this code follows from that.
+2. **`Ok` from a write ≠ data on disk.** There is a window between them, and acknowledging inside it is not allowed.
+3. **A green test suite is a claim about the tests, not about the code.** If you want to know whether
+   something is covered, break it deliberately and look.
+4. **The Rust compiler is not a bureaucrat, it is a second reviewer.** Half the decisions here were made
+   so that forgetfulness gets caught at build time, not in production.
+5. **A silent failure is worse than a loud one.** A program forever repeating a doomed attempt
+   looks like it is working, right up to the question "so what did it do this week?".
+
+---
+
+Next: [DECISIONS.md](../DECISIONS.md) — why it was done this way (29 decisions),
+[spike-findings.md](spike-findings.md) — what we found out about the transport library and what
+must not be used, [pgoutput-notes.md](pgoutput-notes.md) — the bytes of the protocol.

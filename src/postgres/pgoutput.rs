@@ -1,9 +1,9 @@
 use crate::error::PgcdcError;
 use crate::schema::{Column, Relation};
 
-/// Курсор по payload'у с проверкой длины на каждом чтении. Любое чтение за границей
-/// буфера — это Decode-ошибка, а не паника: битый WAL не должен ронять процесс
-/// без внятного сообщения.
+/// A cursor over the payload with a length check on every read. Any read past the
+/// buffer's boundary is a Decode error, not a panic: a corrupted WAL must not bring
+/// down the process without a clear message.
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -55,7 +55,7 @@ impl<'a> Reader<'a> {
         Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 
-    /// C-строка: байты до нулевого терминатора, сам терминатор проглатывается.
+    /// C string: bytes up to the null terminator, the terminator itself is consumed.
     fn cstr(&mut self) -> Result<String, PgcdcError> {
         let rest = &self.buf[self.pos..];
         let nul = rest.iter().position(|&b| b == 0).ok_or_else(|| {
@@ -81,12 +81,12 @@ impl<'a> Reader<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnValue {
-    /// Тег 'n'. В кортеже 'N'/'O' — настоящий SQL NULL.
-    /// В кортеже 'K' — «колонку не прислали», что НЕ то же самое.
+    /// Tag 'n'. In a 'N'/'O' tuple — a real SQL NULL.
+    /// In a 'K' tuple — "the column was not sent", which is NOT the same thing.
     Null,
-    /// Тег 'u'. TOAST-значение не менялось, сервер его не переслал.
+    /// Tag 'u'. The TOAST value did not change, the server did not forward it.
     UnchangedToast,
-    /// Тег 't'. Текстовое представление значения.
+    /// Tag 't'. The value's text representation.
     Text(String),
 }
 
@@ -95,13 +95,13 @@ pub struct TupleData {
     pub columns: Vec<ColumnValue>,
 }
 
-/// Что именно сервер прислал в старом кортеже. Различие несущее: при `Key`
-/// неключевые колонки приходят с тегом `'n'`, и это «не прислано», а не NULL.
+/// What exactly the server sent in the old tuple. The distinction carries weight:
+/// with `Key`, non-key columns arrive with the tag `'n'`, and that means "not sent", not NULL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OldTupleKind {
-    /// Тег `'K'` — только колонки replica identity.
+    /// Tag `'K'` — replica identity columns only.
     Key,
-    /// Тег `'O'` — полная старая строка (REPLICA IDENTITY FULL).
+    /// Tag `'O'` — the full old row (REPLICA IDENTITY FULL).
     Full,
 }
 
@@ -192,8 +192,8 @@ pub fn decode(payload: &[u8]) -> Result<PgOutputMessage, PgcdcError> {
         }
         'U' => {
             let relation_id = r.u32()?;
-            // Байт в позиции 5 решает всё: 'O'/'K' — дальше старый кортеж,
-            // 'N' — старого нет и это уже новый. Третьего не дано.
+            // The byte at position 5 decides everything: 'O'/'K' — an old tuple follows,
+            // 'N' — there is no old one and this is already the new one. There is no third option.
             let tag = r.u8()?;
             let (old, new_tag) = match tag {
                 b'O' => (Some((OldTupleKind::Full, read_tuple(&mut r)?)), r.u8()?),
@@ -220,7 +220,7 @@ pub fn decode(payload: &[u8]) -> Result<PgOutputMessage, PgcdcError> {
         }
         'D' => {
             let relation_id = r.u32()?;
-            // В отличие от UPDATE тег обязателен: «ничего» не бывает.
+            // Unlike UPDATE the tag is mandatory: there is no "nothing" case.
             let old_kind = match r.u8()? {
                 b'K' => OldTupleKind::Key,
                 b'O' => OldTupleKind::Full,
@@ -243,8 +243,8 @@ pub fn decode(payload: &[u8]) -> Result<PgOutputMessage, PgcdcError> {
     Ok(msg)
 }
 
-/// Читает TupleData: Int16 число колонок, затем на каждую — тег и,
-/// только для 't'/'b', длину и данные. У 'n' и 'u' длины НЕТ.
+/// Reads TupleData: an Int16 column count, then for each one — a tag and,
+/// only for 't'/'b', a length and data. 'n' and 'u' have NO length.
 fn read_tuple(r: &mut Reader<'_>) -> Result<TupleData, PgcdcError> {
     let ncols = r.i16()?;
     if ncols < 0 {
@@ -270,10 +270,10 @@ fn read_tuple(r: &mut Reader<'_>) -> Result<TupleData, PgcdcError> {
                     .map_err(|e| PgcdcError::Decode(format!("invalid utf8 in column {i}: {e}")))?;
                 ColumnValue::Text(text.to_owned())
             }
-            // Раскладка 'b' (Int32 длина + данные) взята из документации и байтами не
-            // подтверждена (docs/pgoutput-notes.md §14.2): опция `binary` нигде не
-            // включалась, ни одной фикстуры с этим тегом нет. Декодировать её как текст
-            // было бы непроверенным кодом; типизированная ошибка честнее.
+            // The 'b' layout (Int32 length + data) is taken from the documentation and is not
+            // confirmed by any captured bytes (docs/pgoutput-notes.md §14.2): the `binary` option
+            // was never enabled anywhere, there isn't a single fixture with this tag. Decoding it
+            // as text would be unverified code; a typed error is more honest.
             b'b' => {
                 return Err(PgcdcError::Decode("binary format not supported".into()));
             }
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn decodes_begin() {
-        assert_eq!(BEGIN.len(), 21, "BEGIN всегда 21 байт");
+        assert_eq!(BEGIN.len(), 21, "BEGIN is always 21 bytes");
         match decode(BEGIN).unwrap() {
             PgOutputMessage::Begin {
                 final_lsn,
@@ -309,14 +309,14 @@ mod tests {
                 assert_eq!(commit_timestamp, 841_423_351_314_489);
                 assert_eq!(xid, 737);
             }
-            other => panic!("ожидался Begin, получен {other:?}"),
+            other => panic!("expected Begin, got {other:?}"),
         }
     }
 
     #[test]
     fn decodes_commit_without_swapping_the_two_lsns() {
-        // commit_lsn на offset 2, end_lsn на offset 10, разница 0x30.
-        // Перепутать их — значит перечитывать каждую транзакцию после рестарта.
+        // commit_lsn is at offset 2, end_lsn at offset 10, a difference of 0x30.
+        // Mixing them up would mean re-reading every transaction after a restart.
         match decode(COMMIT).unwrap() {
             PgOutputMessage::Commit {
                 flags,
@@ -325,23 +325,23 @@ mod tests {
                 commit_timestamp,
             } => {
                 assert_eq!(flags, 0);
-                assert_eq!(commit_lsn, 0x0193_00D0, "commit_lsn — первый, offset 2");
-                assert_eq!(end_lsn, 0x0193_0100, "end_lsn — второй, offset 10");
+                assert_eq!(commit_lsn, 0x0193_00D0, "commit_lsn is first, offset 2");
+                assert_eq!(end_lsn, 0x0193_0100, "end_lsn is second, offset 10");
                 assert_eq!(end_lsn - commit_lsn, 0x30);
                 assert_eq!(commit_timestamp, 841_423_351_314_489);
             }
-            other => panic!("ожидался Commit, получен {other:?}"),
+            other => panic!("expected Commit, got {other:?}"),
         }
     }
 
     #[test]
     fn begin_final_lsn_equals_commit_commit_lsn() {
-        // Инвариант из §8 заметок: BEGIN уже знает, где транзакция закончится.
+        // Invariant from notes §8: BEGIN already knows where the transaction will end.
         let (b, c) = (decode(BEGIN).unwrap(), decode(COMMIT).unwrap());
         let (PgOutputMessage::Begin { final_lsn, .. }, PgOutputMessage::Commit { commit_lsn, .. }) =
             (b, c)
         else {
-            panic!("не те типы")
+            panic!("wrong types")
         };
         assert_eq!(final_lsn, commit_lsn);
     }
@@ -352,38 +352,42 @@ mod tests {
     #[test]
     fn decodes_relation_with_full_replica_identity() {
         let PgOutputMessage::Relation(rel) = decode(RELATION_USERS).unwrap() else {
-            panic!("ожидался Relation")
+            panic!("expected Relation")
         };
         assert_eq!(rel.id, 16385);
         assert_eq!(rel.namespace, "public");
         assert_eq!(rel.name, "users");
         assert_eq!(
             rel.replica_identity, b'f',
-            "users создана с REPLICA IDENTITY FULL"
+            "users was created with REPLICA IDENTITY FULL"
         );
         let names: Vec<&str> = rel.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["id", "name", "email", "bio"]);
         assert!(
             rel.columns.iter().all(|c| c.is_key),
-            "при FULL все колонки помечены ключевыми"
+            "with FULL, all columns are marked as key"
         );
         assert!(
             rel.columns.iter().all(|c| c.atttypmod == -1),
-            "atttypmod читается как знаковый"
+            "atttypmod is read as signed"
         );
     }
 
     #[test]
     fn decodes_relation_with_default_replica_identity() {
         let PgOutputMessage::Relation(rel) = decode(RELATION_ITEMS).unwrap() else {
-            panic!("ожидался Relation")
+            panic!("expected Relation")
         };
         assert_eq!(rel.name, "items");
         assert_eq!(rel.replica_identity, b'd');
         let names: Vec<&str> = rel.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["id", "title", "qty"]);
         let keys: Vec<bool> = rel.columns.iter().map(|c| c.is_key).collect();
-        assert_eq!(keys, [true, false, false], "при DEFAULT ключевой только PK");
+        assert_eq!(
+            keys,
+            [true, false, false],
+            "with DEFAULT, only the PK is key"
+        );
     }
 
     const INSERT_USERS: &[u8] = include_bytes!("../../tests/fixtures/0003_insert.bin");
@@ -392,10 +396,10 @@ mod tests {
 
     #[test]
     fn decodes_insert_and_does_not_read_length_after_null_tag() {
-        // Последний байт 0003_insert.bin — тег 'n' без длины и данных.
-        // Декодер, который безусловно читает 4 байта длины после тега, здесь развалится.
+        // The last byte of 0003_insert.bin is tag 'n' with no length and no data.
+        // A decoder that unconditionally reads 4 length bytes after the tag would fall apart here.
         let PgOutputMessage::Insert { relation_id, tuple } = decode(INSERT_USERS).unwrap() else {
-            panic!("ожидался Insert")
+            panic!("expected Insert")
         };
         assert_eq!(relation_id, 16385);
         assert_eq!(
@@ -411,9 +415,9 @@ mod tests {
 
     #[test]
     fn values_arrive_as_text_not_binary() {
-        // id BIGINT = 1 приезжает одним байтом 0x31 = ASCII '1', а не восемью байтами int8.
+        // id BIGINT = 1 arrives as a single byte 0x31 = ASCII '1', not eight bytes of int8.
         let PgOutputMessage::Insert { tuple, .. } = decode(INSERT_ITEMS).unwrap() else {
-            panic!("ожидался Insert")
+            panic!("expected Insert")
         };
         assert_eq!(tuple.columns[0], ColumnValue::Text("10".into()));
         assert_eq!(tuple.columns[2], ColumnValue::Text("5".into()));
@@ -422,32 +426,32 @@ mod tests {
     #[test]
     fn decodes_large_toast_value_in_full() {
         let PgOutputMessage::Insert { tuple, .. } = decode(INSERT_TOAST).unwrap() else {
-            panic!("ожидался Insert")
+            panic!("expected Insert")
         };
         let ColumnValue::Text(bio) = &tuple.columns[3] else {
-            panic!("bio должен приехать текстом целиком в INSERT")
+            panic!("bio must arrive as text in full on INSERT")
         };
         assert_eq!(bio.len(), 9600);
     }
 
     #[test]
     fn every_column_has_an_entry_even_when_null() {
-        // В TupleData всегда ровно ncols записей, пропусков нет (§6 заметок).
+        // TupleData always has exactly ncols entries, no gaps (notes §6).
         let PgOutputMessage::Insert { tuple, .. } = decode(INSERT_USERS).unwrap() else {
-            panic!("ожидался Insert")
+            panic!("expected Insert")
         };
         assert_eq!(tuple.columns.len(), 4);
     }
 
     #[test]
     fn other_message_kinds_are_still_explicitly_unsupported() {
-        // TRUNCATE, TYPE, ORIGIN и всё неизвестное по-прежнему обязаны давать
-        // явную ошибку, а не молчаливый пропуск (спека §8).
+        // TRUNCATE, TYPE, ORIGIN and anything unknown must still produce an
+        // explicit error, not a silent skip (spec §8).
         for kind in [b'T', b'Y', b'O', b'M', b'S'] {
             let payload = [kind, 0x00, 0x00, 0x00, 0x00];
             assert!(
                 matches!(decode(&payload), Err(PgcdcError::UnsupportedMessage { .. })),
-                "тип {:?} должен быть явно неподдержан",
+                "kind {:?} must be explicitly unsupported",
                 kind as char
             );
         }
@@ -464,7 +468,7 @@ mod tests {
             old,
         } = decode(DELETE_FULL).unwrap()
         else {
-            panic!("ожидался Delete")
+            panic!("expected Delete")
         };
         assert_eq!(relation_id, 16385);
         assert_eq!(old_kind, OldTupleKind::Full);
@@ -474,10 +478,10 @@ mod tests {
 
     #[test]
     fn decodes_delete_with_key_only_tuple_carrying_a_slot_per_column() {
-        // ncols = 3, не 1: в 'K'-кортеже запись на КАЖДУЮ колонку таблицы,
-        // просто неключевые заполнены 'n'.
+        // ncols = 3, not 1: in a 'K' tuple there's an entry for EVERY column of the table,
+        // non-key ones are simply filled with 'n'.
         let PgOutputMessage::Delete { old_kind, old, .. } = decode(DELETE_KEY).unwrap() else {
-            panic!("ожидался Delete")
+            panic!("expected Delete")
         };
         assert_eq!(old_kind, OldTupleKind::Key);
         assert_eq!(old.columns.len(), 3);
@@ -488,7 +492,7 @@ mod tests {
 
     #[test]
     fn delete_without_a_tuple_tag_is_an_error() {
-        // У DELETE тег обязателен: удалённую строку надо чем-то идентифицировать.
+        // For DELETE the tag is mandatory: the deleted row needs to be identified by something.
         let bad = [0x44u8, 0x00, 0x00, 0x40, 0x08, 0x4E, 0x00, 0x00];
         assert!(matches!(decode(&bad), Err(PgcdcError::Decode(_))));
     }
@@ -497,16 +501,16 @@ mod tests {
     const UPDATE_NO_OLD: &[u8] = include_bytes!("../../tests/fixtures/0016_update.bin");
     const UPDATE_TOAST: &[u8] = include_bytes!("../../tests/fixtures/0025_update.bin");
 
-    /// UPDATE с тегом 'K' — DEFAULT-идентичность и изменившийся ключ.
-    /// В захвате этой формы нет (docs/pgoutput-notes.md §14 п.3), поэтому байты
-    /// собраны вручную по разметке §10 и §7: 'U', OID 16392 (items),
-    /// 'K', старый кортеж {id:"10", n, n}, 'N', новый кортеж {"11","Widget","7"}.
-    /// В tests/fixtures/ такие байты класть нельзя — там только реальные захваты.
+    /// UPDATE with tag 'K' — DEFAULT identity and a changed key.
+    /// No capture of this form exists (docs/pgoutput-notes.md §14 item 3), so the bytes
+    /// are assembled by hand per the layout in §10 and §7: 'U', OID 16392 (items),
+    /// 'K', old tuple {id:"10", n, n}, 'N', new tuple {"11","Widget","7"}.
+    /// These bytes cannot go into tests/fixtures/ — that holds only real captures.
     const SYNTHETIC_UPDATE_KEY: &[u8] = &[
         0x55, 0x00, 0x00, 0x40, 0x08, // 'U', OID 16392
         0x4B, 0x00, 0x03, // 'K', ncols=3
         0x74, 0x00, 0x00, 0x00, 0x02, 0x31, 0x30, // t(2)="10"
-        0x6E, 0x6E, // 'n', 'n' — заглушки неключевых колонок
+        0x6E, 0x6E, // 'n', 'n' — stubs for non-key columns
         0x4E, 0x00, 0x03, // 'N', ncols=3
         0x74, 0x00, 0x00, 0x00, 0x02, 0x31, 0x31, // t(2)="11"
         0x74, 0x00, 0x00, 0x00, 0x06, 0x57, 0x69, 0x64, 0x67, 0x65, 0x74, // t(6)="Widget"
@@ -521,10 +525,10 @@ mod tests {
             new,
         } = decode(UPDATE_FULL).unwrap()
         else {
-            panic!("ожидался Update")
+            panic!("expected Update")
         };
         assert_eq!(relation_id, 16385);
-        let (kind, old_tuple) = old.expect("при REPLICA IDENTITY FULL старый кортеж есть");
+        let (kind, old_tuple) = old.expect("with REPLICA IDENTITY FULL an old tuple exists");
         assert_eq!(kind, OldTupleKind::Full);
         assert_eq!(old_tuple.columns[1], ColumnValue::Text("Alice".into()));
         assert_eq!(new.columns[1], ColumnValue::Text("Bob".into()));
@@ -532,8 +536,8 @@ mod tests {
 
     #[test]
     fn decodes_update_without_an_old_tuple() {
-        // Offset 5 — 'N', а не 'O'/'K'. Один байт отличает «есть before» от «нет before»;
-        // отличать по длине сообщения или по счёту тегов нельзя.
+        // Offset 5 is 'N', not 'O'/'K'. One byte distinguishes "has before" from "no before";
+        // it cannot be told apart by message length or by counting tags.
         assert_eq!(UPDATE_NO_OLD[5], b'N');
         let PgOutputMessage::Update {
             relation_id,
@@ -541,12 +545,12 @@ mod tests {
             new,
         } = decode(UPDATE_NO_OLD).unwrap()
         else {
-            panic!("ожидался Update")
+            panic!("expected Update")
         };
         assert_eq!(relation_id, 16392);
         assert!(
             old.is_none(),
-            "ключ не менялся — старой версии строки нет вовсе"
+            "the key did not change — there is no old version of the row at all"
         );
         assert_eq!(
             new.columns,
@@ -561,30 +565,30 @@ mod tests {
     #[test]
     fn decodes_update_with_key_only_old_tuple() {
         let PgOutputMessage::Update { old, new, .. } = decode(SYNTHETIC_UPDATE_KEY).unwrap() else {
-            panic!("ожидался Update")
+            panic!("expected Update")
         };
-        let (kind, old_tuple) = old.expect("тег 'K' даёт старый кортеж");
+        let (kind, old_tuple) = old.expect("tag 'K' produces an old tuple");
         assert_eq!(kind, OldTupleKind::Key);
         assert_eq!(
             old_tuple.columns.len(),
             3,
-            "в 'K'-кортеже запись на каждую колонку"
+            "a 'K' tuple has an entry for every column"
         );
         assert_eq!(old_tuple.columns[0], ColumnValue::Text("10".into()));
-        assert_eq!(old_tuple.columns[1], ColumnValue::Null, "заглушка, не NULL");
+        assert_eq!(old_tuple.columns[1], ColumnValue::Null, "a stub, not NULL");
         assert_eq!(new.columns[0], ColumnValue::Text("11".into()));
     }
 
     #[test]
     fn decodes_update_with_unchanged_toast_marker() {
-        // Асимметрия: старый кортеж несёт bio целиком (9600 байт), новый — один байт 'u'.
+        // Asymmetry: the old tuple carries bio in full (9600 bytes), the new one — a single byte 'u'.
         let PgOutputMessage::Update { old, new, .. } = decode(UPDATE_TOAST).unwrap() else {
-            panic!("ожидался Update")
+            panic!("expected Update")
         };
         let (kind, old_tuple) = old.expect("FULL");
         assert_eq!(kind, OldTupleKind::Full);
         let ColumnValue::Text(old_bio) = &old_tuple.columns[3] else {
-            panic!("старый bio обязан приехать текстом")
+            panic!("the old bio must arrive as text")
         };
         assert_eq!(old_bio.len(), 9600);
         assert_eq!(new.columns[3], ColumnValue::UnchangedToast);
@@ -611,14 +615,14 @@ mod tests {
 
     #[test]
     fn binary_tagged_column_is_a_typed_decode_error() {
-        // Тег 'b' не встречается ни в одной фикстуре (опция binary не запрашивалась),
-        // поэтому байты здесь синтетические. decode обязан вернуть типизированную
-        // ошибку, а не молча прочитать значение как текст (docs/pgoutput-notes.md §14.2).
+        // Tag 'b' does not appear in any fixture (the binary option was never requested),
+        // so the bytes here are synthetic. decode must return a typed
+        // error, not silently read the value as text (docs/pgoutput-notes.md §14.2).
         let mut payload = vec![b'I'];
         payload.extend_from_slice(&1u32.to_be_bytes()); // relation_id
-        payload.push(b'N'); // тег кортежа INSERT
+        payload.push(b'N'); // INSERT tuple tag
         payload.extend_from_slice(&1i16.to_be_bytes()); // ncols
-        payload.push(b'b'); // decode должен упасть здесь, не читая длину/данные
+        payload.push(b'b'); // decode must fail here, without reading the length/data
         assert!(matches!(
             decode(&payload),
             Err(PgcdcError::Decode(msg)) if msg.contains("binary format not supported")

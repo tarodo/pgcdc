@@ -1,9 +1,9 @@
 use thiserror::Error;
 
-/// Разделение recoverable/fatal живёт в типе, а не в комментарии: `is_fatal`
-/// реализован исчерпывающим match без `_ =>`, поэтому компилятор заставит
-/// классифицировать каждый новый вариант. Забытая классификация — это путь
-/// «поехали по ветке ретрая и молча потеряли события».
+/// The recoverable/fatal split lives in the type, not in a comment: `is_fatal`
+/// is implemented as an exhaustive match with no `_ =>`, so the compiler forces
+/// classification of every new variant. A forgotten classification is the path
+/// to "went down the retry branch and silently lost events".
 #[derive(Debug, Error)]
 pub enum PgcdcError {
     #[error("replication slot {slot} does not exist")]
@@ -16,27 +16,27 @@ pub enum PgcdcError {
         durable: String,
     },
 
-    /// Сервер ОТВЕТИЛ на `START_REPLICATION` и явно отказал: слот
-    /// инвалидирован (`SQLSTATE 55000`) или несёт чужой output-плагин
-    /// (`SQLSTATE 22023`) — тот же запрос с теми же параметрами получит тот
-    /// же отказ и через час. В отличие от `SlotAhead`, здесь мы даже не
-    /// знаем расхождение позиций — сервер отказал раньше, чем до этого
-    /// дошло; в отличие от `Connection`, повторная попытка не транспортная
-    /// удача, а гарантированный повтор того же отказа (review round after
+    /// The server RESPONDED to `START_REPLICATION` and explicitly refused: the slot
+    /// is invalidated (`SQLSTATE 55000`) or carries a foreign output plugin
+    /// (`SQLSTATE 22023`) — the same request with the same parameters will get the
+    /// same refusal an hour from now too. Unlike `SlotAhead`, here we don't even
+    /// know the position discrepancy — the server refused before it got that
+    /// far; unlike `Connection`, a retry is not a matter of transport
+    /// luck, but a guaranteed repeat of the same refusal (review round after
     /// task 4, C1).
     #[error("replication slot {slot} rejected START_REPLICATION: {reason}")]
     SlotUnusable { slot: String, reason: String },
 
-    /// Слот подряд отвечает гонкой "занят" (`SQLSTATE 55006`,
-    /// `ERRCODE_OBJECT_IN_USE`) дольше настроенного бюджета терпения
-    /// (`--slot-busy-budget-ms`, `SlotBusyPatience` в `replication.rs`). По
-    /// одному коду состояния «наша прошлая сессия ещё не отсоединилась» и
-    /// «кто-то другой держит слот навсегда» неразличимы — единственный
-    /// различитель физический: наш собственный walsender освобождает слот за
-    /// десятки миллисекунд (измерено), чужой потребитель — нет. Превышение
-    /// бюджета означает, что это не гонка с нами самими, и молчаливый вечный
-    /// реконнект здесь — ровно тот класс отказа, против которого написан
-    /// инвариант 3 (DECISIONS §1): процесс выглядит живым, а слот недоступен.
+    /// The slot responds with a "busy" race (`SQLSTATE 55006`,
+    /// `ERRCODE_OBJECT_IN_USE`) in a row for longer than the configured patience
+    /// budget (`--slot-busy-budget-ms`, `SlotBusyPatience` in `replication.rs`). Under
+    /// the same status code, "our prior session hasn't disconnected yet" and
+    /// "someone else is holding the slot forever" are indistinguishable — the only
+    /// discriminator is physical: our own walsender releases the slot within
+    /// tens of milliseconds (measured), a foreign consumer does not. Exceeding the
+    /// budget means this is not a race with ourselves, and a silent perpetual
+    /// reconnect here is exactly the class of failure invariant 3 was written
+    /// against (DECISIONS §1): the process looks alive, but the slot is unreachable.
     #[error(
         "replication slot {slot} stayed busy (SQLSTATE 55006) for {waited_ms}ms, exceeding the \
          configured patience budget of {budget_ms}ms — most likely held by a foreign consumer, \
@@ -80,7 +80,7 @@ pub enum PgcdcError {
 }
 
 impl PgcdcError {
-    /// Машиночитаемая метка для структурированного лога (DECISIONS Q22).
+    /// A machine-readable label for the structured log (DECISIONS Q22).
     pub fn kind(&self) -> &'static str {
         match self {
             Self::SlotMissing { .. } => "slot_missing",
@@ -132,8 +132,8 @@ mod tests {
 
     #[test]
     fn a_slot_that_the_server_refuses_to_stream_from_is_fatal() {
-        // C1: сервер, ответивший отказом на START_REPLICATION (инвалидация,
-        // чужой output-плагин), — не то же самое, что оборвавшаяся связь.
+        // C1: a server that refused START_REPLICATION (invalidation,
+        // foreign output plugin) is not the same as a dropped connection.
         let err = PgcdcError::SlotUnusable {
             slot: "s".into(),
             reason: "boom".into(),

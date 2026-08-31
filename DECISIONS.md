@@ -1,92 +1,93 @@
-# pgcdc — принятые решения по MVP
+# pgcdc — accepted decisions for the MVP
 
-Базовая спека: [input/pgcdc_mvp_task.md](input/pgcdc_mvp_task.md).
-Этот документ фиксирует решения по вопросам, которые спека оставила открытыми,
-и правит те её места, где она сама себе противоречит.
-**При расхождении главнее этот документ.**
-
----
-
-## 1. Инварианты
-
-Три правила, которые не нарушаются ни при каких обстоятельствах:
-
-1. `acked_lsn <= durable_lsn` — Postgres никогда не получает подтверждение
-   позиции, содержимое которой sink не подтвердил как записанное.
-2. **Тихая потеря недопустима, дубликаты допустимы.** Любое сомнение
-   разрешается в пользу повторной доставки.
-3. **Ничто, способное потерять события, не завершается с кодом 0.**
+Base spec: [input/pgcdc_mvp_task.md](input/pgcdc_mvp_task.md).
+This document records decisions on questions the spec left open, and
+corrects the places where it contradicts itself.
+**Where they diverge, this document takes precedence.**
 
 ---
 
-## 2. Решения
+## 1. Invariants
 
-### Рамки и зависимости
+Three rules that are not broken under any circumstances:
 
-| # | Решение |
-|---|---------|
-| Q1 | Проект учебный, с прицелом на портфолио. Оптимизируем глубину понимания и качество тестов, а не throughput. |
-| Q2 | Тонкий транспортный слой: чужой крейт даёт соединение, `START_REPLICATION`, CopyBoth и **сырые байты** (`pg_walstream::next_raw_event` или аналог). Свой wire-протокол с SCRAM/TLS не пишем. |
-| Q3 | Декодер `pgoutput` пишем сами — это ядро проекта. |
-
-Контекст: `tokio-postgres` 0.7.18 не имеет ни `copy_both_simple`, ни `replication`
-в `Config`, то есть открыть replication-соединение через неё нельзя. Канонической
-библиотеки в экосистеме нет; кандидаты — `pg_walstream`, `pgwire-replication`,
-`pg_replicate`, форк rust-postgres.
-
-### Состояние и подтверждения
-
-| # | Решение |
-|---|---------|
-| Q4 | **Локального checkpoint-файла нет.** Слот Postgres (`confirmed_flush_lsn`) — единственный источник истины. `checkpoint.rs` → `lsn.rs`: in-memory трекер четырёх позиций (received / processed / durable / acked). |
-| Q5 | **Групповой ACK**, а не fsync на каждый коммит: буферизуем, fsync по таймеру (`--ack-interval-ms`, дефолт 200) или по объёму, подтверждаем до последнего зафсинченного LSN. Задержка ACK не влияет на корректность — дубликаты разрешены. |
-| Q6 | Durability — свойство sink: `Durability::Fsync` (file) и `Durability::BestEffort` (stdout). stdout подтверждает после write+flush, при старте печатает WARN. Не подтверждать вовсе нельзя — слот встанет и забьёт диск Postgres. |
-| Q7 | **Лимит буфера транзакции** (`--max-transaction-events`, дефолт 100k) → fatal error. Не чинит цикл рестартов на гигантской транзакции, но меняет диагностику с «OOM killed» на внятное сообщение. |
-| Q26 | **Уточнение к Q18 для этапа 3: правило keepalive держится на двух условиях, не на одном.** (a) Продвигать слот из keepalive при отсутствии открытой транзакции можно только когда буфер сборщика пуст **и** processed-позиция догнала durable — пустоты буфера самой по себе достаточно только пока запись, mark-durable и ack идут одним синхронным шагом; групповой ACK по таймеру (Q5) это ломает, оставляя окно, где буфер пуст, а в sink ещё лежат неподтверждённые данные. (b) Позиция keepalive по построению всегда впереди durable-позиции, поэтому продвижение обязано сперва звать mark-durable у трекера, потом acknowledge — засчитывая диапазон durable как пустой, потому что в нём sink'у ничего не причиталось. Guard `acked_lsn <= durable_lsn` (инвариант 1) при этом не смягчается, ни на йоту. (c) В трейт `Sink` добавляется явный барьер durability отдельно от записи — `flush`, возвращающий новую durable-позицию, и вызов mark-durable переезжает к месту вызова `flush`, а не остаётся привязан к `write_transaction`. Без этого групповой ACK делает документированный смысл трейта тихо неверным. (d) Keepalive-фреймы сегодня до нашего кода не доходят вовсе: транспорт поглощает их сам, а цикл ждёт следующее событие без таймаута. Чтобы завести таймер, это ожидание придётся ограничивать по времени, и прежде чем писать цикл с таймером, обязана быть установлена cancel-safety обрыва future чтения на середине фрейма — наполовину прочитанный и отброшенный фрейм — это тихая потеря, а не безобидный ретрай. |
-
-### Процесс и инфраструктура
-
-| # | Решение |
-|---|---------|
-| Q8 | Порядок: **spike → байтовые фикстуры → TDD**. Бинарный протокол нельзя писать вслепую. Spike-код выбрасывается, фикстуры остаются. |
-| Q9 | `cargo` на macOS-хосте, Postgres в Docker. Devcontainer отвергнут: bind-mount `target/` через VM медленный, а testcontainers изнутри контейнера требует проброса docker.sock и ловушки с `host.docker.internal`. |
-| Q10 | Интеграционные тесты — **testcontainers 0.28, свежий Postgres на каждый тест**. Причина: слот репликации — глобальный объект с состоянием, на общем инстансе тесты зависят от порядка запуска. Быстрый цикл держат юнит-тесты на фикстурах, они Docker не трогают. |
-| Q11 | **`lib` + тонкий `bin`.** Логика в `lib.rs`, `main.rs` — только CLI и `run(config, sink)`. Большинство тестов гоняют движок in-process с `FailingSink`; restart-тест поднимает настоящий бинарь через `Command::new(env!("CARGO_BIN_EXE_pgcdc"))` и шлёт ему `SIGKILL`. |
-| Q12 | В `docker-compose.yml` — **только Postgres** (`-c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10`, плюс `init.sql`). pgcdc запускается через `cargo run` с хоста. Dockerfile + `--profile demo` добавляем в конце, как витрину для README. В `init.sql` слот создаётся **после** публикации; в тестах слот создаём из кода теста, чтобы контролировать стартовую позицию. |
-
-### Протокол
-
-| # | Решение |
-|---|---------|
-| Q13 | `proto_version '1'`, текстовый формат, опции `binary` / `messages` / `streaming` / `origin` выключены. v2+ со `streaming` отдаёт незакоммиченные транзакции — противоречит модели «буферим до COMMIT». `binary 'on'` заставил бы писать декодеры на каждый OID. v1 при этом даёт всё нужное: `BEGIN` несёт final LSN, commit timestamp и xid. GUC `track_commit_timestamp` не нужен. |
-| Q14 | **`REPLICA IDENTITY DEFAULT` поддерживаем честно.** Маркер старого кортежа (`K` = только ключ, `O` = полная старая строка) прокидываем в событие полем `before_kind`. Иначе потребитель не отличит «поле было null» от «поле нам не прислали». В демо-таблице ставим `FULL` и это комментируем. `NOTHING` не обрабатываем: Postgres сам роняет UPDATE/DELETE на такой публикуемой таблице. |
-| Q15 | **TOAST-маркер `'u'`** (значение не менялось и лежит вне строки) → колонка **опускается из `after`** и **обязательно называется в отдельном поле `unchanged_columns: ["bio"]`**. Отвергнут был другой вариант — *молчаливое* опускание **без** списка: опущенная без списка колонка неотличима от удалённой при эволюции схемы, и потребитель затрёт значение на null. Значение-заглушку внутри `after` (в том числе `null`) не пишем тоже: это подмешивание метаданных в данные и тот же самый промах с затиранием. Различимость «не прислано» vs «равно null» держит именно список, а не содержимое `after`. Не падаем: это штатное сообщение протокола. Появляется только для значений >~2 КБ после сжатия; демо-таблица `users` (`bio TEXT`, `STORAGE EXTERNAL`) специально сконструирована, чтобы его спровоцировать, и маркер в ней воспроизведён и заморожен в фикстуре (`tests/fixtures/0025_update.bin`). **Исключение: на INSERT маркер фатален.** Значение пишется в той же транзакции, что и сама строка, и reorder buffer резолвит его до того, как декодер увидит `'u'`; появление маркера здесь означает не штатное поведение протокола, а то, что предположение выше нарушено, и молчать нельзя (`src/transaction.rs`, ветка `Insert`). |
-| Q16 | **Все значения — строки**, `null` — настоящий JSON `null`. `pgoutput` в текстовом режиме и так отдаёт строки; любой маппинг — наш собственный парсинг и наш источник багов. `int8` не помещается в JSON-число без потерь (`2^53` ломает JS-потребителей молча). `type_oid` из `RELATION` кладём в логи/метаданные, но **не** в каждое событие. |
-| Q17 | **LSN события — `wal_start` из обёртки `XLogData`** (в v1 у row-сообщений своего LSN нет). **Подтверждаем `end_lsn` из `COMMIT`**, а не commit LSN: иначе при рестарте перечитается та же транзакция. Следствие для архитектуры: транспорт обязан отдавать декодеру payload вместе с LSN обёртки. |
-| Q18 | **Keepalive двигает слот, если буфер пуст.** Если открытых транзакций нет, подтверждаем до `wal_end` из keepalive. Без этого при активной записи в таблицы вне публикации `confirmed_flush_lsn` стоит на месте, WAL растёт, диск кончается — классическая проблема, известная в том числе по Debezium. При непустом буфере не подтверждаем никогда. Один юнит-тест на это условие обязателен. |
-| Q19 | **Реконнект: `START_REPLICATION` с `0/0`** (сервер возьмёт `confirmed_flush_lsn` слота — он и так единственный источник истины). **Relation cache сбрасываем полностью**: он живёт в рамках сессии, Postgres перешлёт `RELATION` перед первым row-событием каждой таблицы; иначе при смене схемы во время разрыва декодируем по устаревшему описанию — тихая порча данных. Недособранную транзакцию выбрасываем, придёт заново. Бэкофф экспоненциальный 0.1 с → 30 с, без лимита по времени. Отсутствующий слот — fatal сразу, без ретраев; это верно только когда реализован guard из Q25 — сам по себе транспорт на отсутствующий слот не падает, а тихо пересоздаёт его (см. Q25). |
-| Q25 | **Транспортные обязательства спайка, обязательные для этапа 1** (полное обоснование и измерения — `docs/spike-findings.md` §3). (1) **Pre-flight guard перед стартом репликации, два режима.** Холодный старт: guard — только проверка существования слота (`SELECT 1 FROM pg_replication_slots WHERE slot_name = $1`); если слота нет — fatal немедленно, без ретраев, слот не создаём. Реконнект внутри уже работающего процесса: полная сверка — `confirmed_flush_lsn` слота против нашей in-memory durable-позиции (трекер четырёх позиций, Q4); при расхождении реагируем **асимметрично**: слот **впереди** нашей durable-позиции — fatal (кто-то подтвердил WAL, который мы не довели до sink); слот **позади** — WARN, а не fatal, потому что это ожидаемый исход обрыва: последний `send_feedback()` мог не дойти до сервера, а `START_REPLICATION` с `0/0` (Q19) честно перечитает промежуток дубликатами — ровно то, что разрешает инвариант 2. В обоих случаях обе позиции попадают в сообщение. На каждом старте, независимо от режима, логируем `restart_lsn` и `confirmed_flush_lsn` слота на INFO. Персистентный файл-трипвайр как замена этому guard'у отвергнут — он возвращает второй источник истины, которого Q4 и §5 п. 7 этого документа специально избегают. (2) **Запрещены пять API `pg_walstream`, ведущих в `recover_connection`**: `next_event_with_retry`, `check_connection_health`, `into_stream`, `stream`, `for_each_event` — все они рестартуют поток с `state.last_received_lsn` (принятая, а не durable позиция), что на нормальном пути работы пропускает WAL между durable-точкой и принятой без единой ошибки. Разрешён только `next_raw_event`. (3) **После каждой durable-записи обязателен явный `stream.send_feedback()`.** Без него подтверждение уходит только по внутреннему расписанию крейта — задержка 18–22 с, до `wal_sender_timeout / 2` на простаивающем потоке. |
-| Q27 | **Уточнение к Q19 для этапа 5: бэкофф реконнекта остаётся без лимита по времени, но для одного класса восстановимых отказов появился отдельный, отдельно бюджетируемый лимит.** Q19 фиксирует, что попытки переподключения после обрыва связи продолжаются бесконечно — это по-прежнему верно для транспортных отказов и для гонки "слот ещё занят нашей же прошлой сессией" (`SQLSTATE 55006`) в пределах бюджета. Но именно эту гонку код состояния не отличает от "слот занят чужим потребителем навсегда" (Q25(1) — тот же `SQLSTATE`, единственный различитель физический — длительность). Бесконечный ретрай здесь маскировал бы вечно недоступный слот под работающий процесс — прямое нарушение инварианта 3. Поэтому этап 5 добавил `SlotBusyPatience`: суммарное время подряд идущих наблюдений именно этой гонки ограничено бюджетом (`--slot-busy-budget-ms` / `PGCDC_SLOT_BUSY_BUDGET_MS`, умолчание 30000мс — измерения и обоснование см. в докстринге `SlotBusyPatience`, `src/postgres/replication.rs`); по истечении бюджета отказ эскалируется в фатальный `PgcdcError::SlotBusyTimedOut`. Механизм накопления счётчика уточнён Q29 ниже; сам бэкофф (`ReconnectBackoff`) по-прежнему растёт и падает без потолка по времени, ровно как решено в Q19. |
-| Q29 | **Уточнение к Q27, ревью раунд 2 после финала этапа 4: счётчик терпения копит время вычитанием простоя, а не полным сбросом.** Первая реализация (текст Q27 выше) сбрасывала счётчик целиком на ЛЮБОМ наблюдении другой природы, не только на успешном старте сессии. Это чинило одну дыру (несвязанные во времени эпизоды гонки суммировались в один фатальный выход) и открывало ровно противоположную: слот, занятый чужим потребителем НАВСЕГДА, на сервере, который вдобавок изредка роняет соединение по не связанной причине, никогда не копил бы времени больше интервала между двумя такими отказами — эскалации не происходило вовсе, сколько бы процесс ни работал. Воспроизведено юнит-тестом (`slot_busy_patience_escalates_despite_a_periodic_unrelated_failure`, `src/postgres/replication.rs`): бюджет по умолчанию (30000мс), слот занят на каждой попытке кроме постороннего отказа раз в 29 секунд — под полным сбросом эскалации нет ни разу за смоделированный час. Формально инварианты целы (процесс не выходит вовсе, данные не теряются), но нарушалась ровно гарантия, ради которой Q27 существует: вечный ретрай маскирует вечно недоступный слот под работающий процесс. Исправление: отказ другой природы не закрывает эпизод, а лишь ПРЕРЫВАЕТ цепочку подряд идущих наблюдений гонки (`SlotBusyPatience::interrupt`) — накопленное время сохраняется, но интервал между последним наблюдением гонки и следующим не засчитывается в него целиком (мы не знаем, что происходило внутри этого интервала до самого отказа, — он мог быть таким же простоем от начала и до конца). Условие эскалации из-за этого строже, чем «слот занят дольше бюджета»: нужна НЕПРЕРВАННАЯ цепочка наблюдений гонки, покрывающая бюджет. При редких посторонних сбоях она набирается, и вечно занятый слот эскалирует; при отказе на каждой второй попытке (при бэкоффе на потолке 30с и бюджете 30с — на каждой второй и чаще) накопленное не растёт вовсе, и эскалации не будет никогда. Это осознанная граница, а не недосмотр: интервал, внутри которого мы наблюдали отказ другой природы, честнее не засчитывать в занятость, чем засчитывать, — цена в том, что достаточно частый посторонний сбой маскирует вечную занятость так же, как её маскировал бесконечный ретрай до Q27. Прежний код (полный сброс) не эскалировал вообще ни при каком чередовании, так что это строгое улучшение, а не размен. Полностью счётчик закрывает по-прежнему только успешный старт сессии (`SlotBusyPatience::reset`, `classify_start_outcome`, ветка `Ok`) — единственное наблюдение, которое физически доказывает, что слот прямо сейчас свободен, а не просто что подряд не было ответа гонкой. |
-
-### Контракт вывода и обвязка
-
-| # | Решение |
-|---|---------|
-| Q20 | **JSONL, одно изменение = одна строка.** `Sink::write_transaction(&Transaction)` остаётся: sink получает транзакцию целиком и сериализует её в N строк. Durability-барьер (`Sink::flush`) — **один на группу транзакций** между тиками таймера, а не flush/fsync на каждую отдельную транзакцию: групповой ACK (Q5) и вынесенный из `write_transaction` барьер (Q26c) сделали бы одно-на-транзакцию неверным. Атомарность записи ≠ атомарность формата. Конверт-на-транзакцию отвергнут: гигантская транзакция = гигантская строка, теряется потоковая обработка. |
-| Q21 | CLI на `clap` derive с `env = "PGCDC_*"`, конфиг-файла нет. Флаги: `--database-url`, `--publication`, `--slot`, `--output stdout\|file`, `--output-path`, `--max-transaction-events`, `--ack-interval-ms`. **Пароль защищаем типом**: newtype над URL с ручными `Debug`/`Display`, вырезающими пароль, плюс тест «`format!("{:?}")` не содержит пароль». |
-| Q28 | **Уточнение к Q21: список флагов устарел — этапы 4–5 добавили ещё три.** Актуальный список — десять флагов: семь из исходного Q21 (`--database-url`, `--publication`, `--slot`, `--output`, `--output-path`, `--max-transaction-events`, `--ack-interval-ms`) плюс `--reconnect-initial-ms` и `--reconnect-max-ms` (этап 4, экспоненциальный бэкофф реконнекта, Q19) и `--slot-busy-budget-ms` (этап 5, бюджет терпения к занятому слоту, Q27). Источник истины — `src/config.rs` и `--help`, а не этот список; он документирует историю решения, а не заменяет собой чтение кода. |
-| Q22 | Exit-код 1 на любую фатальную ошибку + машиночитаемое поле `error_kind` в ERROR-логе. Семантические коды вырождаются в мусор. **Разделение recoverable/fatal живёт в типах**: `enum PgcdcError` (`thiserror`) с `fn is_fatal(&self) -> bool` через исчерпывающий `match` без `_ =>`, чтобы компилятор заставлял классифицировать каждый новый вариант. Код 0 — только штатное завершение по SIGTERM/SIGINT с додавливанием текущей транзакции. |
-| Q23 | Метрики — **свой `struct Metrics` на `AtomicU64`**, без `metrics-rs`. Фасад отправляет значения в никуда без экспортера, а нам они нужны в тестах: «после sink-failure `last_acknowledged_lsn` не сдвинулся» — это ассерт по метрике. Логи: `tracing`; per-transaction на `DEBUG`, на `INFO` — агрегированная строка раз в 10 с. Payload по умолчанию не логируем. |
-| Q24 | **Один крейт**, `src/lib.rs` + `src/main.rs`. Workspace оправдан при втором потребителе библиотеки, его нет. Дерево из §6 спеки сохраняем, плюс: `checkpoint.rs` → `lsn.rs`, `Durability` в `sink/mod.rs`, `tests/fixtures/` с байтовыми дампами, `tests/common/` с `FailingSink`. |
+1. `acked_lsn <= durable_lsn` — Postgres never receives an acknowledgement
+   of a position whose contents the sink has not confirmed as written.
+2. **Silent loss is unacceptable, duplicates are acceptable.** Any doubt
+   is resolved in favor of redelivery.
+3. **Nothing capable of losing events exits with code 0.**
 
 ---
 
-## 3. Контракт выходного JSON
+## 2. Decisions
 
-Одно изменение — одна строка. Поля `before_kind` и `unchanged_columns`
-присутствуют **всегда**, со значениями `null` и `[]` там, где неприменимо:
-стабильная форма важнее компактности.
+### Scope and dependencies
+
+| # | Decision |
+|---|---------|
+| Q1 | This is a learning project aimed at a portfolio. We optimize for depth of understanding and test quality, not throughput. |
+| Q2 | Thin transport layer: a third-party crate provides the connection, `START_REPLICATION`, CopyBoth, and **raw bytes** (`pg_walstream::next_raw_event` or equivalent). We do not write our own wire protocol with SCRAM/TLS. |
+| Q3 | We write the `pgoutput` decoder ourselves — that's the core of the project. |
+
+Context: `tokio-postgres` 0.7.18 has neither `copy_both_simple` nor
+`replication` in `Config`, meaning a replication connection can't be
+opened through it. There is no canonical library in the ecosystem;
+candidates are `pg_walstream`, `pgwire-replication`, `pg_replicate`, a
+fork of rust-postgres.
+
+### State and acknowledgements
+
+| # | Decision |
+|---|---------|
+| Q4 | **No local checkpoint file.** The Postgres slot (`confirmed_flush_lsn`) is the sole source of truth. `checkpoint.rs` → `lsn.rs`: an in-memory tracker of four positions (received / processed / durable / acked). |
+| Q5 | **Group ACK**, not fsync on every commit: buffer, fsync on a timer (`--ack-interval-ms`, default 200) or by volume, acknowledge up to the last fsynced LSN. ACK latency doesn't affect correctness — duplicates are allowed. |
+| Q6 | Durability is a property of the sink: `Durability::Fsync` (file) and `Durability::BestEffort` (stdout). stdout acknowledges after write+flush, and prints a WARN at startup. Not acknowledging at all isn't an option — the slot would stall and fill up Postgres's disk. |
+| Q7 | **Transaction buffer limit** (`--max-transaction-events`, default 100k) → fatal error. Doesn't fix a restart loop on a gigantic transaction, but turns the diagnostic from "OOM killed" into a clear message. |
+| Q26 | **Refinement to Q18 for stage 3: the keepalive rule rests on two conditions, not one.** (a) Advancing the slot from keepalive when there is no open transaction is only allowed when the assembler's buffer is empty **and** the processed position has caught up to durable — buffer emptiness alone is sufficient only as long as write, mark-durable, and ack happen as one synchronous step; the timer-based group ACK (Q5) breaks that, leaving a window where the buffer is empty but the sink still holds unacknowledged data. (b) The keepalive position is, by construction, always ahead of the durable position, so advancing must first call mark-durable on the tracker, then acknowledge — counting the durable range as empty, because the sink owed nothing within it. The guard `acked_lsn <= durable_lsn` (invariant 1) is not relaxed by this, not by one iota. (c) The `Sink` trait gains an explicit durability barrier separate from writing — `flush`, which returns the new durable position, and the mark-durable call moves to where `flush` is called, instead of staying tied to `write_transaction`. Without this, group ACK would silently make the trait's documented meaning wrong. (d) Keepalive frames today never reach our code at all: the transport swallows them itself, and the loop waits for the next event with no timeout. To drive a timer, this wait will have to be time-bounded, and before writing a loop with a timer, cancel-safety for a read future aborted mid-frame must be established — a half-read, discarded frame is silent loss, not a harmless retry. |
+
+### Process and infrastructure
+
+| # | Decision |
+|---|---------|
+| Q8 | Order: **spike → byte fixtures → TDD**. A binary protocol can't be written blind. Spike code is thrown away, fixtures stay. |
+| Q9 | `cargo` on the macOS host, Postgres in Docker. Devcontainer was rejected: bind-mounting `target/` through a VM is slow, and testcontainers from inside a container needs docker.sock forwarding and the `host.docker.internal` trap. |
+| Q10 | Integration tests — **testcontainers 0.28, a fresh Postgres per test**. Reason: a replication slot is a global, stateful object; on a shared instance, tests would depend on run order. The fast cycle is kept by unit tests on fixtures, which don't touch Docker. |
+| Q11 | **`lib` + a thin `bin`.** Logic lives in `lib.rs`; `main.rs` is only the CLI and `run(config, sink)`. Most tests drive the engine in-process with `FailingSink`; the restart test launches the real binary via `Command::new(env!("CARGO_BIN_EXE_pgcdc"))` and sends it `SIGKILL`. |
+| Q12 | `docker-compose.yml` contains **only Postgres** (`-c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10`, plus `init.sql`). pgcdc runs via `cargo run` from the host. Dockerfile + `--profile demo` are added at the end, as a showcase for the README. In `init.sql` the slot is created **after** the publication; in tests we create the slot from the test code, to control the starting position. |
+
+### Protocol
+
+| # | Decision |
+|---|---------|
+| Q13 | `proto_version '1'`, text format, `binary` / `messages` / `streaming` / `origin` options off. v2+ with `streaming` delivers uncommitted transactions — contradicts the "buffer until COMMIT" model. `binary 'on'` would force writing a decoder per OID. v1 gives everything needed as-is: `BEGIN` carries the final LSN, commit timestamp, and xid. The `track_commit_timestamp` GUC isn't needed. |
+| Q14 | **We support `REPLICA IDENTITY DEFAULT` honestly.** The old-tuple marker (`K` = key only, `O` = full old row) is threaded into the event as the `before_kind` field. Otherwise the consumer can't tell "the field was null" from "the field wasn't sent to us at all". The demo table is set to `FULL`, and this is commented. `NOTHING` is not handled: Postgres itself rejects UPDATE/DELETE on a published table set that way. |
+| Q15 | **TOAST marker `'u'`** (the value didn't change and lives out of line) → the column **is omitted from `after`** and **must be named in the separate field `unchanged_columns: ["bio"]`**. A different option was rejected — *silently* omitting it **without** the list: a column omitted without a list is indistinguishable from a dropped one under schema evolution, and the consumer would overwrite the value with null. We also don't write a placeholder value inside `after` (including `null`): that's mixing metadata into data, and the same overwrite mistake. What preserves the distinction between "not sent" and "equals null" is the list itself, not the contents of `after`. We don't fail: this is a normal protocol message. It appears only for values >~2 KB after compression; the demo table `users` (`bio TEXT`, `STORAGE EXTERNAL`) is specifically built to trigger it, and the marker is reproduced and frozen in a fixture (`tests/fixtures/0025_update.bin`). **Exception: on INSERT the marker is fatal.** The value is written in the same transaction as the row itself, and the reorder buffer resolves it before the decoder ever sees `'u'`; the marker appearing here means not normal protocol behavior but that the assumption above has been violated, and staying silent is not an option (`src/transaction.rs`, the `Insert` branch). |
+| Q16 | **All values are strings**, `null` is a real JSON `null`. `pgoutput` in text mode already hands back strings; any mapping is our own parsing and our own source of bugs. `int8` doesn't fit into a JSON number without loss (`2^53` silently breaks JS consumers). `type_oid` from `RELATION` goes into logs/metadata, but **not** into every event. |
+| Q17 | **The event's LSN is `wal_start` from the `XLogData` wrapper** (in v1, row messages carry no LSN of their own). **We acknowledge `end_lsn` from `COMMIT`**, not the commit LSN: otherwise the same transaction would be replayed on restart. Architectural consequence: the transport must hand the payload to the decoder together with the wrapper's LSN. |
+| Q18 | **Keepalive advances the slot when the buffer is empty.** If there are no open transactions, we acknowledge up to `wal_end` from keepalive. Without this, with active writes to tables outside the publication, `confirmed_flush_lsn` stands still, the WAL grows, and disk runs out — a classic problem, known among other places from Debezium. With a non-empty buffer we never acknowledge. One unit test for this condition is mandatory. |
+| Q19 | **Reconnect: `START_REPLICATION` with `0/0`** (the server will use the slot's `confirmed_flush_lsn` — it's the sole source of truth anyway). **The relation cache is fully dropped**: it lives within the session, and Postgres resends `RELATION` before the first row event for each table; otherwise, if the schema changed during the drop, we'd decode against a stale description — silent data corruption. An incompletely assembled transaction is discarded; it will arrive again. Backoff is exponential, 0.1s → 30s, with no time limit. A missing slot is fatal immediately, with no retries; this is only true once the guard from Q25 is implemented — the transport by itself doesn't fail on a missing slot, it silently recreates it (see Q25). |
+| Q25 | **Spike-mandated transport obligations, required for stage 1** (full rationale and measurements — `docs/spike-findings.md` §3). (1) **Pre-flight guard before starting replication, two modes.** Cold start: the guard is just a slot-existence check (`SELECT 1 FROM pg_replication_slots WHERE slot_name = $1`); if the slot doesn't exist — fatal immediately, no retries, we don't create the slot. Reconnect within an already-running process: a full comparison — the slot's `confirmed_flush_lsn` against our in-memory durable position (the four-position tracker, Q4); on a mismatch we react **asymmetrically**: the slot **ahead** of our durable position — fatal (someone acknowledged WAL that we never got through to the sink); the slot **behind** — WARN, not fatal, because that's the expected outcome of a drop: the last `send_feedback()` may not have reached the server, and `START_REPLICATION` with `0/0` (Q19) will honestly replay the gap with duplicates — exactly what invariant 2 allows. In both cases, both positions go into the message. On every start, regardless of mode, we log the slot's `restart_lsn` and `confirmed_flush_lsn` at INFO. A persistent tripwire file as a substitute for this guard was rejected — it brings back a second source of truth, which Q4 and §5 item 7 of this document specifically avoid. (2) **Five `pg_walstream` APIs that lead into `recover_connection` are forbidden**: `next_event_with_retry`, `check_connection_health`, `into_stream`, `stream`, `for_each_event` — all of them restart the stream from `state.last_received_lsn` (the received, not the durable position), which on the normal path silently skips WAL between the durable point and the received one, with no error at all. Only `next_raw_event` is allowed. (3) **An explicit `stream.send_feedback()` is mandatory after every durable write.** Without it, the acknowledgement only goes out on the crate's internal schedule — a delay of 18–22s, up to `wal_sender_timeout / 2` on an idle stream. |
+| Q27 | **Refinement to Q19 for stage 5: reconnect backoff remains unbounded in time, but one class of recoverable failure now has a separate, separately budgeted limit.** Q19 states that reconnection attempts after a connection drop continue indefinitely — that's still true for transport failures and for the "slot still busy with our own past session" race (`SQLSTATE 55006`) within the budget. But the status code itself doesn't distinguish that exact race from "slot busy with someone else's consumer forever" (Q25(1) — same `SQLSTATE`, the only differentiator is physical: duration). Infinite retry here would mask a forever-unavailable slot as a working process — a direct violation of invariant 3. So stage 5 added `SlotBusyPatience`: the total elapsed time of consecutive observations of exactly this race is bounded by a budget (`--slot-busy-budget-ms` / `PGCDC_SLOT_BUSY_BUDGET_MS`, default 30000ms — see the measurements and rationale in the `SlotBusyPatience` doc comment, `src/postgres/replication.rs`); once the budget is exhausted, the failure escalates into a fatal `PgcdcError::SlotBusyTimedOut`. The counter's accumulation mechanism is refined by Q29 below; the backoff itself (`ReconnectBackoff`) still grows and falls with no time ceiling, exactly as decided in Q19. |
+| Q29 | **Refinement to Q27, review round 2 after the stage-4 finale: the patience counter accumulates time by subtracting idle gaps, not by a full reset.** The first implementation (the Q27 text above) reset the counter entirely on ANY observation of a different nature, not just on a successful session start. This fixed one hole (race episodes unrelated in time summed into a single fatal exit) and opened exactly the opposite one: a slot held FOREVER by someone else's consumer, on a server that also occasionally drops the connection for an unrelated reason, would never accumulate more time than the interval between two such failures — escalation would never happen at all, no matter how long the process ran. Reproduced by a unit test (`slot_busy_patience_escalates_despite_a_periodic_unrelated_failure`, `src/postgres/replication.rs`): default budget (30000ms), the slot busy on every attempt except for an unrelated failure once every 29 seconds — under a full reset, escalation never happens even once over a simulated hour. Formally the invariants hold (the process doesn't exit at all, no data is lost), but exactly the guarantee Q27 exists for was broken: infinite retry masks a forever-unavailable slot as a working process. The fix: a failure of a different nature doesn't close the episode, it only INTERRUPTS the chain of consecutive race observations (`SlotBusyPatience::interrupt`) — accumulated time is preserved, but the interval between the last race observation and the next one isn't counted into it in full (we don't know what happened inside that interval up to the failure itself — it could have been the same busy condition from start to end). The escalation condition is therefore stricter than "the slot has been busy longer than the budget": it needs an UNBROKEN chain of race observations spanning the budget. With rare unrelated failures it adds up, and a forever-busy slot escalates; with a failure on every other attempt (with backoff capped at 30s and a 30s budget — on every other attempt or more often) the accumulated time never grows, and escalation never happens. This is a deliberate boundary, not an oversight: it's more honest not to count an interval in which we observed a failure of a different nature toward busy time than to count it — the cost being that a sufficiently frequent unrelated failure masks permanent busyness the same way infinite retry masked it before Q27. The previous code (full reset) never escalated under any interleaving at all, so this is a strict improvement, not a trade-off. The counter is still fully closed only by a successful session start (`SlotBusyPatience::reset`, `classify_start_outcome`, the `Ok` branch) — the one observation that physically proves the slot is free right now, rather than merely that there was no race response for a while. |
+
+### Output contract and glue
+
+| # | Decision |
+|---|---------|
+| Q20 | **JSONL, one change = one line.** `Sink::write_transaction(&Transaction)` stays: the sink receives the whole transaction and serializes it into N lines. The durability barrier (`Sink::flush`) is **one per group of transactions** between timer ticks, not a flush/fsync per individual transaction: group ACK (Q5) and the barrier moved out of `write_transaction` (Q26c) would make one-per-transaction wrong. Write atomicity ≠ format atomicity. An envelope-per-transaction was rejected: a gigantic transaction would mean a gigantic line, losing streaming processing. |
+| Q21 | CLI on `clap` derive with `env = "PGCDC_*"`, no config file. Flags: `--database-url`, `--publication`, `--slot`, `--output stdout\|file`, `--output-path`, `--max-transaction-events`, `--ack-interval-ms`. **The password is protected by the type system**: a newtype over the URL with manual `Debug`/`Display` that strip the password, plus a test that "`format!("{:?}")` doesn't contain the password". |
+| Q28 | **Refinement to Q21: the flag list is stale — stages 4–5 added three more.** The current list is ten flags: the seven from the original Q21 (`--database-url`, `--publication`, `--slot`, `--output`, `--output-path`, `--max-transaction-events`, `--ack-interval-ms`) plus `--reconnect-initial-ms` and `--reconnect-max-ms` (stage 4, exponential reconnect backoff, Q19) and `--slot-busy-budget-ms` (stage 5, patience budget for a busy slot, Q27). The source of truth is `src/config.rs` and `--help`, not this list; it documents the history of the decision, it doesn't substitute for reading the code. |
+| Q22 | Exit code 1 for any fatal error + a machine-readable `error_kind` field in the ERROR log. Semantic codes degenerate into noise. **The recoverable/fatal split lives in the types**: `enum PgcdcError` (`thiserror`) with `fn is_fatal(&self) -> bool` via an exhaustive `match` with no `_ =>`, so the compiler forces every new variant to be classified. Code 0 is only for a clean shutdown on SIGTERM/SIGINT, with the current transaction pushed through first. |
+| Q23 | Metrics — **our own `struct Metrics` on `AtomicU64`**, no `metrics-rs`. A facade sends values into the void without an exporter, and we need them in tests: "after a sink failure, `last_acknowledged_lsn` didn't move" is an assertion on a metric. Logs: `tracing`; per-transaction at `DEBUG`, an aggregated line at `INFO` once every 10s. Payload is not logged by default. |
+| Q24 | **A single crate**, `src/lib.rs` + `src/main.rs`. A workspace is justified once there's a second consumer of the library; there isn't one. We keep the tree from spec §6, plus: `checkpoint.rs` → `lsn.rs`, `Durability` in `sink/mod.rs`, `tests/fixtures/` with byte dumps, `tests/common/` with `FailingSink`. |
+
+---
+
+## 3. Output JSON contract
+
+One change — one line. The fields `before_kind` and `unchanged_columns`
+are **always** present, with values `null` and `[]` where not applicable:
+a stable shape matters more than compactness.
 
 ```json
 {
@@ -104,84 +105,88 @@
 }
 ```
 
-Отличия от §10 спеки:
+Differences from spec §10:
 
-- `before_kind`: `"key"` | `"full"` | `null` — что именно прислал сервер в
-  старом кортеже (следствие `REPLICA IDENTITY`).
-- `unchanged_columns`: колонки, пришедшие с TOAST-маркером `'u'`. Их значение
-  в `after` отсутствует и **не должно** трактоваться как null. Это правило —
-  только про `after`: когда `before_kind = "full"`, `before` несёт полное
-  значение той же колонки, потому что при `REPLICA IDENTITY FULL` сервер
-  прислал старый кортеж целиком, включая TOAST (подтверждено байтами
-  `tests/fixtures/0025_update.bin`, разобрано в `docs/pgoutput-notes.md`
-  §10/§12 случай 4). Опускать её из `before` было бы правкой, ничем не
-  подтверждённой.
-- `commit_lsn`: единственный практичный ключ дедупликации на стороне
-  потребителя. По `xid` дедуплицировать нельзя — они переиспользуются после
-  wraparound.
-
----
-
-## 4. Этапы
-
-Вертикальным срезом, а не снизу вверх: иначе две недели пишется декодер без
-подтверждения, что подключение к слоту вообще корректно.
-
-**Этап 0 — Spike.**
-Соединение, `START_REPLICATION`, дамп сырых payload'ов в hex, ручной разбор по
-[докам протокола](https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html).
-*Готово, когда:* в терминале видны байты после `INSERT` в psql и заморожены как
-фикстуры. Код выбрасывается.
-Артефакты, обязательные для планирования этапа 1 (см. Q25): `docs/spike-findings.md`
-(транспортный вердикт и обязательные обходные пути), `docs/pgoutput-notes.md`
-(побайтовая спецификация формата сообщений pgoutput) и `tests/fixtures/` (31 бинарная
-фикстура плюс `MANIFEST.md`).
-
-**Этап 1 — Сквозной срез.**
-`RELATION` + `BEGIN` + `INSERT` + `COMMIT` → JSON на stdout → ACK на коммите.
-Compose с Postgres.
-*Готово, когда:* сценарий §19 спеки работает для INSERT.
-
-**Этап 2 — Полный декодер.**
-`UPDATE`, `DELETE`, `before_kind`, TOAST `'u'`, замена записи в relation cache.
-*Готово, когда:* юнит-тесты на фикстурах зелёные, Docker для них не нужен.
-
-**Этап 3 — Корректность подтверждений.**
-Разделение received / processed / durable / acked, file-sink с fsync, групповой
-ACK, продвижение по keepalive.
-*Готово, когда:* проходят тесты «sink упал → acked не сдвинулся» и «буфер непуст
-→ keepalive не двигает acked».
-
-**Этап 4 — Устойчивость.**
-Реконнект со сбросом кэша и буфера, таксономия fatal/recoverable, exit-коды,
-лимит буфера транзакции.
-*Готово, когда:* проходят restart-тест и тест на отсутствующий слот.
-
-**Этап 5 — Обвязка.**
-Логи, метрики, README, Dockerfile для демо-профиля.
-*Готово, когда:* чек-лист §20 спеки закрыт целиком.
+- `before_kind`: `"key"` | `"full"` | `null` — exactly what the server sent
+  in the old tuple (a consequence of `REPLICA IDENTITY`).
+- `unchanged_columns`: columns that arrived with the TOAST marker `'u'`.
+  Their value is absent from `after` and **must not** be treated as null.
+  This rule is only about `after`: when `before_kind = "full"`, `before`
+  carries the full value of the same column, because under
+  `REPLICA IDENTITY FULL` the server sent the old tuple in full, TOAST
+  included (confirmed by the bytes of `tests/fixtures/0025_update.bin`,
+  worked out in `docs/pgoutput-notes.md` §10/§12 case 4). Omitting it from
+  `before` too would be an unsupported change.
+- `commit_lsn`: the only practical deduplication key on the consumer side.
+  Deduplicating by `xid` doesn't work — xids are reused after wraparound.
 
 ---
 
-## 5. Правки к базовой спеке
+## 4. Stages
 
-Места, где спека ошибается или недоговаривает:
+A vertical slice, not bottom-up: otherwise the decoder gets written for two
+weeks with no confirmation that connecting to the slot even works
+correctly.
 
-1. **§7, «использовать существующую библиотеку»** — допущение шаткое:
-   канонической библиотеки нет, `tokio-postgres` не подходит вовсе. Решено
-   в Q2/Q3.
-2. **§11 + §12, fsync на каждый коммит** — потолок около сотни транзакций
-   в секунду. Задержка ACK на корректность не влияет; исправлено в Q5.
-3. **§12, stdout как полноценный sink** — труба не даёт durability
-   в принципе. Исправлено в Q6.
-4. **§16, `INFO transaction_committed` на каждую транзакцию** — тысяча строк
-   лога в секунду. Исправлено в Q23.
-5. **§18, тест на ROLLBACK** — оставляем, но переименовываем. Он не проверяет
-   наш код: logical decoding физически не отдаёт откаченные транзакции.
-   Он проверяет наше понимание протокола, и это тоже ценно — но называть его
-   надо «Postgres не присылает откаты», а не «мы не эмитим откаты».
-6. **§22, TOAST в Phase 2** — маркер `'u'` приходит по протоколу и в MVP,
-   игнорировать его нельзя. Перенесено в этап 2 (Q15). В Phase 2 остаётся
-   *дочитывание* TOAST-значений, чего мы не делаем.
-7. **`checkpoint.rs`** — персистентный чекпоинт создаёт второй источник истины
-   и класс багов «файл разошёлся со слотом». Убран в Q4.
+**Stage 0 — Spike.**
+Connection, `START_REPLICATION`, dump raw payloads as hex, manual parsing
+against the
+[protocol docs](https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html).
+*Done when:* bytes after an `INSERT` in psql are visible in the terminal
+and frozen as fixtures. The code is thrown away.
+Artifacts required for planning stage 1 (see Q25): `docs/spike-findings.md`
+(the transport verdict and required workarounds), `docs/pgoutput-notes.md`
+(a byte-level spec of the pgoutput message format), and `tests/fixtures/`
+(31 binary fixtures plus `MANIFEST.md`).
+
+**Stage 1 — End-to-end slice.**
+`RELATION` + `BEGIN` + `INSERT` + `COMMIT` → JSON on stdout → ACK on
+commit. Compose with Postgres.
+*Done when:* the scenario from spec §19 works for INSERT.
+
+**Stage 2 — Full decoder.**
+`UPDATE`, `DELETE`, `before_kind`, TOAST `'u'`, replacing entries in the
+relation cache.
+*Done when:* unit tests on fixtures are green, no Docker needed for them.
+
+**Stage 3 — Acknowledgement correctness.**
+Splitting received / processed / durable / acked, a file sink with fsync,
+group ACK, keepalive advancement.
+*Done when:* the tests "sink fails → acked doesn't move" and "buffer
+non-empty → keepalive doesn't move acked" pass.
+
+**Stage 4 — Resilience.**
+Reconnect with cache and buffer reset, fatal/recoverable taxonomy, exit
+codes, transaction buffer limit.
+*Done when:* the restart test and the missing-slot test pass.
+
+**Stage 5 — Wrap-up.**
+Logs, metrics, README, Dockerfile for the demo profile.
+*Done when:* the checklist in spec §20 is fully closed.
+
+---
+
+## 5. Corrections to the base spec
+
+Places where the spec is wrong or leaves things unsaid:
+
+1. **§7, "use an existing library"** — a shaky assumption: there's no
+   canonical library, and `tokio-postgres` doesn't fit at all. Resolved in
+   Q2/Q3.
+2. **§11 + §12, fsync on every commit** — a ceiling of around a hundred
+   transactions per second. ACK latency doesn't affect correctness; fixed
+   in Q5.
+3. **§12, stdout as a full-fledged sink** — a pipe can't provide
+   durability, period. Fixed in Q6.
+4. **§16, `INFO transaction_committed` for every transaction** — a
+   thousand log lines a second. Fixed in Q23.
+5. **§18, the ROLLBACK test** — we keep it, but rename it. It doesn't test
+   our code: logical decoding physically never delivers rolled-back
+   transactions. It tests our understanding of the protocol, and that's
+   valuable too — but it should be called "Postgres doesn't send rollbacks",
+   not "we don't emit rollbacks".
+6. **§22, TOAST in Phase 2** — the `'u'` marker arrives over the protocol
+   even in the MVP, and it can't be ignored. Moved to stage 2 (Q15). What
+   stays in Phase 2 is *fetching* TOAST values, which we don't do.
+7. **`checkpoint.rs`** — a persistent checkpoint creates a second source of
+   truth and a class of "file drifted from the slot" bugs. Removed in Q4.

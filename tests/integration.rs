@@ -9,9 +9,10 @@ use pgcdc::sink::{Durability, Sink};
 use pgcdc::transaction::Transaction;
 use tokio::sync::mpsc;
 
-/// Копит транзакции в канал, чтобы тест мог их дождаться. Наибольшая
-/// принятая позиция с прошлого барьера хранится отдельно: возврат
-/// `write_transaction` не означает durable (это и есть смысл Task 2).
+/// Accumulates transactions into a channel so the test can wait for them.
+/// The highest received position since the last barrier is stored
+/// separately: a `write_transaction` return does not mean durable (that is
+/// the whole point of Task 2).
 struct ChannelSink(mpsc::UnboundedSender<Transaction>, Option<Lsn>);
 
 #[async_trait::async_trait]
@@ -29,7 +30,7 @@ impl Sink for ChannelSink {
     }
 }
 
-/// Всегда падает — проверяет, что подтверждение не уходит вперёд sink'а.
+/// Always fails — checks that the acknowledgement never gets ahead of the sink.
 struct FailingSink;
 
 #[async_trait::async_trait]
@@ -41,27 +42,29 @@ impl Sink for FailingSink {
         Err(PgcdcError::Sink("deliberate test failure".into()))
     }
     async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError> {
-        // Барьер сюда никогда не доходит: write_transaction всегда падает первым.
-        // Честная реализация — тоже падать, а не молча заявлять durable.
+        // The barrier never gets reached here: write_transaction always fails first.
+        // An honest implementation also fails here, rather than silently claiming durable.
         Err(PgcdcError::Sink("deliberate test failure".into()))
     }
 }
 
-/// Принимает запись успешно, но барьер падает всякий раз, когда есть что
-/// проваливать. Существует отдельно от `FailingSink`, потому что тот падает
-/// внутри `write_transaction` и никогда не доходит до кода, который отмечает
-/// durable, — так что он не охраняет разделение «запись прошла» / «барьер
-/// прошёл», ради которого затевалась задача 2 (review Task 2, round 1, F2).
+/// Accepts the write successfully, but the barrier fails every time there
+/// is something to fail on. Exists separately from `FailingSink` because
+/// that one fails inside `write_transaction` and never reaches the code
+/// that marks durable — so it does not guard the "write went through" /
+/// "barrier went through" split that task 2 was set up for in the first
+/// place (review Task 2, round 1, F2).
 ///
-/// Task 4 review, round 1, F1: раньше `flush` падал БЕЗУСЛОВНО, включая
-/// пустой тик без единой записи. После задачи 4 барьер достижим и на
-/// холостых тиках (в этом весь смысл таймера), поэтому такой дублёр мог
-/// оборвать `run()` ожидаемой ошибкой ещё до первого `write_transaction` —
-/// тест проходил бы, ничего не проверив. Форма — как у остальных sink'ов:
-/// `write_transaction` запоминает принятую позицию, `flush` при пустом
-/// накопителе честно отвечает `Ok(None)` (контракт трейта и уже
-/// существующий юнит-тест для других дублёров), а падает только тогда,
-/// когда действительно было что подтверждать.
+/// Task 4 review, round 1, F1: `flush` used to fail UNCONDITIONALLY,
+/// including on an empty tick with no writes at all. After task 4 the
+/// barrier is reachable on idle ticks too (that is the whole point of the
+/// timer), so a test double like that could abort `run()` with the expected
+/// error before the first `write_transaction` even ran — the test would
+/// pass without checking anything. Its shape matches the other sinks:
+/// `write_transaction` records the received position, `flush` on an empty
+/// accumulator honestly returns `Ok(None)` (the trait contract, and already
+/// covered by a unit test for the other test doubles), and it only fails
+/// when there was actually something to acknowledge.
 struct FlushFailsSink(Option<Lsn>);
 
 #[async_trait::async_trait]
@@ -77,33 +80,33 @@ impl Sink for FlushFailsSink {
         if self.0.is_none() {
             return Ok(None);
         }
-        // Позицию нарочно не забираем: барьер провалился, данные не стали
-        // durable, и повторная попытка обязана видеть ту же ожидающую
-        // позицию, а не молча её терять.
+        // The position is deliberately not taken: the barrier failed, the
+        // data did not become durable, and a retry must see the same
+        // pending position, not silently lose it.
         Err(PgcdcError::Sink("deliberate barrier failure".into()))
     }
 }
 
-/// Зеркало `FlushFailsSink`: запись падает, а барьер (пустой) успешен. Нужен
-/// отдельно от `FailingSink`, у которого падают ОБА метода — из-за этого
-/// `FailingSink` не может отличить "проглоченный отказ записи" от "отказ
-/// барьера": даже мутация, игнорирующая `Err` от `write_transaction`, всё
-/// равно уронит `run()` на следующем же барьере (тот падает безусловно), и
-/// тест на отказ приёмника прошёл бы зелёным не по той причине, по которой
-/// заявлен (I4).
+/// Mirror image of `FlushFailsSink`: the write fails while the (empty)
+/// barrier succeeds. Needed separately from `FailingSink`, whose BOTH
+/// methods fail — because of that, `FailingSink` cannot tell "a swallowed
+/// write failure" apart from "a barrier failure": even a mutation that
+/// ignores the `Err` from `write_transaction` would still bring `run()`
+/// down on the very next barrier (which fails unconditionally), and the
+/// sink-failure test would pass green for the wrong reason (I4).
 ///
-/// `WriteFailsSink` не хранит вообще никакого состояния (в отличие от
-/// `FlushFailsSink`, у которого есть поле `Option<Lsn>`) — запись всегда
-/// падает раньше, чем появится что запоминать, и барьеру нечего подтверждать,
-/// поэтому он честно отвечает `Ok(None)`, как и контракт трейта требует для
-/// пустого накопителя. Если мутация в цикле репликации заменит
-/// `sink.write_transaction(&tx).await?` на игнорирование результата, цикл
-/// продолжит идти как ни в чём не бывало:
-/// `note_processed` сдвинется на позицию транзакции, которую sink на самом
-/// деле не принял, а следующий барьер честно отчитается `Ok(None)` — ack
-/// никогда не продвинется, `run()` никогда не вернёт ошибку, и процесс
-/// зависнет там, где корректный код упал бы с фатальной ошибкой сразу после
-/// первой же записи.
+/// `WriteFailsSink` holds no state at all (unlike `FlushFailsSink`, which
+/// has an `Option<Lsn>` field) — the write always fails before there is
+/// anything to remember, and the barrier has nothing to acknowledge, so it
+/// honestly returns `Ok(None)`, as the trait contract requires for an empty
+/// accumulator. If a mutation in the replication loop replaced
+/// `sink.write_transaction(&tx).await?` with ignoring the result, the loop
+/// would keep going as if nothing happened: `note_processed` would advance
+/// to the position of a transaction the sink never actually accepted, and
+/// the next barrier would honestly report `Ok(None)` — ack would never
+/// advance, `run()` would never return an error, and the process would hang
+/// exactly where correct code would fail with a fatal error right after the
+/// very first write.
 struct WriteFailsSink;
 
 #[async_trait::async_trait]
@@ -115,8 +118,9 @@ impl Sink for WriteFailsSink {
         Err(PgcdcError::Sink("deliberate write failure".into()))
     }
     async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError> {
-        // Ничего никогда не было принято (запись всегда падает раньше) —
-        // барьеру нечего подтверждать, и он честно отвечает Ok(None), а не Err.
+        // Nothing was ever accepted (the write always fails first) — the
+        // barrier has nothing to acknowledge, and it honestly returns
+        // Ok(None) rather than Err.
         Ok(None)
     }
 }
@@ -138,20 +142,21 @@ fn config(conn: &str) -> Config {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reconnect_bounds_above_the_ceiling_fail_before_any_connection() {
-    // M6: `validate_reconnect_bounds()` было добавлено в `run()` в прошлом
-    // раунде, но без теста, бьющего именно по вызову внутри `run()`, — сам
-    // по себе вызов можно было бы стереть, и весь набор остался бы зелёным
-    // (юнит-тесты в `config.rs` проверяют только сам метод в изоляции). Проверка
-    // стоит ДО preflight и до всякого подключения, поэтому контейнер не нужен
-    // вовсе: адрес ниже никогда не будет резолвиться или использоваться, если
-    // вызов на месте.
+    // M6: `validate_reconnect_bounds()` was added to `run()` in a previous
+    // round, but without a test that specifically hits the call inside
+    // `run()` — the call itself could be deleted and the whole suite would
+    // still stay green (the unit tests in `config.rs` only check the method
+    // in isolation). The check sits BEFORE preflight and before any
+    // connection, so no container is needed at all: the address below will
+    // never be resolved or used if the call is in place.
     let mut cfg = config("postgres://u:p@127.0.0.1:1/db");
     cfg.reconnect_initial_ms = 5000;
     cfg.reconnect_max_ms = 1000;
 
-    // Если вызов удалить, run() уйдёт в preflight на недостижимый адрес и
-    // будет ретраить внутри таймаута ниже — таймаут истечёт, и `expect`
-    // запаникует: мутация ловится, а не проходит незамеченной.
+    // If the call is removed, run() will go into preflight against an
+    // unreachable address and keep retrying within the timeout below — the
+    // timeout will expire and `expect` will panic: the mutation is caught,
+    // not left unnoticed.
     let err = tokio::time::timeout(
         Duration::from_secs(5),
         pgcdc::postgres::replication::run(
@@ -161,24 +166,24 @@ async fn reconnect_bounds_above_the_ceiling_fail_before_any_connection() {
         ),
     )
     .await
-    .expect("проверка границ обязана вернуть ошибку немедленно, не дожидаясь сети")
+    .expect("the bounds check must return an error immediately, without waiting on the network")
     .unwrap_err();
     assert!(
         matches!(err, PgcdcError::InvalidReconnectBounds { .. }),
-        "получили {err:?}"
+        "got {err:?}"
     );
     assert!(err.is_fatal());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
-    // I1: раньше сигнал, пришедший пока БД недостижима, не замечался вовсе —
-    // ни внешний цикл реконнекта не читал флаг завершения, ни пауза бэкоффа
-    // не была прерываемой. Ревьюер воспроизвёл это вживую: бинарь на мёртвом
-    // порту, SIGTERM, жив ещё пять секунд спустя, и только SIGKILL что-то
-    // менял. Порт 1 никогда не слушает ни на одной обычной машине, поэтому
-    // preflight будет валиться немедленно и предсказуемо — контейнер
-    // Postgres здесь не нужен вовсе.
+    // I1: previously a signal arriving while the DB was unreachable went
+    // unnoticed entirely — neither did the outer reconnect loop read the
+    // shutdown flag, nor was the backoff sleep interruptible. The reviewer
+    // reproduced this live: the binary on a dead port, SIGTERM, still alive
+    // five seconds later, and only SIGKILL changed anything. Port 1 never
+    // listens on any ordinary machine, so preflight will fail immediately
+    // and predictably — no Postgres container is needed here at all.
     let mut child = common::KillOnDrop(
         std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
             .args([
@@ -188,9 +193,9 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
                 "pgcdc_pub",
                 "--slot",
                 "pgcdc_slot",
-                // Короткие и близкие друг к другу границы бэкоффа: несколько
-                // попыток реконнекта укладываются в секунды, а не в полминуты
-                // потолка по умолчанию.
+                // Short and close-together backoff bounds: several
+                // reconnect attempts fit within seconds instead of the
+                // default half-minute ceiling.
                 "--reconnect-initial-ms",
                 "50",
                 "--reconnect-max-ms",
@@ -199,10 +204,10 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .expect("запустить бинарь"),
+            .expect("spawn the binary"),
     );
 
-    let stderr = child.stderr.take().expect("stderr был запрошен как piped");
+    let stderr = child.stderr.take().expect("stderr was requested as piped");
     let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let lines_writer = lines.clone();
@@ -214,21 +219,23 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
         }
     });
 
-    // Доказательство, а не догадка: ждём, пока бэкофф не долезет до потолка
-    // (50 → 100 → 200 → 400 → 800 → 1600 → 3000 — семь строк "reconnecting").
-    // Раньше порог был "минимум две", но при потолке, равном интервалу опроса
-    // (200мс), пауза этого размера всегда укладывается в один кусок нарезки —
-    // нарезанная и цельная паузы неотличимы. Проверка ниже обязана застать
-    // СИГНАЛ ровно тогда, когда в работе паузa вплоть до потолка (3000мс,
-    // что в разы больше SHUTDOWN_POLL_INTERVAL) — только так тест различает
-    // нарезку и цельный sleep(delay) (round 1 стадии 5, F1).
+    // Proof, not a guess: wait until the backoff climbs all the way to the
+    // ceiling (50 → 100 → 200 → 400 → 800 → 1600 → 3000 — seven
+    // "reconnecting" lines). The threshold used to be "at least two", but
+    // with a ceiling equal to the poll interval (200ms), a pause of that
+    // size always fits inside a single slice — a sliced pause and a whole
+    // one are indistinguishable. The check below must catch the SIGNAL
+    // exactly while a pause up to the ceiling (3000ms, several times
+    // SHUTDOWN_POLL_INTERVAL) is in progress — only that way does the test
+    // tell a sliced pause apart from a whole sleep(delay) (stage 5 round 1, F1).
     //
-    // Бюджет — 20с (400×50мс), а не прежние 10с (round 1 review, F3): сама
-    // обязательная часть ожидания (сумма пауз до седьмого ретрая) — уже
-    // ~3.15с, и на локально нагруженной машине этот набор тестов измеренно
-    // гуляет 2.4x (9.5–22.4с по прогонам) — 10с оставляли запас всего
-    // втрое, а не в шестьдесят раз, как было при пороге "две". 20с ничего
-    // не стоят в зелёном прогоне и убирают историческую нестабильность.
+    // The budget is 20s (400×50ms), not the previous 10s (round 1 review,
+    // F3): the mandatory part of the wait alone (the sum of pauses up to
+    // the seventh retry) is already ~3.15s, and on a locally loaded machine
+    // this test suite has been measured to vary by 2.4x (9.5-22.4s across
+    // runs) — 10s left only a threefold margin, not the sixtyfold margin
+    // the old "two" threshold had. 20s costs nothing on a green run and
+    // removes the historical flakiness.
     let mut retries_seen = 0usize;
     for _ in 0..400 {
         retries_seen = lines
@@ -244,29 +251,31 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
     }
     assert!(
         retries_seen >= 7,
-        "не увидели семь ретраев (бэкофф до потолка) за 20 секунд, видели: {:?}",
+        "did not see seven retries (backoff up to the ceiling) within 20 seconds, saw: {:?}",
         lines.lock().unwrap()
     );
 
-    // SIGTERM посреди бесконечного ретрая на мёртвом порту: буферизованных
-    // данных на этом пути нет — сессия так ни разу и не открылась, — поэтому
-    // единственно верный исход - быстрый выход с кодом 0, а не зависание до
-    // SIGKILL.
+    // SIGTERM in the middle of an endless retry against a dead port: there
+    // is no buffered data on this path — the session was never opened even
+    // once — so the only correct outcome is a fast exit with code 0, not
+    // hanging until SIGKILL.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
 
-    // Опрос через try_wait(), а не блокирующий wait() внутри spawn_blocking:
-    // если этот тест ловит регресс I1 и процесс НЕ реагирует на SIGTERM,
-    // блокирующий wait() повис бы навсегда, а Drop рантайма tokio ждёт
-    // завершения именно blocking-задач — тест повесил бы весь тестовый
-    // бинарь вместо того, чтобы просто покраснеть. try_wait() поток не
-    // блокирует, так что таймаут ниже отрабатывает в обоих случаях.
+    // Polling via try_wait() rather than a blocking wait() inside
+    // spawn_blocking: if this test catches an I1 regression and the process
+    // does NOT react to SIGTERM, a blocking wait() would hang forever, and
+    // tokio's runtime Drop waits specifically for blocking tasks to finish —
+    // the test would hang the whole test binary instead of simply failing
+    // red. try_wait() does not block the thread, so the timeout below fires
+    // either way.
     //
-    // Бюджет — 1.5с, а не прежние 5с: сигнал только что застал паузу
-    // длиной вплоть до 3000мс в работе. Нарезанная пауза замечает флаг не
-    // позже чем через SHUTDOWN_POLL_INTERVAL (200мс) — 1.5с оставляют ей
-    // щедрый запас; а вот цельный sleep(delay) обязан продержать процесс
-    // почти все оставшиеся ~3с и в этот бюджет не уложится — иначе смысла
-    // в его сужении нет, тест снова не отличит нарезку от целого sleep.
+    // The budget is 1.5s, not the previous 5s: the signal just caught a
+    // pause of up to 3000ms in progress. A sliced pause notices the flag no
+    // later than SHUTDOWN_POLL_INTERVAL (200ms) — 1.5s leaves it a generous
+    // margin; whereas a whole sleep(delay) must keep the process alive for
+    // almost all of the remaining ~3s and would not fit in this budget —
+    // otherwise there is no point tightening it, and the test again could
+    // not tell a sliced pause apart from a whole sleep.
     let mut status = None;
     for _ in 0..30 {
         if let Ok(Some(s)) = child.try_wait() {
@@ -276,30 +285,31 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let status =
-        status.expect("SIGTERM обязан остановить процесс за 1.5 секунды, а не только SIGKILL");
+        status.expect("SIGTERM must stop the process within 1.5 seconds, not only SIGKILL");
     assert_eq!(
         status.code(),
         Some(0),
-        "нечего было доводить до барьера — реконнект на недостижимой БД обязан завершаться нулём"
+        "there was nothing left to bring to the barrier — a reconnect against an unreachable DB must exit with zero"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_in_the_last_backoff_chunk_needs_the_top_of_loop_check() {
-    // Round 1 review, F1/F2: нарезка бэкоффа проверяет флаг ПЕРЕД каждым
-    // куском и ни разу ПОСЛЕ последнего — сигнал, попавший именно в
-    // последний кусок, до неё не доходит и ловится только проверкой в
-    // начале СЛЕДУЮЩЕГО прохода внешнего цикла. Сосед этого теста (мёртвый
-    // порт) эту проверку не пин: против отказанного порта "лишняя попытка
-    // подключения", которую эта проверка экономит, стоит меньше
-    // миллисекунды — неотличимо от нуля на фоне любого разумного бюджета.
+    // Round 1 review, F1/F2: backoff slicing checks the flag BEFORE each
+    // chunk and never AFTER the last one — a signal that lands in exactly
+    // the last chunk does not reach that check and is only caught by the
+    // check at the top of the NEXT pass of the outer loop. This test's
+    // neighbor (the dead port) does not exercise this check: against a
+    // refused port, the "one extra connection attempt" that this check
+    // saves costs less than a millisecond — indistinguishable from zero
+    // against any reasonable budget.
     //
-    // Здесь вместо мёртвого порта — пир, который ПРИНИМАЕТ TCP-соединение
-    // и молча держит его ~3с перед тем, как сбросить: preflight падает не
-    // мгновенно и не никогда, а на ограниченной, но реальной задержке.
-    // Без проверки в начале прохода эта задержка проявляется ПОЛНОСТЬЮ —
-    // именно то время, которое новая документация `spawn_shutdown_listener`
-    // называет неограниченным.
+    // Here, instead of a dead port, there is a peer that ACCEPTS the TCP
+    // connection and silently holds it for ~3s before dropping it:
+    // preflight fails neither instantly nor never, but after a bounded yet
+    // real delay. Without the check at the top of the pass, this delay
+    // shows up IN FULL — exactly the duration that the new
+    // `spawn_shutdown_listener` documentation calls unbounded.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind fake peer");
@@ -311,9 +321,10 @@ async fn sigterm_in_the_last_backoff_chunk_needs_the_top_of_loop_check() {
                 Err(_) => break,
             };
             tokio::spawn(async move {
-                // Никогда не говорит протокол Postgres: просто держит
-                // сокет, чтобы clientский connect() заблокировался на
-                // предсказуемые ~3с, а не упал мгновенно и не завис навечно.
+                // Never speaks the Postgres protocol: just holds the
+                // socket so the client's connect() blocks for a
+                // predictable ~3s, instead of failing instantly or hanging
+                // forever.
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 drop(stream);
             });
@@ -329,9 +340,10 @@ async fn sigterm_in_the_last_backoff_chunk_needs_the_top_of_loop_check() {
                 "pgcdc_pub",
                 "--slot",
                 "pgcdc_slot",
-                // Начальная и максимальная границы равны: каждая пауза
-                // бэкоффа — ровно 1с (5 кусков по 200мс), без роста, так
-                // что момент сигнала внутри паузы предсказуем.
+                // The initial and maximum bounds are equal: every backoff
+                // pause is exactly 1s (5 chunks of 200ms), with no growth,
+                // so the moment the signal lands within the pause is
+                // predictable.
                 "--reconnect-initial-ms",
                 "1000",
                 "--reconnect-max-ms",
@@ -340,10 +352,10 @@ async fn sigterm_in_the_last_backoff_chunk_needs_the_top_of_loop_check() {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .expect("запустить бинарь"),
+            .expect("spawn the binary"),
     );
 
-    let stderr = child.stderr.take().expect("stderr был запрошен как piped");
+    let stderr = child.stderr.take().expect("stderr was requested as piped");
     let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let lines_writer = lines.clone();
@@ -355,10 +367,11 @@ async fn sigterm_in_the_last_backoff_chunk_needs_the_top_of_loop_check() {
         }
     });
 
-    // Ждём вторую строку "reconnecting": первая попытка и первая пауза уже
-    // позади, вторая попытка провалилась, и сейчас в работе вторая пауза
-    // (ровно 1с). Бюджет — 15с: два подключения к держащему пиру (~3с
-    // каждое) плюс пауза между ними (~1с) плюс запас.
+    // Wait for the second "reconnecting" line: the first attempt and the
+    // first pause are already behind us, the second attempt has failed,
+    // and the second pause (exactly 1s) is now in progress. The budget is
+    // 15s: two connections to the holding peer (~3s each) plus the pause
+    // between them (~1s) plus margin.
     let mut retries_seen = 0usize;
     for _ in 0..300 {
         retries_seen = lines
@@ -374,44 +387,44 @@ async fn sigterm_in_the_last_backoff_chunk_needs_the_top_of_loop_check() {
     }
     assert!(
         retries_seen >= 2,
-        "не увидели вторую строку reconnecting за 15 секунд, видели: {:?}",
+        "did not see the second reconnecting line within 15 seconds, saw: {:?}",
         lines.lock().unwrap()
     );
 
-    // Пауза после второго ретрая — ровно 1с, нарезана на 5 кусков по
-    // 200мс: границы кусков — 0, 200, 400, 600, 800, 1000. Последний кусок
-    // (800–1000) — тот самый, который нарезка не перепроверяет после
-    // своего конца; сигнал должен попасть именно туда.
+    // The pause after the second retry is exactly 1s, sliced into 5 chunks
+    // of 200ms: chunk boundaries are 0, 200, 400, 600, 800, 1000. The last
+    // chunk (800-1000) is the very one that the slicing does not re-check
+    // after its own end; the signal must land exactly there.
     //
-    // Round 2 review, F5: наше "сейчас" всегда ПОЗЖЕ истинного момента
-    // строки лога — опрос раз в 50мс и было бы. Значит смещение может
-    // только УВЕЛИЧИТЬ фактическую точку попадания внутрь паузы, никогда
-    // не уменьшить её. Отсюда: целиться нужно ближе к началу окна
-    // (800мс), а не к его концу (900мс, как было) — это ничего не стоит
-    // на зелёной стороне (нарезанному коду всё равно, сколько именно
-    // последнего куска осталось — 200мс или 20мс, лишь бы после конца
-    // последнего куска, а не раньше) и покупает запас на красной стороне
-    // (перелёт за 1000мс значил бы попадание уже в СЛЕДУЮЩУЮ попытку
-    // подключения, которая блокирует одинаковые ~3с что на верном, что на
-    // мутированном коде, — ложнокрасный результат даже без мутации).
+    // Round 2 review, F5: our "now" is always LATER than the true moment
+    // of the log line — that's what polling every 50ms would give. So the
+    // offset can only INCREASE the actual point where we land inside the
+    // pause, never decrease it. Hence: aim closer to the start of the
+    // window (800ms), not its end (900ms, as it used to be) — this costs
+    // nothing on the green side (the sliced code doesn't care exactly how
+    // much of the last chunk is left — 200ms or 20ms, as long as it's
+    // after the end of the last chunk, not before) and buys margin on the
+    // red side (overshooting past 1000ms would mean landing in the NEXT
+    // connection attempt, which blocks for the same ~3s on both correct
+    // and mutated code — a false-red result even without a mutation).
     //
-    // Цель — 820мс: +20мс над нижней границей (800) как страховка на
-    // случай, если предположение о границах кусков хоть немного неточно;
-    // до верхней границы (1000) остаётся 180мс на задержку опроса и
-    // диспетчеризацию задачи — было 100мс при цели 900мс. Бюджет выхода
-    // ниже расширен вместе с этим (см. комментарий там).
+    // The target is 820ms: +20ms above the lower bound (800) as insurance
+    // in case the assumption about chunk boundaries is even slightly off;
+    // 180ms remain before the upper bound (1000) for polling delay and
+    // task dispatch — it used to be 100ms with a target of 900ms. The exit
+    // budget below is widened along with this (see the comment there).
     let signal_target = Duration::from_millis(820);
     tokio::time::sleep(signal_target).await;
     let signal_sent_at = std::time::Instant::now();
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
 
-    // Бюджет — 1с (было 600мс): при цели 820мс худший случай для
-    // нарезанного кода — приземлиться сразу на границе 820мс (нулевая
-    // задержка опроса) и досидеть остаток последнего куска, ~180мс, плюс
-    // реакция проверки и доставка сигнала — с запасом до ~250–300мс.
-    // 1с даёт этому кратный запас и остаётся втрое ниже задержки
-    // держащего пира (~3с), так что мутированный путь однозначно не
-    // укладывается.
+    // The budget is 1s (used to be 600ms): with an 820ms target, the worst
+    // case for the sliced code is landing right on the 820ms boundary
+    // (zero polling delay) and sitting out the rest of the last chunk,
+    // ~180ms, plus check reaction and signal delivery — with margin up to
+    // ~250-300ms. 1s gives this a several-fold margin and stays a third
+    // below the holding peer's delay (~3s), so the mutated path definitely
+    // does not fit.
     let mut status = None;
     for _ in 0..20 {
         if let Ok(Some(s)) = child.try_wait() {
@@ -425,8 +438,12 @@ async fn sigterm_in_the_last_backoff_chunk_needs_the_top_of_loop_check() {
         "sigterm_in_the_last_backoff_chunk_needs_the_top_of_loop_check: exit latency = {elapsed:?}"
     );
     let status = status
-        .expect("проверка в начале прохода обязана поймать сигнал из последнего куска паузы за 1с");
-    assert_eq!(status.code(), Some(0), "нечего было доводить до барьера");
+        .expect("the top-of-pass check must catch a signal from the last pause chunk within 1s");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "there was nothing to bring to the barrier"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -457,8 +474,8 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
 
     let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
         .await
-        .expect("транзакция должна приехать за 20 секунд")
-        .expect("канал закрыт");
+        .expect("the transaction should arrive within 20 seconds")
+        .expect("channel closed");
 
     assert_eq!(tx.changes.len(), 1);
     let ev = &tx.changes[0];
@@ -472,38 +489,39 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
     assert!(json["before"].is_null());
     assert_eq!(json["unchanged_columns"], serde_json::json!([]));
 
-    // Ядро контракта на LSN: PostgreSQL должен подтвердить НЕ РАНЬШЕ end_lsn,
-    // а не commit_lsn (они различаются на фиксированные 0x30 байт —
-    // DECISIONS/бриф Task 6). Ждём "не раньше", а не точного совпадения:
-    // idle-keepalive-advance (этап 3) может увести confirmed_flush_lsn дальше
-    // end_lsn ещё до нашего опроса — под нагрузкой это ловилось примерно в
-    // 20% прогонов (review Task 2, round 1, F5), и дело не в том, что
-    // подтвердили что-то не то, а в том, что сервер продолжил собственную
-    // WAL-активность в фоне (зафиксированный пример — 0x38 байт от одной
-    // фоновой standby-snapshot-записи).
+    // The core of the LSN contract: PostgreSQL must acknowledge NOT EARLIER
+    // than end_lsn, not commit_lsn (they differ by a fixed 0x30 bytes —
+    // DECISIONS/Task 6 brief). We wait for "not earlier", not an exact
+    // match: idle-keepalive-advance (stage 3) can move confirmed_flush_lsn
+    // past end_lsn even before our poll — under load this was caught in
+    // about 20% of runs (review Task 2, round 1, F5), and it's not that
+    // the wrong thing got acknowledged, but that the server kept doing its
+    // own WAL activity in the background (a recorded example — 0x38 bytes
+    // from one background standby-snapshot record).
     //
-    // Расплата: этот тест больше не различает "подтвердили ровно end_lsn" от
-    // "подтвердили что-то ЗА него keepalive'ом" — под мутацию, отправляющую
-    // в feedback commit_lsn вместо end_lsn, keepalive-ветка позже всё равно
-    // дотащит слот выше end_lsn, и проверка `>=` этого не заметит.
-    // Различить эти два случая может только наблюдение за НАШИМ собственным
-    // подтверждением (acked), а не за позицией слота на сервере — то есть
-    // потеряно здесь осознанно, а не по недосмотру. Ту дискриминацию, от
-    // которой этот тест отказался, закрывает
-    // `we_acknowledge_the_end_of_the_commit_record_not_its_start` в этом же
-    // файле: он читает `metrics.last_acknowledged_lsn`, а не позицию слота,
-    // и потому различает подмену end_lsn на commit_lsn там, где keepalive
-    // всё равно увёл бы слот вперёд обоих вариантов.
+    // The trade-off: this test no longer distinguishes "acknowledged
+    // exactly end_lsn" from "acknowledged something PAST it via keepalive"
+    // — under a mutation that sends commit_lsn instead of end_lsn in the
+    // feedback, the keepalive branch will later drag the slot above
+    // end_lsn anyway, and the `>=` check will not notice. Only watching OUR
+    // OWN acknowledgement (acked) rather than the slot's position on the
+    // server can distinguish these two cases — that is, this is lost here
+    // deliberately, not by oversight. The discrimination this test gave up
+    // is covered by
+    // `we_acknowledge_the_end_of_the_commit_record_not_its_start` in this
+    // same file: it reads `metrics.last_acknowledged_lsn`, not the slot's
+    // position, and so distinguishes substituting commit_lsn for end_lsn in
+    // a case where keepalive would drag the slot ahead of both anyway.
     let expected_end = tx.end_lsn;
     assert_ne!(
         tx.end_lsn, tx.commit_lsn,
-        "end_lsn и commit_lsn обязаны отличаться, иначе проверка ниже ничего не доказывает"
+        "end_lsn and commit_lsn must differ, otherwise the check below proves nothing"
     );
 
     let confirmed = common::wait_for_slot_at_least(&client, "pgcdc_slot", expected_end).await;
     assert!(
         confirmed >= expected_end,
-        "PostgreSQL должен был подтвердить хотя бы end_lsn транзакции: {confirmed} < {expected_end}"
+        "PostgreSQL should have acknowledged at least the transaction's end_lsn: {confirmed} < {expected_end}"
     );
 
     handle.abort();
@@ -511,9 +529,9 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_does_not_send_rolled_back_transactions() {
-    // Проверяет НАШЕ понимание протокола, а не наш код: logical decoding
-    // физически не отдаёт откаченные транзакции. Если тест покраснеет,
-    // значит мир устроен не так, как мы думаем.
+    // Checks OUR understanding of the protocol, not our code: logical
+    // decoding physically never hands out rolled-back transactions. If
+    // this test fails, it means the world doesn't work the way we think.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -541,15 +559,15 @@ async fn postgres_does_not_send_rolled_back_transactions() {
 
     let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
         .await
-        .expect("таймаут")
-        .expect("канал закрыт");
+        .expect("timeout")
+        .expect("channel closed");
 
-    // Первая приехавшая транзакция — та, что после отката.
+    // The first transaction to arrive is the one after the rollback.
     assert_eq!(tx.changes.len(), 1);
     let json = serde_json::to_value(&tx.changes[0]).unwrap();
     assert_eq!(
         json["after"]["id"], "1",
-        "откаченная строка не должна приехать"
+        "the rolled-back row must not arrive"
     );
 
     handle.abort();
@@ -557,7 +575,8 @@ async fn postgres_does_not_send_rolled_back_transactions() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sink_failure_stops_us_before_the_slot_advances() {
-    // Ядро контракта: подтверждение не уходит вперёд того, что записал sink.
+    // The core of the contract: acknowledgement never gets ahead of what
+    // the sink wrote.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -589,13 +608,13 @@ async fn sink_failure_stops_us_before_the_slot_advances() {
 
     let result = tokio::time::timeout(Duration::from_secs(20), handle)
         .await
-        .expect("run должен завершиться, а не висеть")
+        .expect("run should finish, not hang")
         .expect("join");
     let err = result.unwrap_err();
-    assert!(matches!(err, PgcdcError::Sink(_)), "получили {err:?}");
+    assert!(matches!(err, PgcdcError::Sink(_)), "got {err:?}");
     assert!(
         err.is_fatal(),
-        "sink, который не может двигаться, — фатальная ошибка"
+        "a sink that cannot proceed is a fatal error"
     );
 
     let after: String = client
@@ -609,17 +628,18 @@ async fn sink_failure_stops_us_before_the_slot_advances() {
 
     assert_eq!(
         before, after,
-        "слот не должен был сдвинуться: sink ничего не записал"
+        "the slot must not have moved: the sink wrote nothing"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn barrier_failure_stops_us_before_the_slot_advances() {
-    // Дополняет sink_failure_stops_us_before_the_slot_advances: та проверяет
-    // отказ ВНУТРИ write_transaction, этот — отказ барьера ПОСЛЕ успешной
-    // записи. Без этого теста ветка кода, которую добавила задача 2 (durable
-    // отмечается только по возврату flush, а не write_transaction), ничем не
-    // защищена: FailingSink никогда её не достигает (review Task 2, round 1, F2).
+    // Complements sink_failure_stops_us_before_the_slot_advances: that one
+    // checks a failure INSIDE write_transaction, this one checks a barrier
+    // failure AFTER a successful write. Without this test, the code path
+    // task 2 added (durable is marked only by flush's return, not
+    // write_transaction's) is completely unguarded: FailingSink never
+    // reaches it (review Task 2, round 1, F2).
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -651,13 +671,13 @@ async fn barrier_failure_stops_us_before_the_slot_advances() {
 
     let result = tokio::time::timeout(Duration::from_secs(20), handle)
         .await
-        .expect("run должен завершиться, а не висеть")
+        .expect("run should finish, not hang")
         .expect("join");
     let err = result.unwrap_err();
-    assert!(matches!(err, PgcdcError::Sink(_)), "получили {err:?}");
+    assert!(matches!(err, PgcdcError::Sink(_)), "got {err:?}");
     assert!(
         err.is_fatal(),
-        "барьер, который не может подтвердить, — фатальная ошибка"
+        "a barrier that cannot acknowledge is a fatal error"
     );
 
     let after: String = client
@@ -671,21 +691,21 @@ async fn barrier_failure_stops_us_before_the_slot_advances() {
 
     assert_eq!(
         before, after,
-        "слот не должен был сдвинуться: барьер не довёл запись до диска"
+        "the slot must not have moved: the barrier never brought the write to disk"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_failure_stops_us_before_the_slot_advances_and_is_not_swallowed() {
-    // I4: дополняет sink_failure_stops_us_before_the_slot_advances и
-    // barrier_failure_stops_us_before_the_slot_advances дублёром, у которого
-    // падает ТОЛЬКО запись, а барьер (пустой) успешен — WriteFailsSink,
-    // зеркало FlushFailsSink. FailingSink не годится здесь: у него падают
-    // ОБА метода, поэтому мутация "sink.write_transaction(&tx).await? →
-    // игнорировать результат" всё равно уронила бы run() на следующем же
-    // барьере, и sink_failure_stops_us_before_the_slot_advances прошёл бы
-    // зелёным не по той причине, по которой заявлен — набор был слеп к
-    // мутации того, что якобы покрывает.
+    // I4: complements sink_failure_stops_us_before_the_slot_advances and
+    // barrier_failure_stops_us_before_the_slot_advances with a test double
+    // where ONLY the write fails while the (empty) barrier succeeds —
+    // WriteFailsSink, the mirror of FlushFailsSink. FailingSink does not
+    // work here: BOTH its methods fail, so a mutation "sink.write_transaction(&tx).await? →
+    // ignore the result" would still bring run() down on the very next
+    // barrier, and sink_failure_stops_us_before_the_slot_advances would
+    // pass green for the wrong reason — the suite was blind to a mutation
+    // of the very thing it claimed to cover.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -718,17 +738,15 @@ async fn a_write_failure_stops_us_before_the_slot_advances_and_is_not_swallowed(
     let result = tokio::time::timeout(Duration::from_secs(20), handle)
         .await
         .expect(
-            "run должен завершиться отказом записи, а не висеть — под мутацией, \
-             проглатывающей Err от write_transaction, он висит вечно: цикл продолжает \
-             читать WAL, но ack никогда не продвигается, потому что sink ничего не принял",
+            "run should finish with a write failure, not hang — under a \
+             mutation that swallows the Err from write_transaction, it hangs \
+             forever: the loop keeps reading WAL, but ack never advances \
+             because the sink never accepted anything",
         )
         .expect("join");
     let err = result.unwrap_err();
-    assert!(matches!(err, PgcdcError::Sink(_)), "получили {err:?}");
-    assert!(
-        err.is_fatal(),
-        "sink, который не может писать, — фатальная ошибка"
-    );
+    assert!(matches!(err, PgcdcError::Sink(_)), "got {err:?}");
+    assert!(err.is_fatal(), "a sink that cannot write is a fatal error");
 
     let after: String = client
         .query_one(
@@ -741,32 +759,36 @@ async fn a_write_failure_stops_us_before_the_slot_advances_and_is_not_swallowed(
 
     assert_eq!(
         before, after,
-        "слот не должен был сдвинуться: sink ни разу не принял запись"
+        "the slot must not have moved: the sink never accepted a write"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn we_acknowledge_the_end_of_the_commit_record_not_its_start() {
-    // Перенесено с этапа 3. Раньше это проверялось по позиции слота на точное
-    // равенство, но продвижение слота по keepalive сделало равенство
-    // недостижимым: фоновая запись WAL законно уводит слот дальше, и
-    // ослабленная проверка «не меньше» перестала различать подмену
-    // end_lsn на commit_lsn — keepalive увёл бы слот за end_lsn в обоих
-    // случаях. Счётчик читает НАШЕ решение, а не состояние сервера,
-    // и потому различает.
+    // Carried over from stage 3. This used to be checked against the
+    // slot's position for exact equality, but the slot advancing via
+    // keepalive made equality unreachable: background WAL activity
+    // legitimately moves the slot further, and the weakened "not less
+    // than" check stopped distinguishing a substitution of end_lsn for
+    // commit_lsn — keepalive would drag the slot past end_lsn in both
+    // cases. The counter reads OUR decision, not the server's state, and
+    // so it does distinguish.
     //
-    // M5 (review round after task 4): это пин-тест плотины acknowledge_durable
-    // (src/postgres/replication.rs) и Transaction::end_lsn (src/transaction.rs)
-    // через ChannelSink — тестового дублёра приёмника, объявленного в этом же
-    // файле, который сам кладёт нужную позицию (`self.1 = Some(tx.end_lsn)`).
-    // Он НЕ ловит мутацию «боевые приёмники (FileSink/StdoutSink) отдают
-    // начало вместо конца» — ChannelSink её попросту не касается. Ту мутацию
-    // ловят `flush_reports_the_last_accepted_position_then_clears_it`
-    // (src/sink/file.rs) и `a_second_flush_right_after_the_first_reports_nothing_new`
-    // (src/sink/stdout.rs) — обе используют фикстуру с end_lsn ≠ commit_lsn и
-    // сверяют возврат `flush()` на точное равенство. Проверено мутацией
-    // руками: подмена `tx.end_lsn` на `tx.commit_lsn` в обоих боевых sink'ах
-    // красит ровно эти два юнит-теста и оставляет этот тест зелёным.
+    // M5 (review round after task 4): this is a pin test for the dam
+    // between acknowledge_durable (src/postgres/replication.rs) and
+    // Transaction::end_lsn (src/transaction.rs), going through
+    // ChannelSink — the test double sink declared in this same file, which
+    // stores the needed position itself (`self.1 = Some(tx.end_lsn)`). It
+    // does NOT catch the mutation "the production sinks (FileSink/StdoutSink)
+    // report the start instead of the end" — ChannelSink simply doesn't
+    // touch that path. That mutation is caught by
+    // `flush_reports_the_last_accepted_position_then_clears_it`
+    // (src/sink/file.rs) and `a_second_flush_right_after_the_first_reports_nothing_new`
+    // (src/sink/stdout.rs) — both use a fixture with end_lsn ≠ commit_lsn
+    // and check `flush()`'s return for exact equality. Verified by hand
+    // with a mutation: substituting `tx.end_lsn` for `tx.commit_lsn` in
+    // both production sinks fails exactly these two unit tests and leaves
+    // this test green.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -787,10 +809,10 @@ async fn we_acknowledge_the_end_of_the_commit_record_not_its_start() {
 
     let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
         .await
-        .expect("транзакция должна приехать")
-        .expect("канал закрыт");
+        .expect("the transaction should arrive")
+        .expect("channel closed");
 
-    // Ждём, пока счётчик догонит: подтверждение уходит из барьера по таймеру.
+    // Wait for the counter to catch up: acknowledgement leaves the barrier on a timer.
     let mut acked = 0;
     for _ in 0..200 {
         acked = metrics.snapshot().last_acknowledged_lsn;
@@ -802,11 +824,11 @@ async fn we_acknowledge_the_end_of_the_commit_record_not_its_start() {
 
     assert_eq!(
         acked, tx.end_lsn.0,
-        "подтверждаем end_lsn транзакции, а не что-то ещё"
+        "we acknowledge the transaction's end_lsn, not something else"
     );
     assert_ne!(
         acked, tx.commit_lsn.0,
-        "commit_lsn указывает на начало записи коммита — рестарт перечитал бы её"
+        "commit_lsn points to the start of the commit record — a restart would reread it"
     );
 
     handle.abort();
@@ -814,45 +836,48 @@ async fn we_acknowledge_the_end_of_the_commit_record_not_its_start() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_servers_confirmed_position_never_races_ahead_of_what_we_acknowledged() {
-    // I3: DECISIONS Q25(2) запрещает пять вызовов `pg_walstream`, ведущих в
-    // `recover_connection`, именно потому, что они рестартуют поток с
-    // ПРИНЯТОЙ позицией, а не с ДУРАБЛЬНОЙ. Тест выше
-    // (we_acknowledge_the_end_of_the_commit_record_not_its_start) читает
-    // НАШЕ решение через `metrics.last_acknowledged_lsn`, а не то, что
-    // реально ушло на провод — шаг "решение → провод" остаётся слепым: подмени
-    // `acked` на `received`/`processed` внутри `acknowledge_durable` (в
-    // вызовах `stream.shared_lsn_feedback.update_flushed_lsn`/
-    // `update_applied_lsn`), и весь набор остаётся зелёным, потому что
-    // `metrics.set_last_acknowledged_lsn` в той же функции эту подмену не
-    // видит вовсе.
+    // I3: DECISIONS Q25(2) forbids five calls to `pg_walstream` leading into
+    // `recover_connection`, precisely because they restart the stream from
+    // the RECEIVED position rather than the DURABLE one. The test above
+    // (we_acknowledge_the_end_of_the_commit_record_not_its_start) reads OUR
+    // decision through `metrics.last_acknowledged_lsn`, not what actually
+    // went out on the wire — the "decision → wire" step stays blind: swap
+    // `acked` for `received`/`processed` inside `acknowledge_durable` (in
+    // the calls to `stream.shared_lsn_feedback.update_flushed_lsn`/
+    // `update_applied_lsn`), and the whole suite stays green, because
+    // `metrics.set_last_acknowledged_lsn` in that same function never sees
+    // that substitution at all.
     //
-    // Сценарий (зонд ревьюера, сделанный тестом). `acknowledge_durable`
-    // зовётся ТОЛЬКО когда барьеру есть что подтверждать (`sink.flush()`
-    // вернул `Some`) — единственная маленькая транзакция стала бы пустышкой:
-    // первый же тик барьера подтвердил бы её почти сразу, задолго до того,
-    // как следующая, большая транзакция вообще начнёт стримиться, и
-    // подмена в `acknowledge_durable` не успела бы увидеть ничего, кроме
-    // крошечного `received`. Поэтому фоновая задача непрерывно пишет
-    // отдельные маленькие транзакции на протяжении всего теста — это даёт
-    // МНОГО отдельных вызовов `acknowledge_durable`, и какой-то из них
-    // гарантированно попадёт на момент, когда большая транзакция B уже
-    // СТРИМИТСЯ (received растёт кадр за кадром), но ещё не разобрана до
-    // конца (её COMMIT ещё не дошёл, write_transaction для неё ещё не
-    // звали). В этот момент барьер подтверждает только маленькую фоновую
-    // транзакцию — sink ничего не принимал сверх неё. Если бы на провод
-    // уходила received/processed вместо acked, сервер увидел бы
-    // `confirmed_flush_lsn` где-то в середине B — далеко впереди того, что
-    // реально ушло sink'у.
+    // The scenario (a reviewer's probe, turned into a test).
+    // `acknowledge_durable` is only called when the barrier has something
+    // to acknowledge (`sink.flush()` returned `Some`) — a single small
+    // transaction would be a dud: the very first barrier tick would
+    // acknowledge it almost immediately, long before the next, large
+    // transaction even starts streaming, and a substitution inside
+    // `acknowledge_durable` would never get to see anything but a tiny
+    // `received`. So a background task keeps writing separate small
+    // transactions throughout the test — this produces MANY separate calls
+    // to `acknowledge_durable`, and one of them is guaranteed to land at a
+    // moment when the large transaction B is already STREAMING (received
+    // grows frame by frame) but not yet fully parsed (its COMMIT has not
+    // arrived yet, write_transaction has not been called for it yet). At
+    // that moment the barrier only acknowledges the small background
+    // transaction — the sink has not accepted anything beyond it. If
+    // received/processed went out on the wire instead of acked, the server
+    // would see `confirmed_flush_lsn` somewhere in the middle of B — far
+    // ahead of what actually reached the sink.
     //
-    // B — один INSERT...SELECT, один коммит: 300 строк по 200КБ в
-    // TOAST-колонке `bio`, STORAGE EXTERNAL, без сжатия (≈60МБ). Решает не
-    // полный объём B, а разрыв между двумя барьерами, который B успевает
-    // создать, пока стримится, — а это калибруется временем разбора одной
-    // строки, а не суммой всех строк. Прежняя версия теста гоняла 3000
-    // строк (≈600МБ): впятеро дороже по времени и памяти, не покупая
-    // большего разрыва (review round 2 after task 4 finale, P2) — при этом
-    // же пороге (`max_gap_after_some_ack >= 1_000_000` ниже) наблюдаемый
-    // разрыв остаётся десятками мегабайт, с запасом на порядки.
+    // B is one INSERT...SELECT, one commit: 300 rows of 200KB each in the
+    // TOAST column `bio`, STORAGE EXTERNAL, uncompressed (≈60MB). What
+    // matters is not B's total volume but the gap between two barriers
+    // that B manages to create while it streams — and that's calibrated by
+    // the time it takes to parse one row, not the sum of all rows. The
+    // previous version of the test ran 3000 rows (≈600MB): five times more
+    // expensive in time and memory, without buying a bigger gap (review
+    // round 2 after task 4 finale, P2) — at the same threshold
+    // (`max_gap_after_some_ack >= 1_000_000` below), the observed gap
+    // stays in the tens of megabytes, with margin to spare by orders of
+    // magnitude.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -867,10 +892,10 @@ async fn the_servers_confirmed_position_never_races_ahead_of_what_we_acknowledge
         pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None)), m).await
     });
 
-    // Фоновая задача: непрерывно пишет отдельные маленькие транзакции
-    // (уникальные id, начиная с 500 000, вне диапазона B), пока тест не
-    // велит ей остановиться. Каждая держит барьер занятым чем-то маленьким
-    // на протяжении всего теста — включая момент, когда B в середине пути.
+    // Background task: continuously writes separate small transactions
+    // (unique ids starting at 500,000, outside B's range) until the test
+    // tells it to stop. Each one keeps the barrier busy with something
+    // small throughout the test — including the moment when B is midway.
     let bg_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let bg_stop_writer = bg_stop.clone();
     let bg_conn = conn.clone();
@@ -886,19 +911,19 @@ async fn the_servers_confirmed_position_never_races_ahead_of_what_we_acknowledge
         }
     });
 
-    // Ждём первую фоновую транзакцию — доказательство, что механизм вообще
-    // работает, прежде чем запускать B.
+    // Wait for the first background transaction — proof the mechanism
+    // works at all, before launching B.
     let first_bg = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
         .await
-        .expect("первая фоновая транзакция должна приехать")
-        .expect("канал закрыт");
+        .expect("the first background transaction should arrive")
+        .expect("channel closed");
     assert_eq!(
         first_bg.changes.len(),
         1,
-        "фоновая транзакция — одна строка"
+        "a background transaction is one row"
     );
 
-    // Большая транзакция B — без искусственной задержки.
+    // The large transaction B — with no artificial delay.
     let client_b = common::connect(&conn).await;
     let insert_b = tokio::spawn(async move {
         client_b
@@ -908,27 +933,27 @@ async fn the_servers_confirmed_position_never_races_ahead_of_what_we_acknowledge
                 &[],
             )
             .await
-            .expect("вставить большую транзакцию B");
+            .expect("insert large transaction B");
     });
 
-    // Опрашиваем СЕРВЕРНУЮ confirmed_flush_lsn против НАШЕЙ подтверждённой
-    // позиции, пока B в пути, до тех пор, пока B не придёт целиком по каналу
-    // (или пока не истечёт защитный таймаут). Транзакции короче 300 строк
-    // (все фоновые) пролетают мимо этого цикла — интересна только B.
-    // Порог — инвариант 1 (DECISIONS §1): `acked_lsn <= durable_lsn`, а то,
-    // что реально ушло серверу, обязано совпадать с тем, что мы сами решили
-    // подтвердить.
+    // Poll the SERVER'S confirmed_flush_lsn against OUR acknowledged
+    // position while B is in flight, until B arrives whole over the
+    // channel (or the safety timeout expires). Transactions shorter than
+    // 300 rows (all background ones) fly past this loop — only B matters.
+    // The threshold is invariant 1 (DECISIONS §1): `acked_lsn <=
+    // durable_lsn`, and what actually reached the server must match what
+    // we ourselves decided to acknowledge.
     let probe_client = common::connect(&conn).await;
     let mut max_gap_after_some_ack: i64 = -1;
     let tx_b = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             tokio::select! {
                 recv = tx_recv.recv() => {
-                    let tx = recv.expect("канал закрыт");
+                    let tx = recv.expect("channel closed");
                     if tx.changes.len() >= 300 {
                         return tx;
                     }
-                    // Фоновая транзакция — не то, что мы ждём, продолжаем опрос.
+                    // A background transaction — not what we're waiting for, keep polling.
                 }
                 _ = tokio::time::sleep(Duration::from_millis(15)) => {
                     let row = probe_client
@@ -944,19 +969,20 @@ async fn the_servers_confirmed_position_never_races_ahead_of_what_we_acknowledge
                         continue;
                     };
                     let ours = Lsn(metrics.snapshot().last_acknowledged_lsn);
-                    // Сверяем только ПОСЛЕ хотя бы одного подтверждения
-                    // НАШИМ процессом (ours > 0): у свежесозданного слота
-                    // confirmed_flush_lsn уже стоит на позиции создания (не
-                    // на нуле), и до первого вызова acknowledge_durable
-                    // сравнение с ours=0 ничего не проверяет про сам вызов.
+                    // Only check AFTER at least one acknowledgement from
+                    // OUR process (ours > 0): a freshly created slot's
+                    // confirmed_flush_lsn already sits at the creation
+                    // position (not at zero), and before the first call to
+                    // acknowledge_durable, comparing against ours=0 proves
+                    // nothing about the call itself.
                     if ours.0 == 0 {
                         continue;
                     }
                     assert!(
                         server_confirmed <= ours,
-                        "сервер подтвердил {server_confirmed}, а мы реально признали только \
-                         {ours} — позиция, ушедшая на провод, обогнала то, что мы сами решили \
-                         подтвердить"
+                        "the server acknowledged {server_confirmed}, but we actually \
+                         acknowledged only {ours} — the position that went out on the wire \
+                         got ahead of what we ourselves decided to acknowledge"
                     );
                     let received = metrics.snapshot().last_received_lsn as i64;
                     let gap = received - ours.0 as i64;
@@ -968,30 +994,31 @@ async fn the_servers_confirmed_position_never_races_ahead_of_what_we_acknowledge
         }
     })
     .await
-    .expect("транзакция B должна приехать за 30 секунд");
+    .expect("transaction B should arrive within 30 seconds");
 
     bg_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     insert_b
         .await
-        .expect("вставка B не должна была запаниковать");
+        .expect("inserting B should not have panicked");
     bg_task
         .await
-        .expect("фоновая задача не должна была запаниковать");
+        .expect("the background task should not have panicked");
 
     assert!(
         max_gap_after_some_ack >= 1_000_000,
-        "тест обязан был застать received заметно впереди уже подтверждённого (замечено \
-         {max_gap_after_some_ack} байт) — иначе большая транзакция передалась быстрее, чем \
-         фоновые вставки создавали новые подтверждения, и окно гонки не было пройдено; \
-         увеличьте размер B, участите фоновые вставки или уменьшите ack_interval_ms"
+        "the test must have caught received noticeably ahead of what was already acknowledged \
+         (observed {max_gap_after_some_ack} bytes) — otherwise the large transaction transferred \
+         faster than the background inserts created new acknowledgements, and the race window \
+         was not exercised; increase B's size, make background inserts more frequent, or \
+         decrease ack_interval_ms"
     );
 
-    // Финальная сверка: слот в итоге догоняет B целиком, и не спорит с тем,
-    // что мы реально подтвердили.
+    // Final check: the slot eventually catches up with B in full, and does
+    // not disagree with what we actually acknowledged.
     let confirmed = common::wait_for_slot_at_least(&client, "pgcdc_slot", tx_b.end_lsn).await;
     assert!(
         confirmed >= tx_b.end_lsn,
-        "слот обязан догнать B: {confirmed} < {}",
+        "the slot must catch up with B: {confirmed} < {}",
         tx_b.end_lsn
     );
 
@@ -1000,9 +1027,9 @@ async fn the_servers_confirmed_position_never_races_ahead_of_what_we_acknowledge
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_barrier_leaves_the_acknowledged_counter_at_zero() {
-    // Формулировка Q23 дословно: «после sink-failure last_acknowledged_lsn
-    // не сдвинулся». Раньше это можно было проверить только по слоту;
-    // теперь видно и наше собственное решение.
+    // Q23's wording verbatim: "after a sink failure, last_acknowledged_lsn
+    // has not moved". Previously this could only be checked via the slot;
+    // now our own decision is visible too.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1022,41 +1049,43 @@ async fn a_failing_barrier_leaves_the_acknowledged_counter_at_zero() {
 
     let result = tokio::time::timeout(Duration::from_secs(20), handle)
         .await
-        .expect("run должен завершиться, а не висеть")
+        .expect("run should finish, not hang")
         .expect("join");
     assert!(matches!(result.unwrap_err(), PgcdcError::Sink(_)));
 
     let snap = metrics.snapshot();
     assert_eq!(
         snap.last_acknowledged_lsn, 0,
-        "барьер не прошёл — подтверждать нечего"
+        "the barrier did not go through — there is nothing to acknowledge"
     );
     assert!(
         snap.transactions_total >= 1,
-        "но транзакция была принята и посчитана"
+        "but the transaction was accepted and counted"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error() {
-    // I2: "JSONL на stdout, логи на stderr" — поведенчески верно, но ничего не
-    // упало бы при регрессии. `--help` для этого не годится: он не проходит ни
-    // одной ветки, которая логирует. Отсутствующий слот — детерминированный и
-    // быстрый способ гарантированно попасть в ветку логирования: guard падает
-    // до первого события репликации, без ожидания INSERT и без гонок по времени.
+    // I2: "JSONL on stdout, logs on stderr" is behaviorally correct, but
+    // nothing would have failed on a regression. `--help` doesn't work for
+    // this: it doesn't go through any branch that logs. A missing slot is a
+    // deterministic and fast way to guaranteedly hit the logging branch:
+    // the guard fails before the first replication event, with no need to
+    // wait for an INSERT and no timing races.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
-    // Слот намеренно не создаём.
+    // The slot is intentionally not created.
 
-    // tokio::process::Command, не std + spawn_blocking: с std, если таймаут
-    // ниже срабатывает, отменяется только ожидание join-хендла — блокирующий
-    // поток внутри cmd.output() и сам осиротевший дочерний процесс продолжают
-    // жить. Теперь, когда процесс умеет ретраить реконнект бесконечно, такой
-    // сирота никогда не завершается сам и вешает весь тестовый бинарь при
-    // выключении рантайма (review Task 2, round 1, F9). kill_on_drop(true)
-    // даёт нам хендл, который убивает процесс, если future отменяется по
-    // таймауту: async Child, в отличие от std, дропается вместе с future.
+    // tokio::process::Command, not std + spawn_blocking: with std, if the
+    // timeout below fires, only waiting on the join handle gets cancelled —
+    // the blocking thread inside cmd.output() and the orphaned child
+    // process itself keep living. Now that the process retries reconnecting
+    // forever, such an orphan never finishes on its own and hangs the
+    // whole test binary on runtime shutdown (review Task 2, round 1, F9).
+    // kill_on_drop(true) gives us a handle that kills the process if the
+    // future is cancelled by the timeout: an async Child, unlike std, gets
+    // dropped along with the future.
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"));
     cmd.env("PGCDC_DATABASE_URL", &conn)
         .env("PGCDC_PUBLICATION", "pgcdc_pub")
@@ -1064,41 +1093,45 @@ async fn stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let child = cmd.spawn().expect("запустить pgcdc");
+    let child = cmd.spawn().expect("spawn pgcdc");
 
     let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
         .await
-        .expect("бинарь должен завершиться за 20 секунд")
-        .expect("дождаться завершения pgcdc");
+        .expect("the binary should finish within 20 seconds")
+        .expect("wait for pgcdc to finish");
 
     assert!(
         !output.status.success(),
-        "отсутствующий слот обязан быть фатальным для реального бинаря"
+        "a missing slot must be fatal for the real binary"
     );
 
-    let stdout = String::from_utf8(output.stdout).expect("stdout должен быть валидным UTF-8");
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
     assert!(
         stdout.is_empty(),
-        "stdout обязан остаться пустым при фатальной ошибке старта, получили: {stdout:?}"
+        "stdout must stay empty on a fatal startup error, got: {stdout:?}"
     );
-    // Пустых строк тут не будет, но это ассерт-на-будущее: если когда-нибудь в
-    // stdout протечёт нежурнальный текст, он не пройдёт как JSON и тест покраснеет.
+    // There will be no lines here at this point, but this is a
+    // future-proofing assertion: if non-journal text ever leaks into
+    // stdout, it will not parse as JSON and the test will fail red.
     for line in stdout.lines() {
         serde_json::from_str::<serde_json::Value>(line)
-            .unwrap_or_else(|e| panic!("строка stdout не является JSON: {line:?}: {e}"));
+            .unwrap_or_else(|e| panic!("stdout line is not JSON: {line:?}: {e}"));
     }
 
-    let stderr = String::from_utf8(output.stderr).expect("stderr должен быть валидным UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be valid UTF-8");
     assert!(
-        stderr.contains("slot") || stderr.contains("слот"),
-        "stderr должен сообщить об отсутствующем слоте, получили: {stderr}"
+        // Error text lives in src/error.rs and is English-only, so a
+        // Russian fallback here would never match — a dead branch, removed.
+        stderr.contains("slot"),
+        "stderr should report the missing slot, got: {stderr}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn libpq_connection_string_is_rejected_without_echoing_the_password() {
-    // Отвергать такую строку мы научились в этапе 1, но clap печатал её целиком
-    // в тексте своей ошибки. Здесь проверяется именно отсутствие эха.
+    // We learned to reject such a string in stage 1, but clap used to
+    // print it in full in its error text. This specifically checks the
+    // absence of that echo.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
         .args([
             "--database-url",
@@ -1109,29 +1142,29 @@ async fn libpq_connection_string_is_rejected_without_echoing_the_password() {
             "pgcdc_slot",
         ])
         .output()
-        .expect("запустить бинарь");
+        .expect("spawn the binary");
 
     assert!(
         !output.status.success(),
-        "невалидный URL обязан давать ненулевой код"
+        "an invalid URL must produce a nonzero exit code"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.is_empty(), "stdout несёт только полезную нагрузку");
+    assert!(stdout.is_empty(), "stdout carries only the payload");
     assert!(
         !stderr.contains("SUPERSECRET_XYZZY"),
-        "пароль не должен появляться в stderr: {stderr}"
+        "the password must not appear in stderr: {stderr}"
     );
     assert!(
         stderr.contains("postgres://"),
-        "сообщение должно подсказывать нужную форму: {stderr}"
+        "the message should hint at the expected form: {stderr}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn file_output_without_a_path_is_rejected_by_the_binary() {
-    // Проверяется поведение бинаря целиком: clap разбирает конфигурацию,
-    // а решение об обязательности пути принимает main.
+    // Checks the behavior of the whole binary: clap parses the
+    // configuration, and main decides whether the path is required.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
         .args([
             "--database-url",
@@ -1144,14 +1177,14 @@ async fn file_output_without_a_path_is_rejected_by_the_binary() {
             "file",
         ])
         .output()
-        .expect("запустить бинарь");
+        .expect("spawn the binary");
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.is_empty(), "stdout несёт только полезную нагрузку");
+    assert!(stdout.is_empty(), "stdout carries only the payload");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("--output-path"),
-        "сообщение называет недостающий флаг: {stderr}"
+        "the message names the missing flag: {stderr}"
     );
 }
 
@@ -1160,12 +1193,12 @@ async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
-    // Слот намеренно НЕ создаём.
+    // The slot is intentionally NOT created.
 
-    // Слот сейчас классифицирован как немедленно фатальный, но run() теперь
-    // умеет ретраить бесконечно на восстановимых ошибках — без таймаута этот
-    // await навсегда повесил бы тест, если бы классификация когда-нибудь
-    // сломалась (review Task 2, round 1, F9).
+    // The slot is currently classified as immediately fatal, but run() can
+    // now retry forever on recoverable errors — without the timeout, this
+    // await would hang the test forever if the classification ever broke
+    // (review Task 2, round 1, F9).
     let err = tokio::time::timeout(
         Duration::from_secs(20),
         pgcdc::postgres::replication::run(
@@ -1175,7 +1208,7 @@ async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
         ),
     )
     .await
-    .expect("run должен завершиться, а не висеть")
+    .expect("run should finish, not hang")
     .unwrap_err();
     assert!(matches!(err, PgcdcError::SlotMissing { .. }));
     assert!(err.is_fatal());
@@ -1186,29 +1219,30 @@ async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
         .unwrap();
     assert!(
         rows.is_empty(),
-        "слот не создан — иначе мы маскировали бы потерю данных"
+        "the slot must not be created — otherwise we would be masking data loss"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slot_with_a_foreign_output_plugin_is_fatal_and_the_process_exits() {
-    // C1 (review round after task 4): §20 п.14 требует ненулевой код выхода,
-    // когда слот отсутствует ИЛИ непригоден. "Отсутствует" покрывает
-    // missing_slot_is_fatal_and_the_slot_is_not_created выше;
-    // "непригоден" не был покрыт вовсе — слот, на котором START_REPLICATION
-    // получает явный отказ сервера, попадал в PgcdcError::Connection и уходил
-    // в вечный реконнект без единого ненулевого кода выхода.
+    // C1 (review round after task 4): §20 item 14 requires a nonzero exit
+    // code when the slot is either missing OR unusable. "Missing" is
+    // covered by missing_slot_is_fatal_and_the_slot_is_not_created above;
+    // "unusable" wasn't covered at all — a slot where START_REPLICATION
+    // gets an explicit server refusal fell into PgcdcError::Connection and
+    // went into an endless reconnect with no nonzero exit code whatsoever.
     //
-    // Дешёвая ветка непригодности: слот создан с чужим output-плагином
-    // (`test_decoding` вместо `pgoutput`). Существование слота проходит
-    // preflight (он не смотрит на плагин), а START_REPLICATION отвечает
-    // "option \"proto_version\" = \"1\" is unknown" (SQLSTATE 22023) — тот же
-    // конверт ошибки (сервер ОТВЕТИЛ и отказал), что и настоящая инвалидация
-    // по объёму удержанного WAL, но без необходимости прогонять гигабайты
-    // WAL, чтобы её спровоцировать.
+    // A cheap unusable branch: the slot is created with a foreign output
+    // plugin (`test_decoding` instead of `pgoutput`). The slot's existence
+    // passes preflight (it doesn't look at the plugin), and
+    // START_REPLICATION replies "option \"proto_version\" = \"1\" is
+    // unknown" (SQLSTATE 22023) — the same error envelope (the server
+    // RESPONDED and refused) as a genuine invalidation from the amount of
+    // retained WAL, but without needing to push gigabytes of WAL through
+    // to provoke it.
     //
-    // Гоняем настоящий скомпилированный бинарь, а не run() in-process: пункт
-    // 14 чек-листа — про код выхода ПРОЦЕССА, а не про Result библиотеки.
+    // We run the real compiled binary, not run() in-process: checklist item
+    // 14 is about the PROCESS exit code, not about the library's Result.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1218,7 +1252,7 @@ async fn slot_with_a_foreign_output_plugin_is_fatal_and_the_process_exits() {
             &[&"pgcdc_slot"],
         )
         .await
-        .expect("создать слот с чужим output-плагином");
+        .expect("create a slot with a foreign output plugin");
 
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"));
     cmd.env("PGCDC_DATABASE_URL", &conn)
@@ -1226,61 +1260,62 @@ async fn slot_with_a_foreign_output_plugin_is_fatal_and_the_process_exits() {
         .env("PGCDC_SLOT", "pgcdc_slot")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        // async Child, а не std + spawn_blocking: если таймаут ниже
-        // сработает, kill_on_drop(true) действительно убьёт процесс, вместо
-        // того чтобы оставить его вечно реконнектящейся сиротой (тот же
-        // приём, что и в stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error).
+        // async Child, not std + spawn_blocking: if the timeout below
+        // fires, kill_on_drop(true) will actually kill the process instead
+        // of leaving it as an endlessly reconnecting orphan (the same
+        // technique as in stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error).
         .kill_on_drop(true);
-    let child = cmd.spawn().expect("запустить pgcdc");
+    let child = cmd.spawn().expect("spawn pgcdc");
 
     let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
         .await
-        .expect("процесс обязан завершиться за 20 секунд, а не уйти в вечный реконнект")
-        .expect("дождаться завершения pgcdc");
+        .expect("the process must finish within 20 seconds, not go into an endless reconnect")
+        .expect("wait for pgcdc to finish");
 
     assert!(
         !output.status.success(),
-        "непригодный (чужой плагин) слот обязан быть фатальным для реального бинаря"
+        "an unusable (foreign plugin) slot must be fatal for the real binary"
     );
     assert_eq!(
         output.status.code(),
         Some(1),
-        "фатальная ошибка обязана давать код выхода 1 (DECISIONS Q22)"
+        "a fatal error must produce exit code 1 (DECISIONS Q22)"
     );
 
-    let stdout = String::from_utf8(output.stdout).expect("stdout должен быть валидным UTF-8");
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
     assert!(
         stdout.is_empty(),
-        "stdout обязан остаться пустым при фатальной ошибке старта, получили: {stdout:?}"
+        "stdout must stay empty on a fatal startup error, got: {stdout:?}"
     );
 
-    let stderr = String::from_utf8(output.stderr).expect("stderr должен быть валидным UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be valid UTF-8");
     assert!(
         stderr.contains("slot_unusable"),
-        "stderr обязан назвать причину машиночитаемой меткой error_kind, получили: {stderr}"
+        "stderr must name the reason via the machine-readable error_kind label, got: {stderr}"
     );
     assert!(
         !stderr.contains("reconnecting"),
-        "фатальный отказ сервера обязан остановить процесс, а не уйти в цикл реконнекта: {stderr}"
+        "a fatal server refusal must stop the process, not send it into a reconnect loop: {stderr}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slot_busy_with_our_own_prior_session_is_recoverable_not_fatal() {
-    // Обратная сторона C1: сервер ТОЖЕ отвечает отказом на START_REPLICATION
-    // ("replication slot ... is active for PID ...", ERRCODE_OBJECT_IN_USE),
-    // но это не про непригодность слота — конкурентный читатель ещё держит
-    // его. Наивный "любой отказ сервера фатален" сломал бы обычный реконнект:
-    // после разрыва наша же предыдущая сессия может на мгновение не успеть
-    // отпустить слот раньше, чем новая сессия попробует его перехватить.
+    // The flip side of C1: the server ALSO responds with a refusal on
+    // START_REPLICATION ("replication slot ... is active for PID ...",
+    // ERRCODE_OBJECT_IN_USE), but this isn't about the slot being unusable
+    // — a concurrent reader is still holding it. A naive "any server
+    // refusal is fatal" would break ordinary reconnecting: after a drop,
+    // our own previous session might momentarily fail to release the slot
+    // before a new session tries to grab it.
     //
-    // Здесь гонка сделана детерминированной: отдельный pg_walstream держит
-    // слот занятым ДО того, как pgcdc вообще запускается, — первая попытка
-    // pgcdc гарантированно получает "is active for PID", а не что-то ещё.
-    // Если классификация когда-нибудь станет "любой отказ сервера фатален",
-    // этот тест покраснеет детерминированно: run() вернёт SlotUnusable на
-    // первой же попытке, канал закроется, и recv() ниже получит None вместо
-    // транзакции.
+    // Here the race is made deterministic: a separate pg_walstream holds
+    // the slot busy BEFORE pgcdc even starts — pgcdc's first attempt is
+    // guaranteed to get "is active for PID" and nothing else. If the
+    // classification ever becomes "any server refusal is fatal", this test
+    // fails red deterministically: run() will return SlotUnusable on the
+    // very first attempt, the channel will close, and recv() below will
+    // get None instead of a transaction.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1301,11 +1336,11 @@ async fn slot_busy_with_our_own_prior_session_is_recoverable_not_fatal() {
     let blocker_url = format!("{conn}?replication=database");
     let mut blocker = pg_walstream::LogicalReplicationStream::new(&blocker_url, blocker_config)
         .await
-        .expect("открыть блокирующее соединение");
+        .expect("open the blocking connection");
     blocker
         .start(None)
         .await
-        .expect("блокирующее соединение обязано первым захватить слот");
+        .expect("the blocking connection must grab the slot first");
 
     let cfg = config(&conn);
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
@@ -1318,11 +1353,12 @@ async fn slot_busy_with_our_own_prior_session_is_recoverable_not_fatal() {
         .await
     });
 
-    // Дать pgcdc реально наткнуться на занятый слот хотя бы раз (100мс —
-    // reconnect_initial_ms по умолчанию из config()), прежде чем освободить
-    // его. Drop блокирующего потока на multi-thread рантайме синхронно шлёт
-    // CopyDone+Terminate (pg_walstream::connection::native, close_connection),
-    // так что слот освобождается раньше, чем drop() возвращает управление.
+    // Let pgcdc actually run into the busy slot at least once (100ms —
+    // the default reconnect_initial_ms from config()) before releasing it.
+    // Dropping the blocking stream on a multi-thread runtime synchronously
+    // sends CopyDone+Terminate (pg_walstream::connection::native,
+    // close_connection), so the slot is released before drop() returns
+    // control.
     tokio::time::sleep(Duration::from_millis(500)).await;
     drop(blocker);
 
@@ -1333,8 +1369,8 @@ async fn slot_busy_with_our_own_prior_session_is_recoverable_not_fatal() {
 
     let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
         .await
-        .expect("pgcdc обязан довести реконнект до конца, а не застрять или упасть")
-        .expect("канал закрыт — run() завершился ошибкой вместо ретрая");
+        .expect("pgcdc must carry the reconnect through to completion, not get stuck or fail")
+        .expect("channel closed — run() finished with an error instead of retrying");
     assert_eq!(tx.changes.len(), 1);
 
     handle.abort();
@@ -1342,22 +1378,23 @@ async fn slot_busy_with_our_own_prior_session_is_recoverable_not_fatal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slot_busy_forever_exhausts_the_patience_budget_and_the_process_exits_nonzero() {
-    // Обратная сторона гонки выше (slot_busy_with_our_own_prior_session_is_recoverable_not_fatal):
-    // слот, занятый ЧУЖИМ потребителем НАВСЕГДА, отвечает буквально тем же
-    // SQLSTATE 55006 — по коду состояния эти два случая неотличимы (см. §
-    // "Что осталось открытым" в task-4-report.md по задаче 4, п.3, и
-    // подробный разбор у classify_start_error/SlotBusyPatience в
-    // src/postgres/replication.rs). Единственный физический различитель —
-    // ДЛИТЕЛЬНОСТЬ: наша прошлая сессия отпускает слот за десятки
-    // миллисекунд (измерено), чужой потребитель — нет. Здесь блокирующее
-    // соединение держит слот и НЕ освобождается на протяжении всего теста;
-    // с маленьким бюджетом терпения процесс обязан исчерпать его и
-    // завершиться ненулевым кодом, а не уйти в вечный реконнект — именно
-    // это было воспроизведено вручную (34 цикла, ни одного ненулевого
-    // кода выхода) в отчёте по задаче 4.
+    // The flip side of the race above (slot_busy_with_our_own_prior_session_is_recoverable_not_fatal):
+    // a slot held busy by a FOREIGN consumer FOREVER responds with literally
+    // the same SQLSTATE 55006 — by status code alone the two cases are
+    // indistinguishable (see the "What's Left Open" section in
+    // task-4-report.md for task 4, item 3, and the detailed breakdown at
+    // classify_start_error/SlotBusyPatience in
+    // src/postgres/replication.rs). The only physical discriminator is
+    // DURATION: our own prior session releases the slot within tens of
+    // milliseconds (measured), a foreign consumer does not. Here a blocking
+    // connection holds the slot and does NOT release it for the whole
+    // test; with a small patience budget the process must exhaust it and
+    // exit with a nonzero code instead of going into an endless reconnect
+    // — exactly this was reproduced by hand (34 cycles, not a single
+    // nonzero exit code) in the task 4 report.
     //
-    // Гоняем настоящий скомпилированный бинарь: пункт 14 чек-листа — про код
-    // выхода ПРОЦЕССА, а не про Result библиотеки.
+    // We run the real compiled binary: checklist item 14 is about the
+    // PROCESS exit code, not about the library's Result.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1378,89 +1415,91 @@ async fn slot_busy_forever_exhausts_the_patience_budget_and_the_process_exits_no
     let blocker_url = format!("{conn}?replication=database");
     let mut blocker = pg_walstream::LogicalReplicationStream::new(&blocker_url, blocker_config)
         .await
-        .expect("открыть блокирующее соединение");
+        .expect("open the blocking connection");
     blocker
         .start(None)
         .await
-        .expect("блокирующее соединение обязано захватить слот и не отпускать его вовсе");
+        .expect("the blocking connection must grab the slot and never release it");
 
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"));
     cmd.env("PGCDC_DATABASE_URL", &conn)
         .env("PGCDC_PUBLICATION", "pgcdc_pub")
         .env("PGCDC_SLOT", "pgcdc_slot")
-        // Быстрый бэкофф и маленький бюджет — чтобы терпение исчерпалось за
-        // сотни миллисекунд, а не за настоящие 30 секунд умолчания.
+        // A fast backoff and a small budget — so patience runs out within
+        // hundreds of milliseconds instead of the real default 30 seconds.
         .env("PGCDC_RECONNECT_INITIAL_MS", "20")
         .env("PGCDC_RECONNECT_MAX_MS", "50")
         .env("PGCDC_SLOT_BUSY_BUDGET_MS", "300")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        // kill_on_drop: если таймаут ниже сработает (терпение почему-то не
-        // исчерпалось), процесс не осиротеет вечно реконнектящимся.
+        // kill_on_drop: if the timeout below fires (patience somehow did
+        // not run out), the process will not be orphaned reconnecting forever.
         .kill_on_drop(true);
-    let child = cmd.spawn().expect("запустить pgcdc");
+    let child = cmd.spawn().expect("spawn pgcdc");
 
     let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
         .await
         .expect(
-            "процесс обязан исчерпать бюджет терпения и завершиться, а не уйти в вечный реконнект",
+            "the process must exhaust the patience budget and finish, not go into an endless reconnect",
         )
-        .expect("дождаться завершения pgcdc");
+        .expect("wait for pgcdc to finish");
 
-    // Держим блокирующее соединение живым до этой точки: слот обязан
-    // оставаться занятым весь тест, иначе это тестировало бы обычную гонку
-    // (уже покрытую тестом выше), а не вечно занятый слот.
+    // Keep the blocking connection alive up to this point: the slot must
+    // stay busy for the whole test, otherwise this would be testing the
+    // ordinary race (already covered by the test above), not a
+    // permanently busy slot.
     drop(blocker);
 
     assert!(
         !output.status.success(),
-        "вечно занятый чужим потребителем слот обязан быть фатальным по исчерпании бюджета терпения"
+        "a slot permanently held busy by a foreign consumer must be fatal once the patience budget is exhausted"
     );
     assert_eq!(
         output.status.code(),
         Some(1),
-        "фатальная ошибка обязана давать код выхода 1 (DECISIONS Q22)"
+        "a fatal error must produce exit code 1 (DECISIONS Q22)"
     );
 
-    let stdout = String::from_utf8(output.stdout).expect("stdout должен быть валидным UTF-8");
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
     assert!(
         stdout.is_empty(),
-        "stdout обязан остаться пустым при фатальной ошибке старта, получили: {stdout:?}"
+        "stdout must stay empty on a fatal startup error, got: {stdout:?}"
     );
 
-    let stderr = String::from_utf8(output.stderr).expect("stderr должен быть валидным UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be valid UTF-8");
     assert!(
         stderr.contains("slot_busy_timed_out"),
-        "stderr обязан назвать причину машиночитаемой меткой error_kind, получили: {stderr}"
+        "stderr must name the reason via the machine-readable error_kind label, got: {stderr}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reconnect_zeroes_the_buffer_gauge_at_the_run_call_site() {
-    // M4 (review round after task 4): удаление вызова
-    // state.reset_for_reconnect(&metrics) из run() оставляет все остальные
-    // тесты зелёными — сама функция покрыта юнит-тестом
-    // (reconnect_zeroes_the_buffer_gauge_even_with_an_open_transaction в
-    // src/postgres/replication.rs), а её единственный вызов внутри run() —
-    // нет. README прямо обещает, что датчик размера буфера падает до нуля
-    // и на реконнекте тоже — этот тест пришпиливает именно вызов, а не саму
-    // функцию.
+    // M4 (review round after task 4): removing the call to
+    // state.reset_for_reconnect(&metrics) from run() leaves every other
+    // test green — the function itself is covered by a unit test
+    // (reconnect_zeroes_the_buffer_gauge_even_with_an_open_transaction in
+    // src/postgres/replication.rs), but its one call site inside run() is
+    // not. The README explicitly promises that the buffer-size gauge drops
+    // to zero on reconnect too — this test pins down that call site, not
+    // the function itself.
     //
-    // Две ловушки, из-за которых "просто разорвать соединение и проверить
-    // счётчик" не сработало бы:
-    // 1) Однострочная транзакция приходит одним куском (BEGIN+row+COMMIT
-    //    подряд) — окна, где буфер реально ненулевой, а COMMIT ещё не
-    //    пришёл, не существует. Транзакция здесь достаточно большая, чтобы
-    //    decode и передача заняли измеримое время, и тест ждёт (опросом, а
-    //    не сном наугад), пока датчик не станет положительным.
-    // 2) Сама следующая BEGIN переигранной транзакции обнулила бы `len()`
-    //    естественно (Assembler::handle перезаписывает открытую транзакцию
-    //    целиком, без явного reset) — без дополнительной меры мутация
-    //    "убрать reset_for_reconnect" осталась бы незамеченной, потому что
-    //    ноль появился бы всё равно, просто по другой причине. Слот здесь
-    //    держит занятым второй читатель сразу после обрыва, так что ни
-    //    один новый кадр не может прийти, пока блокировщик жив, — и ноль,
-    //    если он появится, может быть только от самого reset_for_reconnect.
+    // Two pitfalls that would make "just drop the connection and check the
+    // counter" not work:
+    // 1) A single-row transaction arrives as one chunk (BEGIN+row+COMMIT
+    //    back to back) — there's no window where the buffer is actually
+    //    nonzero while COMMIT hasn't arrived yet. The transaction here is
+    //    large enough that decoding and transfer take measurable time, and
+    //    the test waits (by polling, not a blind sleep) until the gauge
+    //    turns positive.
+    // 2) The very next BEGIN of the replayed transaction would zero out
+    //    `len()` naturally (Assembler::handle overwrites the whole open
+    //    transaction, with no explicit reset) — without an extra measure,
+    //    the mutation "remove reset_for_reconnect" would go unnoticed,
+    //    because zero would show up anyway, just for a different reason.
+    //    Here a second reader holds the slot busy right after the drop, so
+    //    no new frame can arrive while the blocker is alive — and any zero
+    //    that shows up can only come from reset_for_reconnect itself.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1469,9 +1508,9 @@ async fn reconnect_zeroes_the_buffer_gauge_at_the_run_call_site() {
     let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
     let (tx_send, _tx_recv) = mpsc::unbounded_channel();
     let mut cfg = config(&conn);
-    // Достаточно большой, чтобы блокировщик гарантированно успел захватить
-    // слот (гонится только с отсоединением старого backend'а на сервере, а
-    // не с этой попыткой) раньше, чем run() вообще попробует реконнект.
+    // Large enough that the blocker is guaranteed to grab the slot (racing
+    // only against the old backend disconnecting on the server, not
+    // against this attempt) before run() even tries to reconnect.
     cfg.reconnect_initial_ms = 2000;
     let m = metrics.clone();
     let handle = tokio::spawn(async move {
@@ -1499,15 +1538,15 @@ async fn reconnect_zeroes_the_buffer_gauge_at_the_run_call_site() {
     }
     assert!(
         caught_mid_transaction,
-        "тест не поймал транзакцию в процессе передачи — увеличьте объём вставки"
+        "the test did not catch the transaction in flight — increase the insert size"
     );
 
     common::terminate_replication_backend(&client).await;
 
-    // Захватить слот раньше, чем run() сам попробует реконнект (у него есть
-    // целых 2 секунды форы, cfg.reconnect_initial_ms выше). Гонка здесь —
-    // только с тем, сколько сервер отсоединяет старый backend после
-    // pg_terminate_backend, а не с pgcdc.
+    // Grab the slot before run() itself tries to reconnect (it has a full
+    // 2-second head start, cfg.reconnect_initial_ms above). The only race
+    // here is with how long the server takes to disconnect the old backend
+    // after pg_terminate_backend, not with pgcdc.
     let make_blocker_config = || {
         pg_walstream::ReplicationStreamConfig::new(
             "pgcdc_slot".to_string(),
@@ -1535,16 +1574,16 @@ async fn reconnect_zeroes_the_buffer_gauge_at_the_run_call_site() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let _blocker = blocker.expect("захватить слот блокировщиком раньше pgcdc не удалось");
+    let _blocker = blocker.expect("failed to grab the slot with the blocker before pgcdc");
 
-    // К этому моменту run() уже должен был пройти через backoff-паузу и
-    // reset_for_reconnect(), но не смочь получить ни одного нового кадра —
-    // слот занят блокировщиком.
+    // By this point run() should have already gone through the backoff
+    // pause and reset_for_reconnect(), but failed to get a single new
+    // frame — the slot is held by the blocker.
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(
         metrics.snapshot().transaction_buffer_size,
         0,
-        "датчик обязан упасть до нуля на реконнекте, даже пока слот занят и новых кадров нет"
+        "the gauge must drop to zero on reconnect, even while the slot is busy and there are no new frames"
     );
 
     handle.abort();
@@ -1552,9 +1591,9 @@ async fn reconnect_zeroes_the_buffer_gauge_at_the_run_call_site() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn changing_a_key_column_produces_a_key_only_before_image() {
-    // Единственная форма UPDATE, которой нет в замороженном захвате: тег 'K'.
-    // Юнит-тест проверяет её синтетическими байтами, то есть нашим пониманием
-    // разметки; здесь её выдаёт настоящий PostgreSQL.
+    // The one form of UPDATE not present in the frozen capture: the 'K'
+    // tag. The unit test checks it with synthetic bytes, i.e. our own
+    // understanding of the wire format; here it's produced by a real PostgreSQL.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1581,27 +1620,27 @@ async fn changing_a_key_column_produces_a_key_only_before_image() {
         .await
         .unwrap();
 
-    // Первая транзакция — INSERT, вторая — интересующий нас UPDATE.
+    // The first transaction is the INSERT, the second is the UPDATE we care about.
     let _insert_tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
         .await
-        .expect("insert должен приехать")
-        .expect("канал закрыт");
+        .expect("the insert should arrive")
+        .expect("channel closed");
     let update_tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
         .await
-        .expect("update должен приехать")
-        .expect("канал закрыт");
+        .expect("the update should arrive")
+        .expect("channel closed");
 
     let ev = &update_tx.changes[0];
     let json = serde_json::to_value(ev).unwrap();
     assert_eq!(json["operation"], "update");
     assert_eq!(
         json["before_kind"], "key",
-        "ключ менялся — сервер шлёт тег 'K'"
+        "the key changed — the server sends the 'K' tag"
     );
-    assert_eq!(json["before"]["id"], "10", "старое значение ключа");
+    assert_eq!(json["before"]["id"], "10", "the old key value");
     assert!(
         json["before"].get("title").is_none(),
-        "неключевые колонки сервер не прислал, и в before их быть не должно: {json}"
+        "the server did not send non-key columns, and before must not have them: {json}"
     );
     assert_eq!(json["after"]["id"], "11");
     assert_eq!(json["after"]["title"], "Widget");
@@ -1611,9 +1650,9 @@ async fn changing_a_key_column_produces_a_key_only_before_image() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_change_resends_relation_and_the_cache_takes_the_new_one() {
-    // pgoutput пересылает RELATION при инвалидации записи — например после DDL.
-    // Захват этапа 0 такого случая не содержит, а замена записи в кэше
-    // от этого поведения прямо зависит.
+    // pgoutput resends RELATION when a cache entry is invalidated — for
+    // example after DDL. Stage 0's capture doesn't contain such a case, and
+    // replacing the cache entry depends directly on this behavior.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1637,8 +1676,8 @@ async fn schema_change_resends_relation_and_the_cache_takes_the_new_one() {
         .unwrap();
     let first = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
         .await
-        .expect("первый insert")
-        .expect("канал закрыт");
+        .expect("the first insert")
+        .expect("channel closed");
     assert_eq!(first.changes[0].after.as_ref().unwrap().len(), 3);
 
     client
@@ -1652,10 +1691,14 @@ async fn schema_change_resends_relation_and_the_cache_takes_the_new_one() {
 
     let second = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
         .await
-        .expect("второй insert")
-        .expect("канал закрыт");
+        .expect("the second insert")
+        .expect("channel closed");
     let after = second.changes[0].after.as_ref().unwrap();
-    assert_eq!(after.len(), 4, "кэш обязан был принять новую схему");
+    assert_eq!(
+        after.len(),
+        4,
+        "the cache must have picked up the new schema"
+    );
     assert_eq!(after.get("note").unwrap(), "hello");
 
     handle.abort();
@@ -1663,12 +1706,13 @@ async fn schema_change_resends_relation_and_the_cache_takes_the_new_one() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn several_transactions_are_not_lost_and_the_slot_catches_up() {
-    // Название раньше обещало проверку группировки подтверждений, но
-    // ChannelSink отдаёт durable-позицию на КАЖДОМ вызове flush независимо от
-    // того, сколько транзакций накопилось, — этому дублёру групповое и
-    // потранзакционное подтверждение неотличимы. Реально проверяемо здесь
-    // только то, что группировка не теряет транзакции и что слот в итоге
-    // догоняет последнюю доведённую позицию (review round 2, F3).
+    // The name used to promise a check of acknowledgement grouping, but
+    // ChannelSink reports a durable position on EVERY flush call
+    // regardless of how many transactions accumulated — for this test
+    // double, grouped and per-transaction acknowledgement are
+    // indistinguishable. What is actually checked here is only that
+    // grouping does not lose transactions and that the slot eventually
+    // catches up with the last delivered position (review round 2, F3).
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1700,18 +1744,18 @@ async fn several_transactions_are_not_lost_and_the_slot_catches_up() {
     for _ in 0..5 {
         let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
             .await
-            .expect("все пять транзакций должны приехать")
-            .expect("канал закрыт");
+            .expect("all five transactions should arrive")
+            .expect("channel closed");
         seen.push(tx.end_lsn);
     }
-    assert_eq!(seen.len(), 5, "группировка не теряет транзакции");
+    assert_eq!(seen.len(), 5, "grouping does not lose transactions");
 
-    // Слот обязан догнать последнюю доведённую позицию.
+    // The slot must catch up with the last delivered position.
     let last = seen.last().copied().unwrap();
     let confirmed = common::wait_for_slot_at_least(&client, "pgcdc_slot", last).await;
     assert!(
         confirmed >= last,
-        "слот догнал последнюю группу: {confirmed} < {last}"
+        "the slot caught up with the last group: {confirmed} < {last}"
     );
 
     handle.abort();
@@ -1719,15 +1763,15 @@ async fn several_transactions_are_not_lost_and_the_slot_catches_up() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slot_advances_while_the_publication_is_idle() {
-    // Классическая проблема: пишут в таблицы вне публикации, нам не приходит
-    // ни одного события, слот стоит, WAL растёт. Продвижение по keepalive
-    // существует ровно ради этого.
+    // A classic problem: writes go to tables outside the publication, we
+    // never receive a single event, the slot stands still, WAL grows.
+    // Keepalive-based advancement exists precisely for this.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
     common::create_slot(&client, "pgcdc_slot").await;
 
-    // Таблица ВНЕ публикации: записи в неё двигают WAL, но не порождают событий.
+    // A table OUTSIDE the publication: writes to it move WAL forward but produce no events.
     client
         .batch_execute("CREATE TABLE public.noise (id BIGINT PRIMARY KEY, payload TEXT)")
         .await
@@ -1759,12 +1803,12 @@ async fn slot_advances_while_the_publication_is_idle() {
         .await
         .unwrap()
         .get(0);
-    let target = common::parse_lsn(&target).expect("позиция сервера");
+    let target = common::parse_lsn(&target).expect("server position");
 
     let confirmed = common::wait_for_slot_at_least(&client, "pgcdc_slot", target).await;
     assert!(
         confirmed >= target,
-        "слот обязан догнать сервер на простаивающей публикации: {confirmed} < {target}"
+        "the slot must catch up with the server on an idle publication: {confirmed} < {target}"
     );
 
     handle.abort();
@@ -1772,13 +1816,15 @@ async fn slot_advances_while_the_publication_is_idle() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
-    // FlushFailsSink, не дублёр, который падает безусловно (review round 2,
-    // F2): тот проваливал барьер и на ПУСТОМ тике тоже, обрывая run() ошибкой
-    // до первого write_transaction — INSERT ниже не успевал случиться, и
-    // ассерт «слот не сдвинулся» проходил бы, ничего не проверив про
-    // keepalive-ветку. FlushFailsSink отвечает Ok(None) на пустой барьер и
-    // падает только когда есть что подтверждать, так что запись реально
-    // доходит до sink'а, а падает только барьер — и слот обязан стоять.
+    // FlushFailsSink, not the test double that fails unconditionally
+    // (review round 2, F2): that one failed the barrier on an EMPTY tick
+    // too, aborting run() with an error before the first write_transaction
+    // — the INSERT below never got the chance to happen, and the "slot did
+    // not move" assertion would pass without checking anything about the
+    // keepalive branch. FlushFailsSink answers Ok(None) on an empty barrier
+    // and only fails when there is something to acknowledge, so the write
+    // really does reach the sink, and only the barrier fails — the slot
+    // must stand still.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1810,7 +1856,7 @@ async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
 
     let result = tokio::time::timeout(Duration::from_secs(20), handle)
         .await
-        .expect("run должен завершиться, а не висеть")
+        .expect("run should finish, not hang")
         .expect("join");
     assert!(matches!(result.unwrap_err(), PgcdcError::Sink(_)));
 
@@ -1822,31 +1868,35 @@ async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(before, after, "барьер не прошёл — слот не двигается");
+    assert_eq!(
+        before, after,
+        "the barrier did not go through — the slot does not move"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_connection_is_recovered_without_losing_rows() {
-    // Захватываем логи до старта run(): проверка ниже (F3) должна увидеть
-    // событие восстановления, а не просто угадать, что оно случилось.
+    // Capture logs before run() starts: the check below (F3) must see the
+    // recovery event, not just guess that it happened.
     let log_events = common::capture_log_events();
 
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
-    // M8: имя слота здесь уникально для этого теста, а не общее "pgcdc_slot",
-    // которым пользуется большинство соседей, — `log_events` копит сообщения
-    // ВСЕХ параллельно идущих тестов в одном процессе (общий глобальный
-    // буфер), и без уникального маркера в самом сообщении совпадение по
-    // тексту "postgres_connection_restored" ниже стало бы случайным поводом,
-    // а не доказательством, что реконнект произошёл именно здесь.
+    // M8: the slot name here is unique to this test, rather than the
+    // common "pgcdc_slot" most neighbors use — `log_events` accumulates
+    // messages from ALL tests running in parallel within one process (a
+    // shared global buffer), and without a unique marker inside the
+    // message itself, matching on the text "postgres_connection_restored"
+    // below would become a coincidence, not proof that a reconnect
+    // happened right here.
     let slot = "pgcdc_slot_recover_no_loss";
     common::create_slot(&client, slot).await;
 
-    // F5 (review Task 2, round 1): общий экземпляр, а не одноразовый — это
-    // единственный тест, который заведомо пересекает ветку реконнекта, и
-    // потому единственное мутационное покрытие, которое `reconnects_total`
-    // вообще когда-либо получит.
+    // F5 (review Task 2, round 1): a shared instance, not a throwaway one —
+    // this is the only test that is guaranteed to cross the reconnect
+    // branch, and hence the only mutation coverage `reconnects_total` will
+    // ever get at all.
     let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
     let mut cfg = config(&conn);
@@ -1862,8 +1912,8 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
         .unwrap();
     let first = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
         .await
-        .expect("первая транзакция")
-        .expect("канал закрыт");
+        .expect("the first transaction")
+        .expect("channel closed");
     assert_eq!(
         first.changes[0]
             .after
@@ -1874,16 +1924,18 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
         "before"
     );
 
-    // Ждём, пока наш собственный барьер доведёт первую транзакцию до durable
-    // и слот на сервере это подтвердит: канал отдаёт транзакцию сразу после
-    // write_transaction, а до durable/acked ещё нужно дождаться следующего
-    // тика барьера. Без этого обрыв ниже почти наверняка случится раньше
-    // первого flush, `state.durable()` останется нулём, is_reconnect()
-    // никогда не станет true, и весь блок проверки реконнекта останется
-    // непройденным этим тестом — ровно риск из review Task 2, round 1, F3.
+    // Wait for our own barrier to bring the first transaction to durable
+    // and for the slot on the server to acknowledge it: the channel
+    // delivers the transaction right after write_transaction, but reaching
+    // durable/acked still needs the next barrier tick. Without this, the
+    // drop below would almost certainly happen before the first flush,
+    // `state.durable()` would stay at zero, is_reconnect() would never
+    // become true, and the whole reconnect-check block would go
+    // unexercised by this test — exactly the risk from review Task 2,
+    // round 1, F3.
     common::wait_for_slot_at_least(&client, slot, first.end_lsn).await;
 
-    // Сервер обрывает наше репликационное соединение.
+    // The server drops our replication connection.
     common::terminate_replication_backend(&client).await;
 
     client
@@ -1891,8 +1943,9 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
         .await
         .unwrap();
 
-    // Строка, вставленная после обрыва, обязана приехать. Дубликат первой
-    // допустим и контрактом разрешён, поэтому ищем нужную, а не берём первую.
+    // The row inserted after the drop must arrive. A duplicate of the
+    // first row is acceptable and allowed by the contract, so we search
+    // for the one we need instead of taking the first one.
     let mut names = Vec::new();
     for _ in 0..5 {
         match tokio::time::timeout(Duration::from_secs(20), tx_recv.recv()).await {
@@ -1911,65 +1964,64 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
     }
     assert!(
         names.iter().any(|n| n == "after"),
-        "строка после обрыва не приехала, видели: {names:?}"
+        "the row after the drop did not arrive, saw: {names:?}"
     );
 
-    // F3: это headline-проверка задачи — check_reconnect действительно
-    // выполнился и recovery действительно залогирован, а не просто
-    // "строка как-то приехала". Удаление всего блока проверки реконнекта
-    // не тронуло бы ни одно из предыдущих утверждений в этом тесте.
+    // F3: this is the task's headline check — that check_reconnect
+    // actually ran and the recovery was actually logged, not just "the row
+    // somehow arrived". Deleting the whole reconnect-check block would not
+    // touch any of the earlier assertions in this test.
     //
-    // M8: сообщение обязано нести ИМЕННО наш `slot` — `log_events` общий на
-    // весь тестовый бинарь, и другой тест, доживший до успешного реконнекта,
-    // залогировал бы то же сообщение с ДРУГИМ именем слота. Сегодня
-    // единственный сосед-реконнект (`a_slot_advanced_past_our_durable_position_is_fatal_on_reconnect`)
-    // падает на check_reconnect раньше этого лога, так что без маркера
-    // совпадение по одному тексту сообщения ещё было бы (случайно) верным;
-    // с маркером оно перестаёт зависеть от этой хрупкой предпосылки.
+    // M8: the message must carry EXACTLY our `slot` — `log_events` is
+    // shared across the whole test binary, and another test that lives
+    // long enough for a successful reconnect would log the same message
+    // with a DIFFERENT slot name. Today the only reconnect neighbor
+    // (`a_slot_advanced_past_our_durable_position_is_fatal_on_reconnect`)
+    // fails at check_reconnect before this log line, so matching on the
+    // message text alone would still be (accidentally) correct without a
+    // marker; with the marker, it stops depending on that fragile assumption.
     let expected_log = format!("postgres_connection_restored slot={slot}");
     assert!(
         log_events.lock().unwrap().contains(&expected_log),
-        "событие восстановления соединения не залогировано для слота {slot}"
+        "the connection-restored event was not logged for slot {slot}"
     );
 
-    // F5 (review Task 2, round 1): к этой точке внешний цикл реконнекта уже
-    // прошёл хотя бы один полный оборот (доказано логом восстановления
-    // выше), так что счётчик обязан был продвинуться. Это единственная
-    // мутационная проверка, которую `reconnects_total` вообще получает —
-    // удаление или неверная привязка инкремента остались бы незамеченными
-    // всем остальным набором.
+    // F5 (review Task 2, round 1): by this point the outer reconnect loop
+    // has already made at least one full lap (proven by the restoration
+    // log above), so the counter must have advanced. This is the only
+    // mutation check `reconnects_total` gets at all — removing the
+    // increment or wiring it up wrong would go unnoticed by the rest of
+    // the suite.
     assert!(
         metrics.snapshot().reconnects_total >= 1,
-        "reconnects_total обязан был продвинуться после обрыва и восстановления"
+        "reconnects_total must have advanced after the drop and recovery"
     );
 
-    // F4: слот, пропавший во время обрыва, обязан быть фатальным немедленно,
-    // а не ретраиться бесконечно — иначе процесс сидел бы в цикле реконнекта,
-    // пока данные, которые он должен был захватить, не состарились в WAL.
+    // F4: a slot that disappears during a drop must be fatal immediately,
+    // not retried forever — otherwise the process would sit in the
+    // reconnect loop while the data it was supposed to capture aged out of WAL.
     common::terminate_replication_backend(&client).await;
     common::drop_slot_once_inactive(&client, slot).await;
 
     let result = tokio::time::timeout(Duration::from_secs(20), handle)
         .await
-        .expect("run должен упасть на пропавшем слоте, а не ретраиться вечно")
+        .expect("run must fail on a missing slot, not retry forever")
         .expect("join");
     let err = result.unwrap_err();
-    assert!(
-        matches!(err, PgcdcError::SlotMissing { .. }),
-        "получили {err:?}"
-    );
+    assert!(matches!(err, PgcdcError::SlotMissing { .. }), "got {err:?}");
     assert!(err.is_fatal());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slot_advanced_past_our_durable_position_is_fatal_on_reconnect() {
-    // Прямое доказательство, что check_reconnect() теперь ДЕЙСТВИТЕЛЬНО
-    // вызывается, а не просто существует нетронутым (review Task 2, round 1,
-    // F3). Тест из соседней функции этого не проверяет: там слот на обычном
-    // реконнекте либо точно совпадает с durable, либо отстаёт — асимметрию
-    // "слот ВПЕРЁД — фатально" ни разу не задевает. Здесь слот двигаем вручную
-    // через pg_replication_slot_advance мимо нашего sink — ровно тот случай,
-    // когда кто-то подтвердил WAL, который мы не записали.
+    // Direct proof that check_reconnect() is now ACTUALLY called, not just
+    // sitting there untouched (review Task 2, round 1, F3). The test in the
+    // neighboring function doesn't check this: there, on an ordinary
+    // reconnect, the slot either exactly matches durable or lags behind —
+    // it never touches the asymmetric case "the slot is AHEAD — fatal".
+    // Here we manually move the slot forward via
+    // pg_replication_slot_advance, past our sink — exactly the case where
+    // someone acknowledged WAL we never wrote.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1977,8 +2029,8 @@ async fn a_slot_advanced_past_our_durable_position_is_fatal_on_reconnect() {
 
     let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
     let mut cfg = config(&conn);
-    // Окно нужно, чтобы успеть продвинуть слот ДО того, как процесс сам
-    // предпримет попытку реконнекта.
+    // The window is needed to advance the slot BEFORE the process itself
+    // attempts to reconnect.
     cfg.reconnect_initial_ms = 3000;
     let handle = tokio::spawn(async move {
         pgcdc::postgres::replication::run(
@@ -1995,16 +2047,16 @@ async fn a_slot_advanced_past_our_durable_position_is_fatal_on_reconnect() {
         .unwrap();
     let first = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
         .await
-        .expect("первая транзакция")
-        .expect("канал закрыт");
-    // Durable должен реально стать ненулевым, иначе is_reconnect() на
-    // следующем подключении останется false и check_reconnect не вызовется.
+        .expect("the first transaction")
+        .expect("channel closed");
+    // Durable must actually become nonzero, otherwise is_reconnect() on
+    // the next connection stays false and check_reconnect never gets called.
     common::wait_for_slot_at_least(&client, "pgcdc_slot", first.end_lsn).await;
 
     common::terminate_replication_backend(&client).await;
     common::wait_until_slot_inactive(&client, "pgcdc_slot").await;
 
-    // Строка, которую наш (сейчас отключённый) sink никогда не увидит.
+    // A row our (now disconnected) sink will never see.
     client
         .execute("INSERT INTO users VALUES (2, 'ghost', NULL, NULL)", &[])
         .await
@@ -2016,10 +2068,11 @@ async fn a_slot_advanced_past_our_durable_position_is_fatal_on_reconnect() {
         .get(0);
     client
         .query(
-            // Двойное приведение, а не прямое $2::pg_lsn: иначе Postgres выводит
-            // тип плейсхолдера как pg_lsn напрямую, а tokio-postgres не умеет
-            // биндить в него `String` (WrongType). Через ::text::pg_lsn плейсхолдер
-            // остаётся текстовым для драйвера, а привод в pg_lsn происходит на сервере.
+            // A double cast, not a direct $2::pg_lsn: otherwise Postgres
+            // infers the placeholder's type as pg_lsn directly, and
+            // tokio-postgres can't bind a `String` into it (WrongType).
+            // Through ::text::pg_lsn the placeholder stays textual for the
+            // driver, and the cast to pg_lsn happens on the server.
             "SELECT * FROM pg_replication_slot_advance($1, $2::text::pg_lsn)",
             &[&"pgcdc_slot", &target],
         )
@@ -2028,23 +2081,21 @@ async fn a_slot_advanced_past_our_durable_position_is_fatal_on_reconnect() {
 
     let result = tokio::time::timeout(Duration::from_secs(20), handle)
         .await
-        .expect("run должен упасть на SlotAhead, а не тихо продолжить реконнект")
+        .expect("run must fail with SlotAhead, not silently continue reconnecting")
         .expect("join");
     let err = result.unwrap_err();
-    assert!(
-        matches!(err, PgcdcError::SlotAhead { .. }),
-        "получили {err:?}"
-    );
+    assert!(matches!(err, PgcdcError::SlotAhead { .. }), "got {err:?}");
     assert!(err.is_fatal());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn file_output_binary_writes_durable_json_lines() {
-    // Ветка `--output file` в main.rs ничем не покрыта: замени в match'e
-    // FileSink на StdoutSink — ни один тест не покраснеет. FileSink — единственный
-    // sink этапа, который честно обещает Fsync, и именно эта ветка бинаря его
-    // не проверяет вовсе (review round 2, F7). Гоняем настоящий бинарь целиком:
-    // CLI-разбор, guard, цикл репликации и файловый sink с fsync.
+    // The `--output file` branch in main.rs is completely uncovered:
+    // replace FileSink with StdoutSink in the match and no test fails red.
+    // FileSink is the stage's only sink that honestly promises Fsync, and
+    // this exact branch of the binary never exercises it at all (review
+    // round 2, F7). We run the real binary end to end: CLI parsing, guard,
+    // the replication loop, and the file sink with fsync.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -2065,7 +2116,7 @@ async fn file_output_binary_writes_durable_json_lines() {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("запустить бинарь"),
+            .expect("spawn the binary"),
     );
 
     client
@@ -2084,7 +2135,7 @@ async fn file_output_binary_writes_durable_json_lines() {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&path);
-            panic!("файл не получил ни одной строки за 20с");
+            panic!("the file got no lines within 20s");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
@@ -2094,9 +2145,9 @@ async fn file_output_binary_writes_durable_json_lines() {
     let _ = std::fs::remove_file(&path);
 
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 1, "один INSERT — одна строка: {text:?}");
+    assert_eq!(lines.len(), 1, "one INSERT — one line: {text:?}");
     let json: serde_json::Value =
-        serde_json::from_str(lines[0]).expect("строка файла — валидный JSON");
+        serde_json::from_str(lines[0]).expect("the file line is valid JSON");
     assert_eq!(json["operation"], "insert");
     assert_eq!(json["table"], "users");
     assert_eq!(json["after"]["id"], "1");
@@ -2105,8 +2156,8 @@ async fn file_output_binary_writes_durable_json_lines() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminated_process_exits_zero_after_draining() {
-    // Штатная остановка обязана давать ноль. Иначе супервизор будет
-    // бесконечно перезапускать процесс, который остановили намеренно.
+    // A graceful stop must produce zero. Otherwise a supervisor would keep
+    // endlessly restarting a process that was stopped intentionally.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -2130,7 +2181,7 @@ async fn a_terminated_process_exits_zero_after_draining() {
                 out.to_str().unwrap(),
             ])
             .spawn()
-            .expect("запустить бинарь"),
+            .expect("spawn the binary"),
     );
 
     client
@@ -2138,7 +2189,7 @@ async fn a_terminated_process_exits_zero_after_draining() {
         .await
         .unwrap();
 
-    // Ждём, пока строка окажется в файле, — значит процесс дошёл до барьера.
+    // Wait until the line shows up in the file — that means the process reached the barrier.
     let mut seen = false;
     for _ in 0..200 {
         if std::fs::read_to_string(&out)
@@ -2150,23 +2201,27 @@ async fn a_terminated_process_exits_zero_after_draining() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(seen, "строка не появилась в файле за 20 секунд");
+    assert!(
+        seen,
+        "the line did not appear in the file within 20 seconds"
+    );
 
-    // SIGTERM, а не kill: проверяем именно штатное завершение.
+    // SIGTERM, not kill: we're specifically checking the graceful shutdown.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let status = tokio::task::spawn_blocking(move || child.wait())
         .await
         .unwrap()
         .expect("wait");
-    assert_eq!(status.code(), Some(0), "штатная остановка даёт ноль");
+    assert_eq!(status.code(), Some(0), "a graceful stop gives zero");
 
     let _ = std::fs::remove_file(&out);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transaction_over_the_limit_is_fatal_and_the_slot_stays_put() {
-    // Лимит не чинит цикл рестартов на гигантской транзакции — он меняет
-    // диагностику с «убит по памяти» на внятное сообщение (DECISIONS Q7).
+    // The limit doesn't fix a restart loop on a giant transaction — it
+    // changes the diagnostic from "killed for memory" to an intelligible
+    // message (DECISIONS Q7).
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -2203,16 +2258,16 @@ async fn a_transaction_over_the_limit_is_fatal_and_the_slot_stays_put() {
 
     let result = tokio::time::timeout(Duration::from_secs(20), handle)
         .await
-        .expect("run должен завершиться, а не висеть")
+        .expect("run should finish, not hang")
         .expect("join");
     let err = result.unwrap_err();
     assert!(
         matches!(err, PgcdcError::TransactionTooLarge { limit: 2 }),
-        "получили {err:?}"
+        "got {err:?}"
     );
     assert!(
         err.is_fatal(),
-        "превышение лимита — фатальная ошибка, а не повод для ретрая"
+        "exceeding the limit is a fatal error, not a reason to retry"
     );
 
     let after: String = client
@@ -2223,49 +2278,50 @@ async fn a_transaction_over_the_limit_is_fatal_and_the_slot_stays_put() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(before, after, "фатальная ошибка не двигает слот");
+    assert_eq!(before, after, "a fatal error does not move the slot");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
-    // Round 1, F2: `a_terminated_process_exits_zero_after_draining` остаётся
-    // зелёным даже без барьера в самой ветке завершения, потому что при
-    // интервале по умолчанию (200мс) периодический барьер почти наверняка
-    // успевает сработать раньше, чем мы вообще отправим сигнал. Этот тест
-    // закрывает именно эту дыру: интервал барьера задран настолько, что
-    // периодическая ветка заведомо не успевает сработать за время
-    // предпроверки.
+    // Round 1, F2: `a_terminated_process_exits_zero_after_draining` stays
+    // green even without a barrier in the shutdown branch itself, because
+    // at the default interval (200ms) the periodic barrier almost always
+    // manages to fire before we even send the signal. This test closes
+    // exactly that gap: the barrier interval is cranked up so high that the
+    // periodic branch is guaranteed not to fire within the pre-check window.
     //
-    // Проверка НЕ по содержимому файла: `FileSink` пишет через
-    // `BufWriter<File>`, и при обычном (не панике) выходе из процесса Rust
-    // сам делает для него best-effort `flush()` в `Drop` — без вызова
-    // барьера ветки завершения строка всё равно окажется в файле, просто
-    // без fsync и без подтверждения слоту. Первая попытка написать этот
-    // тест так и проверяла — файл непуст после SIGTERM — и осталась
-    // зелёной ПОСЛЕ мутации, убирающей барьер: `Drop` замаскировал
-    // отсутствие вызова. Источник истины, который не подделать через
-    // `Drop`, только один — `confirmed_flush_lsn` слота на сервере: он
-    // продвигается исключительно вызовом `send_feedback`, а тот в ветке
-    // завершения происходит только внутри `flush_and_acknowledge`.
+    // The check is NOT on the file's contents: `FileSink` writes through a
+    // `BufWriter<File>`, and on a normal (non-panic) process exit, Rust
+    // itself does a best-effort `flush()` for it in `Drop` — without the
+    // shutdown branch's barrier call, the line would still end up in the
+    // file, just without fsync and without acknowledging the slot. The
+    // first attempt at writing this test checked exactly that — the file
+    // is nonempty after SIGTERM — and stayed green AFTER a mutation that
+    // removed the barrier: `Drop` masked the missing call. The one source
+    // of truth that can't be faked through `Drop` is the slot's
+    // `confirmed_flush_lsn` on the server: it advances only via a call to
+    // `send_feedback`, and in the shutdown branch that only happens inside
+    // `flush_and_acknowledge`.
     //
-    // Round 3, F1: раньше вместо ожидания доказательства здесь стоял
-    // фиксированный `sleep`. Ревьюер вскрыл настоящую причину флейка: при
-    // 150мс дочерний процесс ещё не успевал даже установить обработчик
-    // сигнала, при 700мс проходило впритык (~0.4с запаса) — под двадцатью
-    // параллельными контейнерами такого бюджета не хватает, и SIGTERM
-    // уходит ДО того, как транзакция вообще была принята и разобрана. В
-    // этом случае барьеру просто нечего флашить, и слот не двигается — та
-    // же сигнатура отказа, что и у мутации, убирающей вызов барьера из
-    // ветки завершения, но по другой причине. Часы заменены на
-    // доказательство: пишем stderr дочернего процесса под debug-логами и
-    // ждём строку `transaction_accepted` — она логируется сразу после
-    // `sink.write_transaction`, то есть до всякого барьера, и означает,
-    // что транзакция гарантированно лежит в sink'е и барьеру будет что
-    // флашить. SIGTERM уходит только после этого. Проверка ниже
-    // (`before_signal < target`) не ослаблена ей в пару: если бы мы
-    // прождали ещё дольше — вплоть до срабатывания периодического барьера
-    // — она бы упала сама, доказывая, что тест перестал изолировать ветку
-    // завершения.
+    // Round 3, F1: previously a fixed `sleep` stood here instead of waiting
+    // for proof. The reviewer uncovered the real cause of the flakiness: at
+    // 150ms the child process hadn't even managed to install its signal
+    // handler yet, at 700ms it passed by a hair (~0.4s of margin) — under
+    // twenty parallel containers that budget isn't enough, and SIGTERM goes
+    // out BEFORE the transaction was even accepted and parsed. In that
+    // case the barrier simply has nothing to flush, and the slot doesn't
+    // move — the same failure signature as the mutation that removes the
+    // barrier call from the shutdown branch, but for a different reason.
+    // The clock has been replaced with proof: we capture the child
+    // process's stderr under debug logging and wait for the
+    // `transaction_accepted` line — it's logged right after
+    // `sink.write_transaction`, i.e. before any barrier, and means the
+    // transaction is guaranteed to be sitting in the sink and the barrier
+    // will have something to flush. SIGTERM is only sent after that. The
+    // check below (`before_signal < target`) isn't weakened to match: if
+    // we had waited even longer — long enough for the periodic barrier to
+    // fire — it would fail on its own, proving the test had stopped
+    // isolating the shutdown branch.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -2290,23 +2346,23 @@ async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
                 "file",
                 "--output-path",
                 out.to_str().unwrap(),
-                // На порядок больше, чем время до сигнала ниже: если барьер
-                // таймера всё-таки сработает в этом окне, тест ничего не
-                // докажет о ветке завершения.
+                // An order of magnitude larger than the time to the signal
+                // below: if the timer barrier fires within this window
+                // anyway, the test proves nothing about the shutdown branch.
                 "--ack-interval-ms",
                 "10000",
             ])
-            // debug — чтобы увидеть transaction_accepted (логируется на этом
-            // уровне сразу после приёма транзакции sink'ом); pg_walstream
-            // приглушён отдельно, чтобы не тонуть в его собственном debug-шуме.
+            // debug — to see transaction_accepted (logged at this level
+            // right after the sink accepts the transaction); pg_walstream
+            // is muted separately so we don't drown in its own debug noise.
             .env("RUST_LOG", "pgcdc=debug,pg_walstream=warn")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .expect("запустить бинарь"),
+            .expect("spawn the binary"),
     );
 
-    let stderr = child.stderr.take().expect("stderr был запрошен как piped");
+    let stderr = child.stderr.take().expect("stderr was requested as piped");
     let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let lines_writer = lines.clone();
@@ -2323,18 +2379,20 @@ async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
         .await
         .unwrap();
 
-    // Позиция WAL сразу после коммита — нижняя граница того, что процесс
-    // обязан будет подтвердить слоту, когда всё-таки подтвердит эту
-    // транзакцию (через периодический барьер или через барьер завершения).
+    // The WAL position right after the commit — a lower bound on what the
+    // process will have to acknowledge to the slot once it does
+    // acknowledge this transaction (via the periodic barrier or the
+    // shutdown barrier).
     let target: String = client
         .query_one("SELECT pg_current_wal_lsn()::text", &[])
         .await
         .unwrap()
         .get(0);
-    let target = common::parse_lsn(&target).expect("распарсить LSN");
+    let target = common::parse_lsn(&target).expect("parse the LSN");
 
-    // Ждём доказательство, а не время: `transaction_accepted` означает,
-    // что транзакция уже принята sink'ом и лежит там, ожидая барьера.
+    // Wait for proof, not for time: `transaction_accepted` means the
+    // transaction has already been accepted by the sink and is sitting
+    // there waiting for the barrier.
     let mut accepted = false;
     for _ in 0..200 {
         if lines
@@ -2350,7 +2408,7 @@ async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
     }
     assert!(
         accepted,
-        "не увидели transaction_accepted за 20 секунд, видели: {:?}",
+        "did not see transaction_accepted within 20 seconds, saw: {:?}",
         lines.lock().unwrap()
     );
 
@@ -2362,26 +2420,26 @@ async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
         .await
         .unwrap()
         .get(0);
-    let before_signal = common::parse_lsn(&before_signal).expect("распарсить LSN");
+    let before_signal = common::parse_lsn(&before_signal).expect("parse the LSN");
     assert!(
         before_signal < target,
-        "слот продвинулся до {target} ДО сигнала (сейчас {before_signal}) — периодический \
-         барьер успел сработать, тест не изолирует ветку завершения"
+        "the slot advanced to {target} BEFORE the signal (currently {before_signal}) — the \
+         periodic barrier fired in time, the test isn't isolating the shutdown branch"
     );
 
-    // SIGTERM: если барьер живёт в ветке завершения (как и должно быть),
-    // слот обязан подтвердить транзакцию уже ПОСЛЕ сигнала.
+    // SIGTERM: if the barrier lives in the shutdown branch (as it should),
+    // the slot must acknowledge the transaction only AFTER the signal.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let status = tokio::task::spawn_blocking(move || child.wait())
         .await
         .unwrap()
         .expect("wait");
-    assert_eq!(status.code(), Some(0), "штатная остановка даёт ноль");
+    assert_eq!(status.code(), Some(0), "a graceful stop gives zero");
 
     let after_signal = common::wait_for_slot_at_least(&client, "pgcdc_slot", target).await;
     assert!(
         after_signal >= target,
-        "слот не подтвердил транзакцию после штатной остановки: {after_signal} < {target}"
+        "the slot did not acknowledge the transaction after a graceful stop: {after_signal} < {target}"
     );
 
     let _ = std::fs::remove_file(&out);
@@ -2389,20 +2447,20 @@ async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
-    // Проверяет только то, что заявлено в имени: после реконнекта SIGTERM
-    // по-прежнему доводит процесс до штатного завершения с кодом 0.
+    // Checks only what the name claims: after a reconnect, SIGTERM still
+    // brings the process to a graceful exit with code 0.
     //
-    // Round 2, F3: этот тест раньше претендовал на большее — что он ловит
-    // перенос `spawn_shutdown_listener()` внутрь цикла реконнекта (создание
-    // слушателя заново на каждую сессию). Это неверно: у
-    // `tokio::signal::unix::signal` и `ctrl_c()` доставка сигнала идёт
-    // КАЖДОМУ зарегистрированному слушателю данного вида, а не только
-    // последнему созданному, — так что даже слушатель, пересозданный
-    // заново на второй сессии, всё равно получил бы SIGTERM и тест остался
-    // бы зелёным независимо от места вызова. Слушатель по-прежнему живёт
-    // над внешним циклом (пересоздавать его на каждый реконнект — течь по
-    // задаче на сессию), но это тест на поведение (сигнал работает и после
-    // реконнекта), а не на размещение кода.
+    // Round 2, F3: this test used to claim more — that it catches
+    // `spawn_shutdown_listener()` being moved inside the reconnect loop
+    // (recreating the listener on every session). That's wrong:
+    // `tokio::signal::unix::signal` and `ctrl_c()` deliver the signal to
+    // EVERY registered listener of that kind, not just the most recently
+    // created one — so even a listener recreated on the second session
+    // would still get SIGTERM, and the test would stay green regardless of
+    // where the call sits. The listener still lives above the outer loop
+    // (recreating it on every reconnect would be a task leak per session),
+    // but this is a test of behavior (the signal still works after a
+    // reconnect), not of code placement.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -2431,14 +2489,15 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .expect("запустить бинарь"),
+            .expect("spawn the binary"),
     );
 
-    // Читаем stderr дочернего процесса построчно в фоновом потоке: нам
-    // нужно ДОКАЗАТЬ, что реконнект произошёл, до отправки сигнала, а не
-    // просто понадеяться на время. `postgres_connection_restored` логируется
-    // только на успешном повторном подключении (stream_once, review Task 2).
-    let stderr = child.stderr.take().expect("stderr был запрошен как piped");
+    // Read the child process's stderr line by line on a background thread:
+    // we need to PROVE that a reconnect happened before sending the
+    // signal, not just hope based on timing.
+    // `postgres_connection_restored` is only logged on a successful
+    // reconnection (stream_once, review Task 2).
+    let stderr = child.stderr.take().expect("stderr was requested as piped");
     let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let lines_writer = lines.clone();
@@ -2455,8 +2514,8 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
         .await
         .unwrap();
 
-    // Ждём первую строку в файле — доказательство, что процесс дошёл до
-    // барьера на первой сессии.
+    // Wait for the first line in the file — proof the process reached the
+    // barrier during the first session.
     let mut seen = false;
     for _ in 0..200 {
         if std::fs::read_to_string(&out)
@@ -2468,15 +2527,18 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(seen, "первая строка не появилась в файле за 20 секунд");
+    assert!(
+        seen,
+        "the first line did not appear in the file within 20 seconds"
+    );
 
-    // Обрываем репликационное соединение со стороны сервера — процесс
-    // обязан переподключиться сам (задача 2), а не упасть.
+    // Drop the replication connection from the server side — the process
+    // must reconnect on its own (task 2), not fail.
     common::terminate_replication_backend(&client).await;
 
-    // Ждём лог восстановления соединения: без него ниже мы бы просто
-    // проверяли обычный сигнальный сценарий ещё раз, ничего не говоря про
-    // реконнект.
+    // Wait for the connection-restored log line: without it, the check
+    // below would just be re-testing an ordinary signal scenario, saying
+    // nothing about the reconnect.
     let mut reconnected = false;
     for _ in 0..200 {
         if lines
@@ -2492,12 +2554,12 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
     }
     assert!(
         reconnected,
-        "не увидели лог восстановления соединения за 20 секунд, видели: {:?}",
+        "did not see the connection-restored log line within 20 seconds, saw: {:?}",
         lines.lock().unwrap()
     );
 
-    // SIGTERM ПОСЛЕ реконнекта: см. комментарий над функцией — это тест на
-    // поведение (сигнал по-прежнему работает), а не на размещение кода.
+    // SIGTERM AFTER the reconnect: see the comment above the function —
+    // this is a test of behavior (the signal still works), not of code placement.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let status = tokio::task::spawn_blocking(move || child.wait())
         .await
@@ -2506,7 +2568,7 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
     assert_eq!(
         status.code(),
         Some(0),
-        "штатная остановка после реконнекта тоже обязана давать ноль"
+        "a graceful stop after a reconnect must also give zero"
     );
 
     let _ = std::fs::remove_file(&out);
@@ -2514,10 +2576,10 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sigint_also_stops_the_process_cleanly() {
-    // Чек-лист заявляет обработку SIGINT наравне с SIGTERM, но теста на неё
-    // не было; SIGTERM закрыт отдельным тестом, а SIGINT до сих пор держался
-    // только на том, что слушатель объединяет оба сигнала в один select.
-    // Проверяем, что объединение работает.
+    // The checklist claims SIGINT is handled on par with SIGTERM, but there
+    // was no test for it; SIGTERM is covered by a separate test, while
+    // SIGINT so far has only relied on the listener merging both signals
+    // into one select. We check that the merge actually works.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -2541,7 +2603,7 @@ async fn sigint_also_stops_the_process_cleanly() {
                 out.to_str().unwrap(),
             ])
             .spawn()
-            .expect("запустить бинарь"),
+            .expect("spawn the binary"),
     );
 
     client
@@ -2554,17 +2616,17 @@ async fn sigint_also_stops_the_process_cleanly() {
         .await
         .unwrap()
         .get(0);
-    let target = common::parse_lsn(&target).expect("распарсить LSN");
+    let target = common::parse_lsn(&target).expect("parse the LSN");
     common::wait_for_slot_at_least(&client, "pgcdc_slot", target).await;
 
     unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
 
-    // Опрос через try_wait(), а не блокирующий wait() (round 1 review, F5):
-    // как и в мёртвопортовом соседе этого теста, регрессия, которая ставит
-    // обработчик, но никогда не взводит флаг, оставила бы блокирующий
-    // wait() висеть навсегда, а Drop рантайма tokio ждёт именно
-    // blocking-задачи — тест повесил бы весь тестовый бинарь вместо того,
-    // чтобы просто покраснеть.
+    // Polling via try_wait() rather than a blocking wait() (round 1
+    // review, F5): just like in this test's dead-port neighbor, a
+    // regression that installs the handler but never sets the flag would
+    // leave a blocking wait() hanging forever, and tokio's runtime Drop
+    // specifically waits for blocking tasks — the test would hang the
+    // whole test binary instead of simply failing red.
     let mut status = None;
     for _ in 0..100 {
         if let Ok(Some(s)) = child.try_wait() {
@@ -2573,19 +2635,19 @@ async fn sigint_also_stops_the_process_cleanly() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let status = status.expect("SIGINT обязан остановить процесс за 5 секунд, а не только SIGKILL");
-    assert_eq!(status.code(), Some(0), "SIGINT тоже даёт ноль");
+    let status = status.expect("SIGINT must stop the process within 5 seconds, not only SIGKILL");
+    assert_eq!(status.code(), Some(0), "SIGINT also gives zero");
 
     let _ = std::fs::remove_file(&out);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_productive_session_resets_the_backoff() {
-    // Перенесено с этапа 4. Сброс считался непроверяемым, но задержка
-    // попадает в лог структурным полем на каждой попытке, и этого достаточно.
-    // Сценарий: два обрыва подряд с продуктивной сессией между ними —
-    // задержка второй серии обязана начаться заново с начальной, а не
-    // продолжить расти от достигнутой.
+    // Carried over from stage 4. The reset was considered unverifiable, but
+    // the delay lands in the log as a structured field on every attempt,
+    // and that's enough. The scenario: two drops in a row with a productive
+    // session between them — the second series' delay must start over from
+    // the initial value, not keep growing from where it left off.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -2611,13 +2673,14 @@ async fn a_productive_session_resets_the_backoff() {
         "800",
     ]);
 
-    // Ждём, пока walsender первой (холодный старт) сессии реально
-    // подключится: между `spawn()` и `START_REPLICATION` проходит заметное
-    // время (разбор аргументов, TCP, preflight), и обрыв, посланный раньше,
-    // никого не находит — первая серия бэкоффа тогда вообще не случится.
+    // Wait for the first (cold-start) session's walsender to actually
+    // connect: a noticeable amount of time passes between `spawn()` and
+    // `START_REPLICATION` (argument parsing, TCP, preflight), and a drop
+    // sent earlier finds nobody — the first backoff series would then
+    // never happen at all.
     common::wait_until_slot_active(&client, "pgcdc_slot").await;
 
-    // Первый обрыв и вставка, чтобы сессия после него была продуктивной.
+    // The first drop and an insert, so the session after it is productive.
     common::terminate_replication_backend(&client).await;
     client
         .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
@@ -2628,20 +2691,21 @@ async fn a_productive_session_resets_the_backoff() {
         .await
         .unwrap()
         .get(0);
-    let target = common::parse_lsn(&target).expect("распарсить LSN");
+    let target = common::parse_lsn(&target).expect("parse the LSN");
     common::wait_for_slot_at_least(&client, "pgcdc_slot", target).await;
 
-    // Второй обрыв. Первая попытка после него обязана взять начальную задержку.
+    // The second drop. The first attempt after it must take the initial delay.
     common::terminate_replication_backend(&client).await;
 
-    // Читаем ОБЕ серии: первая начинается с начальной задержки в любом случае,
-    // и различает их только вторая. Со сбросом получится [100, 100], без него
-    // вторая серия продолжит с удвоенной — [100, 200].
+    // Read BOTH series: the first always starts with the initial delay
+    // regardless, and only the second one tells them apart. With the reset
+    // you get [100, 100]; without it, the second series continues with the
+    // doubled value — [100, 200].
     let delays = common::collect_backoff_delays(&mut child, 2).await;
     assert_eq!(
         delays.get(1).copied(),
         Some(100),
-        "после продуктивной сессии бэкофф обязан начаться заново, а не продолжить: {delays:?}"
+        "after a productive session the backoff must restart, not continue: {delays:?}"
     );
 
     let _ = std::fs::remove_file(&out);
@@ -2649,22 +2713,24 @@ async fn a_productive_session_resets_the_backoff() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect() {
-    // I2: удаление всего блока периодической сводки (`metrics_report`,
-    // `METRICS_REPORT_INTERVAL`) оставляло все 168 тестов зелёными — ни то,
-    // что строка вообще выходит, ни интервал, ни то, что отсчёт переживает
-    // переподключение, не было пришпилено ничем, кроме ручного прогона демо.
-    // А ведь именно переживание реконнекта обосновывало вынос `last_report`
-    // наружу цикла реконнекта в прошлом раунде (review Task 3, round 1, F1):
-    // без этого процесс, переподключающийся чаще десяти секунд, никогда не
-    // прожил бы достаточно долго внутри одной сессии, чтобы сводка вышла.
+    // I2: deleting the whole periodic-report block (`metrics_report`,
+    // `METRICS_REPORT_INTERVAL`) left all 168 tests green — neither that
+    // the line comes out at all, nor the interval, nor that the countdown
+    // survives a reconnect, was pinned down by anything but a manual demo
+    // run. And it was precisely surviving a reconnect that justified
+    // hoisting `last_report` outside the reconnect loop in a previous round
+    // (review Task 3, round 1, F1): without it, a process reconnecting more
+    // often than ten seconds would never live long enough inside a single
+    // session for the report to come out.
     //
-    // Сценарий раздельно пришпиливает обе половины: реконнект форсируется
-    // РАНО (в первые секунды), задолго до десятисекундного интервала. Если
-    // бы отсчёт неверно обнулялся на реконнекте, строка появилась бы не
-    // раньше t_reconnect + 10с; отсчёт, переживающий реконнект, печатает её
-    // около t_start + 10с независимо от того, когда случился реконнект.
-    // Разница между этими двумя предсказаниями — много секунд, и именно она
-    // разделяет тест на "переживает" и "не переживает".
+    // The scenario pins down both halves separately: the reconnect is
+    // forced EARLY (within the first few seconds), well before the
+    // ten-second interval. If the countdown were incorrectly reset on
+    // reconnect, the line would appear no earlier than t_reconnect + 10s; a
+    // countdown that survives the reconnect prints it around t_start + 10s
+    // regardless of when the reconnect happened. The gap between these two
+    // predictions is many seconds, and that's exactly what splits the test
+    // into "survives" and "doesn't survive".
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -2688,7 +2754,7 @@ async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect(
         out.to_str().unwrap(),
     ]);
 
-    let stderr = child.stderr.take().expect("stderr перехвачен при запуске");
+    let stderr = child.stderr.take().expect("stderr captured at spawn");
     let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let lines_writer = lines.clone();
@@ -2700,8 +2766,8 @@ async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect(
         }
     });
 
-    // Ждём первую (холодный старт) сессию — обрыв, посланный раньше, никого
-    // не найдёт (backend ещё не подключился).
+    // Wait for the first (cold-start) session — a drop sent earlier would
+    // find nobody (the backend hasn't connected yet).
     common::wait_until_slot_active(&client, "pgcdc_slot").await;
 
     client
@@ -2720,15 +2786,19 @@ async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(seen, "первая строка не появилась в файле за 5 секунд");
+    assert!(
+        seen,
+        "the first line did not appear in the file within 5 seconds"
+    );
 
-    // Форсируем реконнект на известной, контролируемой отметке (~6с от
-    // старта процесса) — не сразу и не близко к десятисекундному интервалу.
-    // Разнос важен: он и разделяет два предсказания. Отсчёт, переживающий
-    // реконнект, печатает сводку около t_start + 10с независимо от того,
-    // когда случился реконнект; отсчёт, ошибочно обнуляемый НА реконнекте,
-    // печатает её около t_reconnect + 10с ≈ 16с — эти два предсказания
-    // разделяет несколько секунд, и именно в этот разрыв целится тест.
+    // Force a reconnect at a known, controlled mark (~6s from process
+    // start) — neither immediately nor close to the ten-second interval.
+    // The spacing matters: it's exactly what separates the two
+    // predictions. A countdown that survives the reconnect prints the
+    // report around t_start + 10s regardless of when the reconnect
+    // happened; a countdown incorrectly reset ON reconnect prints it
+    // around t_reconnect + 10s ≈ 16s — these two predictions are several
+    // seconds apart, and that gap is exactly what the test targets.
     let elapsed_before_reconnect = t_start.elapsed();
     let reconnect_at = Duration::from_secs(6);
     if elapsed_before_reconnect < reconnect_at {
@@ -2751,16 +2821,16 @@ async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect(
     }
     assert!(
         reconnected,
-        "не увидели восстановление соединения за 5 секунд"
+        "did not see the connection restored within 5 seconds"
     );
     let t_reconnected = t_start.elapsed();
     assert!(
         t_reconnected < Duration::from_secs(9),
-        "реконнект обязан был случиться задолго до интервала сводки, а занял {t_reconnected:?} — \
-         тест не может отличить 'пережил реконнект' от 'совпало по времени' без этого запаса"
+        "the reconnect had to happen well before the report interval, but took {t_reconnected:?} — \
+         the test cannot tell 'survived the reconnect' apart from 'coincided in time' without this margin"
     );
 
-    // Ждём строку сводки, не дольше 20 секунд от старта процесса.
+    // Wait for the report line, no more than 20 seconds from process start.
     let mut t_report = None;
     while t_start.elapsed() < Duration::from_secs(20) {
         if lines
@@ -2774,18 +2844,19 @@ async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let t_report =
-        t_report.expect("строка metrics_report не появилась за 20 секунд от старта процесса");
+    let t_report = t_report
+        .expect("the metrics_report line did not appear within 20 seconds of process start");
 
     assert!(
         t_report >= Duration::from_secs(9),
-        "сводка вышла раньше интервала METRICS_REPORT_INTERVAL: {t_report:?} от старта процесса"
+        "the report came out earlier than METRICS_REPORT_INTERVAL: {t_report:?} from process start"
     );
     assert!(
         t_report <= Duration::from_secs(13),
-        "сводка вышла позже, чем допускает переживший реконнект отсчёт: {t_report:?} от старта \
-         процесса, реконнект случился на {t_reconnected:?} — обнуление отсчёта на реконнекте \
-         отодвинуло бы её к t_reconnected + 10с = {:?}, что выходит далеко за этот предел",
+        "the report came out later than a countdown that survived the reconnect would allow: \
+         {t_report:?} from process start, the reconnect happened at {t_reconnected:?} — resetting \
+         the countdown on reconnect would push it to t_reconnected + 10s = {:?}, which is well \
+         past this bound",
         t_reconnected + Duration::from_secs(10)
     );
 

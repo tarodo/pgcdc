@@ -1,14 +1,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Счётчики процесса. Своя структура, а не фасад вроде `metrics-rs`: фасад без
-/// подключённого экспортёра отправляет значения в никуда, а нам они нужны прямо
-/// в тестах — «после отказа sink подтверждённая позиция не сдвинулась» это
-/// утверждение о счётчике (DECISIONS Q23). Обернуть это экспортёром позже
-/// тривиально; вернуть наблюдаемость фасаду — нет.
+/// Process counters. Our own struct, not a facade like `metrics-rs`: a facade with
+/// no exporter attached sends values into the void, and we need them directly
+/// in tests — "after a sink failure the acknowledged position did not move" is
+/// an assertion about a counter (DECISIONS Q23). Wrapping this in an exporter later
+/// is trivial; getting observability back from a facade is not.
 ///
-/// Все поля — `Relaxed`: это наблюдение, а не синхронизация. Ни одно решение
-/// в коде не принимается по значению счётчика, поэтому упорядочивание между
-/// ними не нужно и стоило бы дороже.
+/// All fields are `Relaxed`: this is observation, not synchronization. No decision
+/// in the code is made based on a counter's value, so ordering between
+/// them is unnecessary and would cost more.
 #[derive(Debug, Default)]
 pub struct Metrics {
     events_total: AtomicU64,
@@ -21,9 +21,9 @@ pub struct Metrics {
     transaction_buffer_size: AtomicU64,
 }
 
-/// Согласованный по полям снимок. Нужен и периодической сводке, и тестам:
-/// читать восемь атомиков по отдельности в ассерте — значит получить
-/// значения из разных моментов.
+/// A field-consistent snapshot. Needed both by the periodic report and by
+/// tests: reading eight atomics separately in an assertion would mean getting
+/// values from different moments in time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub events_total: u64,
@@ -61,8 +61,8 @@ impl Metrics {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Позиции монотонны по той же причине, что и в трекере: replay уже
-    /// обработанного не должен откатывать наблюдаемый прогресс.
+    /// Positions are monotonic for the same reason as in the tracker: replaying
+    /// what was already processed must not roll back observed progress.
     pub fn set_last_received_lsn(&self, lsn: u64) {
         self.last_received_lsn.fetch_max(lsn, Ordering::Relaxed);
     }
@@ -71,7 +71,7 @@ impl Metrics {
         self.last_acknowledged_lsn.fetch_max(lsn, Ordering::Relaxed);
     }
 
-    /// Размер буфера — датчик, а не позиция: он обязан падать до нуля на коммите.
+    /// Buffer size is a gauge, not a position: it must fall to zero on commit.
     pub fn set_transaction_buffer_size(&self, n: u64) {
         self.transaction_buffer_size.store(n, Ordering::Relaxed);
     }
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn positions_are_set_not_added() {
-        // Позиция — не счётчик: она заменяется, а не накапливается.
+        // A position is not a counter: it is replaced, not accumulated.
         let m = Metrics::new();
         m.set_last_acknowledged_lsn(0x1000);
         m.set_last_acknowledged_lsn(0x2000);
@@ -114,8 +114,8 @@ mod tests {
 
     #[test]
     fn a_position_never_moves_backwards() {
-        // Тот же довод, что и у трекера: replay уже обработанного не должен
-        // откатывать наблюдаемую позицию, иначе график лжёт о прогрессе.
+        // The same argument as for the tracker: replaying what was already processed
+        // must not roll back the observed position, otherwise the graph lies about progress.
         let m = Metrics::new();
         m.set_last_acknowledged_lsn(0x2000);
         m.set_last_acknowledged_lsn(0x1000);
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn buffer_size_is_a_gauge_and_may_fall() {
-        // А вот размер буфера — не позиция: он обязан падать до нуля на коммите.
+        // Buffer size, on the other hand, is not a position: it must fall to zero on commit.
         let m = Metrics::new();
         m.set_transaction_buffer_size(17);
         m.set_transaction_buffer_size(0);

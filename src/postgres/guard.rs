@@ -7,14 +7,14 @@ pub struct SlotInfo {
     pub confirmed_flush_lsn: Option<Lsn>,
 }
 
-/// Guard слота: вызывается на КАЖДОЙ сессии репликации (`stream_once` в
-/// `replication.rs`) — и на холодном старте, и на каждом реконнекте, а не
-/// только один раз при первом запуске. Здесь проверяется только
-/// существование слота; на холодном старте сравнивать `confirmed_flush_lsn`
-/// не с чем — персистентной durable-позиции у нас нет и не будет (DECISIONS
-/// Q4), — а на реконнекте возвращённые отсюда позиции сверяет вызывающий
-/// через `check_reconnect`. Слот отсутствует — падаем, НЕ создаём:
-/// автосоздание маскирует потерю данных, и это измерено в
+/// The slot guard: called on EVERY replication session (`stream_once` in
+/// `replication.rs`) — both on a cold start and on every reconnect, not
+/// just once at first launch. Only the slot's existence is checked here;
+/// on a cold start there's nothing to compare `confirmed_flush_lsn` against —
+/// we have no persistent durable position and never will (DECISIONS
+/// Q4) — while on reconnect the positions returned from here are checked by the
+/// caller via `check_reconnect`. If the slot is missing — we fail, we do NOT create it:
+/// auto-creation masks data loss, and that is measured in
 /// docs/spike-findings.md §2.4.
 pub async fn preflight_slot(conn_str: &str, slot: &str) -> Result<SlotInfo, PgcdcError> {
     let (client, connection) = tokio_postgres::connect(conn_str, tokio_postgres::NoTls)
@@ -50,9 +50,9 @@ pub async fn preflight_slot(conn_str: &str, slot: &str) -> Result<SlotInfo, Pgcd
     })
 }
 
-/// Реконнект внутри работающего процесса, где durable-позиция есть в памяти.
-/// Возвращает `Ok(Some(text))`, если расхождение стоит записать в WARN,
-/// и `Err`, только если слот ушёл ВПЕРЁД нашей durable-точки.
+/// Reconnect within a running process, where the durable position is in memory.
+/// Returns `Ok(Some(text))` if the discrepancy is worth logging as a WARN,
+/// and `Err` only if the slot has moved AHEAD of our durable point.
 pub fn check_reconnect(
     slot: &str,
     info: &SlotInfo,
@@ -75,7 +75,7 @@ pub fn check_reconnect(
     Ok(None)
 }
 
-/// PostgreSQL печатает LSN как `X/Y` в шестнадцатеричном виде.
+/// PostgreSQL prints an LSN as `X/Y` in hexadecimal.
 fn parse_lsn(text: &str) -> Option<Lsn> {
     let (hi, lo) = text.split_once('/')?;
     let hi = u64::from_str_radix(hi, 16).ok()?;
@@ -96,23 +96,23 @@ mod tests {
 
     #[test]
     fn slot_ahead_of_our_durable_position_is_fatal() {
-        // Кто-то подтвердил WAL, который мы не довели до sink.
+        // Someone acknowledged WAL that we never committed to the sink.
         let err = check_reconnect("s", &info(0x2000), Lsn(0x1000)).unwrap_err();
         assert!(matches!(err, PgcdcError::SlotAhead { .. }));
     }
 
     #[test]
     fn slot_behind_is_a_warning_not_a_failure() {
-        // Ожидаемый исход обрыва: последний send_feedback мог не дойти.
-        // START_REPLICATION с 0/0 перечитает промежуток дубликатами,
-        // что инвариант «дубликаты допустимы» прямо разрешает.
-        // Падать здесь означало бы падать при каждом сетевом сбое.
+        // The expected outcome of a drop: the last send_feedback might not have arrived.
+        // START_REPLICATION with 0/0 will replay the gap as duplicates,
+        // which the "duplicates are allowed" invariant explicitly permits.
+        // Failing here would mean failing on every network hiccup.
         let warn = check_reconnect("s", &info(0x1000), Lsn(0x2000)).unwrap();
-        assert!(warn.is_some(), "расхождение должно быть замечено");
+        assert!(warn.is_some(), "the discrepancy must be noticed");
         let text = warn.unwrap();
         assert!(
             text.contains("1000") && text.contains("2000"),
-            "обе позиции в сообщении"
+            "both positions are in the message"
         );
     }
 
@@ -129,7 +129,7 @@ mod tests {
             restart_lsn: None,
             confirmed_flush_lsn: None,
         };
-        // Слот есть, но ни разу не подтверждался — он позади любой нашей позиции.
+        // The slot exists but has never been acknowledged — it is behind any position of ours.
         assert!(check_reconnect("s", &empty, Lsn(0x1000)).unwrap().is_some());
     }
 

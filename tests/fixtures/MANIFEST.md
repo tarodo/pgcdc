@@ -1,83 +1,85 @@
 # pgoutput byte fixtures — manifest
 
-Снято Task 4 (2026-08-30) на чистом слоте после `docker compose down -v && docker compose up
--d --wait`: `pgcdc_slot` пересоздан `docker/init.sql` на позиции сразу после `CREATE
-PUBLICATION`, затем один запуск `./target/debug/spike` прогнал `scripts/gen-fixtures.sql`
-целиком. Нумерация файлов `NNNN_kind.bin` — это порядковый номер сообщения pgoutput в этой
-сессии (счётчик `seq` в `dump()`), не связан с `wal_start`.
+Captured in Task 4 (2026-08-30) on a clean slot after `docker compose down -v && docker
+compose up -d --wait`: `pgcdc_slot` recreated by `docker/init.sql` at the position right
+after `CREATE PUBLICATION`, then a single run of `./target/debug/spike` drove
+`scripts/gen-fixtures.sql` through in full. File numbering `NNNN_kind.bin` is the ordinal
+position of the pgoutput message within this session (the `seq` counter in `dump()`), not
+tied to `wal_start`.
 
-Каждый `.bin` содержит **ровно один payload pgoutput**, без обёртки `XLogData` и без
-финального перевода строки — так их читает `include_bytes!` в юнит-тестах декодера этапа 2.
-Позиции WAL из обёртки `XLogData` (не входят в payload, поэтому вынесены сюда, DECISIONS
-Q17) приведены в формате `hi/lo`, как их печатает `psql`/`pg_lsn`.
+Each `.bin` holds **exactly one pgoutput payload**, without the `XLogData` wrapper and
+without a trailing newline — that's how `include_bytes!` reads them in the stage-2 decoder
+unit tests. WAL positions from the `XLogData` wrapper (not part of the payload, hence
+carried here, DECISIONS Q17) are given in `hi/lo` format, the way `psql`/`pg_lsn` prints
+them.
 
-Формат таблицы: `wal_start` / `wal_end` — значения из лога spike'а (`raw.wal_start`,
-`raw.wal_end` для этого сообщения); для всех сообщений в этом прогоне `wal_start == wal_end`
-(row-сообщения не имеют собственного LSN, см. DECISIONS Q17 и примечание про RELATION ниже).
+Table format: `wal_start` / `wal_end` — values from the spike's log (`raw.wal_start`,
+`raw.wal_end` for that message); for every message in this run `wal_start == wal_end` (row
+messages have no LSN of their own, see DECISIONS Q17 and the note about RELATION below).
 
-## Транзакция 1 — одиночный INSERT (users, REPLICA IDENTITY FULL)
+## Transaction 1 — single INSERT (users, REPLICA IDENTITY FULL)
 
 SQL: `INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', NULL);`
 
-| Файл | wal_start | wal_end | Проверяет |
+| File | wal_start | wal_end | Checks |
 |------|-----------|---------|-----------|
-| `0001_begin.bin` | `0/192FFC0` | `0/192FFC0` | Разбор BEGIN: xid, commit-timestamp, final LSN |
-| `0002_relation.bin` | `0/0` | `0/0` | Разбор RELATION для `public.users`: 4 колонки (id, name, email, bio), их OID типов и `key`-флаги. См. примечание про нулевой LSN ниже |
-| `0003_insert.bin` | `0/192FFC0` | `0/192FFC0` | Разбор INSERT, 4 колонки, одна NULL (`bio`), три текстовых (`t`) |
-| `0004_commit.bin` | `0/1930100` | `0/1930100` | Разбор COMMIT: flags, `commit_lsn`, `end_lsn`, timestamp |
+| `0001_begin.bin` | `0/192FFC0` | `0/192FFC0` | BEGIN parsing: xid, commit timestamp, final LSN |
+| `0002_relation.bin` | `0/0` | `0/0` | RELATION parsing for `public.users`: 4 columns (id, name, email, bio), their type OIDs and `key` flags. See the note about the zero LSN below |
+| `0003_insert.bin` | `0/192FFC0` | `0/192FFC0` | INSERT parsing, 4 columns, one NULL (`bio`), three text (`t`) |
+| `0004_commit.bin` | `0/1930100` | `0/1930100` | COMMIT parsing: flags, `commit_lsn`, `end_lsn`, timestamp |
 
-## Транзакция 2 — UPDATE, REPLICA IDENTITY FULL → старый кортеж целиком (`O`)
+## Transaction 2 — UPDATE, REPLICA IDENTITY FULL → full old tuple (`O`)
 
 SQL: `UPDATE users SET name = 'Bob' WHERE id = 1;`
 
-| Файл | wal_start | wal_end | Проверяет |
+| File | wal_start | wal_end | Checks |
 |------|-----------|---------|-----------|
-| `0005_begin.bin` | `0/1930100` | `0/1930100` | BEGIN второй транзакции |
-| `0006_update.bin` | `0/1930100` | `0/1930100` | UPDATE с `before_kind = full` (тег `'O'`): старый кортеж — три колонки текстом (`id`, `name`, `email`) и `bio` тегом `'n'` (настоящий NULL, не заглушка), новый кортеж — `name` изменился на `Bob`, `bio` остаётся NULL. Парсер должен различать тег `O`/`K`/отсутствие тега перед новым кортежем |
+| `0005_begin.bin` | `0/1930100` | `0/1930100` | BEGIN of the second transaction |
+| `0006_update.bin` | `0/1930100` | `0/1930100` | UPDATE with `before_kind = full` (tag `'O'`): old tuple — three text columns (`id`, `name`, `email`) and `bio` with tag `'n'` (a real NULL, not a placeholder), new tuple — `name` changed to `Bob`, `bio` stays NULL. The parser must distinguish the `O`/`K`/no-tag cases before the new tuple |
 | `0007_commit.bin` | `0/19301B8` | `0/19301B8` | COMMIT |
 
-## Транзакция 3 — DELETE, REPLICA IDENTITY FULL
+## Transaction 3 — DELETE, REPLICA IDENTITY FULL
 
 SQL: `DELETE FROM users WHERE id = 1;`
 
-| Файл | wal_start | wal_end | Проверяет |
+| File | wal_start | wal_end | Checks |
 |------|-----------|---------|-----------|
 | `0008_begin.bin` | `0/19301B8` | `0/19301B8` | BEGIN |
-| `0009_delete.bin` | `0/19301B8` | `0/19301B8` | DELETE с `before_kind = full` (тег `'O'`): полный старый кортеж (`id=1, name='Bob', email='alice@example.com', bio=NULL`) |
+| `0009_delete.bin` | `0/19301B8` | `0/19301B8` | DELETE with `before_kind = full` (tag `'O'`): full old tuple (`id=1, name='Bob', email='alice@example.com', bio=NULL`) |
 | `0010_commit.bin` | `0/1930248` | `0/1930248` | COMMIT |
 
-## Транзакция 4a — INSERT, REPLICA IDENTITY DEFAULT (items)
+## Transaction 4a — INSERT, REPLICA IDENTITY DEFAULT (items)
 
 SQL: `INSERT INTO items VALUES (10, 'Widget', 5);`
 
-| Файл | wal_start | wal_end | Проверяет |
+| File | wal_start | wal_end | Checks |
 |------|-----------|---------|-----------|
 | `0011_begin.bin` | `0/1930248` | `0/1930248` | BEGIN |
-| `0012_relation.bin` | `0/0` | `0/0` | Разбор RELATION для `public.items`: 3 колонки (id, title, qty). Второе (и последнее) сообщение RELATION за весь прогон — наблюдение для этого конкретного прогона (не было ни DDL, ни смены replica identity, ни изменения публикации), а не общее правило протокола: повторный RELATION для того же OID легален и обязан заменить запись в кэше, см. `docs/pgoutput-notes.md` §6 |
-| `0013_insert.bin` | `0/1930248` | `0/1930248` | INSERT в таблицу с другим OID/схемой колонок, чтобы декодер держал relation-cache по нескольким таблицам одновременно |
+| `0012_relation.bin` | `0/0` | `0/0` | RELATION parsing for `public.items`: 3 columns (id, title, qty). The second (and last) RELATION message in the whole run — an observation about this particular run (no DDL, no replica identity change, no publication change happened), not a protocol-wide rule: a repeated RELATION for the same OID is legal and must replace the cache entry, see `docs/pgoutput-notes.md` §6 |
+| `0013_insert.bin` | `0/1930248` | `0/1930248` | INSERT into a table with a different OID/column schema, so the decoder keeps a relation cache across several tables at once |
 | `0014_commit.bin` | `0/1930368` | `0/1930368` | COMMIT |
 
-## Транзакция 4b — UPDATE, REPLICA IDENTITY DEFAULT → старого кортежа нет
+## Transaction 4b — UPDATE, REPLICA IDENTITY DEFAULT → no old tuple
 
 SQL: `UPDATE items SET qty = 7 WHERE id = 10;`
 
-| Файл | wal_start | wal_end | Проверяет |
+| File | wal_start | wal_end | Checks |
 |------|-----------|---------|-----------|
 | `0015_begin.bin` | `0/1930368` | `0/1930368` | BEGIN |
-| `0016_update.bin` | `0/1930368` | `0/1930368` | UPDATE с `before_kind` **отсутствует** (нет тега `O`/`K`, сразу `'N'` и новый кортеж): ключевые колонки не менялись, REPLICA IDENTITY DEFAULT не шлёт старую версию строки вовсе |
+| `0016_update.bin` | `0/1930368` | `0/1930368` | UPDATE with `before_kind` **absent** (no `O`/`K` tag, straight to `'N'` and the new tuple): key columns didn't change, REPLICA IDENTITY DEFAULT doesn't send the old row version at all |
 | `0017_commit.bin` | `0/19303F0` | `0/19303F0` | COMMIT |
 
-## Транзакция 4c — DELETE, REPLICA IDENTITY DEFAULT → только ключ (`K`)
+## Transaction 4c — DELETE, REPLICA IDENTITY DEFAULT → key only (`K`)
 
 SQL: `DELETE FROM items WHERE id = 10;`
 
-| Файл | wal_start | wal_end | Проверяет |
+| File | wal_start | wal_end | Checks |
 |------|-----------|---------|-----------|
 | `0018_begin.bin` | `0/19303F0` | `0/19303F0` | BEGIN |
-| `0019_delete.bin` | `0/19303F0` | `0/19303F0` | DELETE с `before_kind = key` (тег `'K'`): в старом кортеже только `id='10'` текстом, `title`/`qty` — NULL-заглушки (не значения!) |
+| `0019_delete.bin` | `0/19303F0` | `0/19303F0` | DELETE with `before_kind = key` (tag `'K'`): the old tuple carries only `id='10'` as text, `title`/`qty` are NULL placeholders (not values!) |
 | `0020_commit.bin` | `0/1930468` | `0/1930468` | COMMIT |
 
-## Транзакция 5a — INSERT с TOAST-значением (bio, STORAGE EXTERNAL)
+## Transaction 5a — INSERT with a TOAST value (bio, STORAGE EXTERNAL)
 
 SQL:
 ```sql
@@ -86,32 +88,33 @@ SELECT 2, 'Carol', 'carol@example.com',
        (SELECT string_agg(md5(random()::text), '') FROM generate_series(1, 300));
 ```
 
-| Файл | wal_start | wal_end | Проверяет |
+| File | wal_start | wal_end | Checks |
 |------|-----------|---------|-----------|
 | `0021_begin.bin` | `0/1932D18` | `0/1932D18` | BEGIN |
-| `0022_insert.bin` | `0/1932D18` | `0/1932D18` | INSERT с большим TOAST-значением (`bio`, 9600 байт текста) — на INSERT значение всегда приходит полностью текстом (тег `'t'`); маркера `'u'` тут быть не может (инференс из поведения reorder buffer PostgreSQL, не подтверждено байтами этой фикстуры напрямую — см. `docs/pgoutput-notes.md` §9): TOAST-оптимизация применима только к UPDATE. Файл 9651 байт — самый большой INSERT в наборе, годится для проверки, что декодер не режет длинные `int32`-длины колонок |
+| `0022_insert.bin` | `0/1932D18` | `0/1932D18` | INSERT with a large TOAST value (`bio`, 9600 bytes of text) — on INSERT the value always arrives in full as text (tag `'t'`); the `'u'` marker can't appear here (inferred from the behavior of PostgreSQL's reorder buffer, not confirmed directly by this fixture's bytes — see `docs/pgoutput-notes.md` §9): the TOAST optimization applies only to UPDATE. The file is 9651 bytes — the largest INSERT in the set, good for checking that the decoder doesn't truncate long `int32` column lengths |
 | `0023_commit.bin` | `0/1932DF8` | `0/1932DF8` | COMMIT |
 
-## Транзакция 5b — UPDATE, не трогающий TOAST-колонку → маркер `'u'`
+## Transaction 5b — UPDATE that doesn't touch the TOAST column → `'u'` marker
 
 SQL: `UPDATE users SET name = 'Caroline' WHERE id = 2;`
 
-**Самая хрупкая и самая важная фикстура набора.**
+**The most fragile and most important fixture in the set.**
 
-| Файл | wal_start | wal_end | Проверяет |
+| File | wal_start | wal_end | Checks |
 |------|-----------|---------|-----------|
 | `0024_begin.bin` | `0/1932E30` | `0/1932E30` | BEGIN |
-| `0025_update.bin` | `0/1932E30` | `0/1932E30` | **UPDATE с TOAST-маркером `'u'`.** `before_kind = full` (тег `'O'`, т.к. REPLICA IDENTITY FULL): старый кортеж несёт `bio` целиком текстом (9600 байт, тег `'t'`, это единственное место в наборе, где старый кортеж тоже TOAST-размера). В новом кортеже `bio` — однобайтовый тег `'u'` (unchanged-toast), без длины и без данных: колонка не менялась, Postgres не стал перетаскивать TOAST-значение из старой WAL-записи. Декодер обязан отличать `'u'` от `'n'` (NULL) и от `'t'` (данные есть) |
+| `0025_update.bin` | `0/1932E30` | `0/1932E30` | **UPDATE with the TOAST marker `'u'`.** `before_kind = full` (tag `'O'`, since REPLICA IDENTITY FULL): the old tuple carries `bio` in full as text (9600 bytes, tag `'t'` — the only place in the set where the old tuple is also TOAST-sized). In the new tuple, `bio` is a single-byte tag `'u'` (unchanged-toast), with no length and no data: the column didn't change, and PostgreSQL didn't bother carrying the TOAST value over from the old WAL record. The decoder must distinguish `'u'` from `'n'` (NULL) and from `'t'` (data present) |
 | `0026_commit.bin` | `0/19354A0` | `0/19354A0` | COMMIT |
 
-**Проверка TOAST эмпирически (см. также раздел «TOAST evidence» ниже):**
-`pg_column_size(bio) FROM users WHERE id = 2` → `9600` (порог TOAST на STORAGE EXTERNAL —
-внутристрочный лимит ~2 КБ; 9600 существенно больше, значит `bio` гарантированно хранится
-не в основной строке). Маркер `0x75` (`'u'`) байт-парсером найден в `0025_update.bin`,
-в позиции формата 4-й колонки нового кортежа (`bio`), после трёх текстовых колонок —
-структурный парсинг (см. отчёт) потребил ровно все 9696 байт файла без остатка.
+**Empirical TOAST verification (see also the "TOAST evidence" section below):**
+`pg_column_size(bio) FROM users WHERE id = 2` → `9600` (the TOAST threshold on STORAGE
+EXTERNAL — the in-row limit is ~2 KB; 9600 is well above that, so `bio` is guaranteed to be
+stored out of line). The `0x75` (`'u'`) marker was found by the byte parser in
+`0025_update.bin`, at the format position of the 4th column of the new tuple (`bio`), after
+three text columns — structural parsing (see the report) consumed exactly all 9696 bytes of
+the file with nothing left over.
 
-## Транзакция 6 — многострочная транзакция (INSERT + UPDATE + DELETE в одном BEGIN/COMMIT)
+## Transaction 6 — multi-statement transaction (INSERT + UPDATE + DELETE in one BEGIN/COMMIT)
 
 SQL:
 ```sql
@@ -122,15 +125,15 @@ DELETE FROM users WHERE id = 3;
 COMMIT;
 ```
 
-| Файл | wal_start | wal_end | Проверяет |
+| File | wal_start | wal_end | Checks |
 |------|-----------|---------|-----------|
-| `0027_begin.bin` | `0/19354A0` | `0/19354A0` | BEGIN одной транзакции на три DML подряд |
-| `0028_insert.bin` | `0/19354A0` | `0/19354A0` | INSERT внутри многострочной транзакции — RELATION для `users` не повторяется (уже было в `0002_relation.bin`), декодер должен переиспользовать relation-cache между транзакциями сессии |
-| `0029_update.bin` | `0/1935538` | `0/1935538` | UPDATE внутри той же транзакции, `before_kind = full` (меняется только `email`, но REPLICA IDENTITY FULL всё равно шлёт полный старый кортеж) |
-| `0030_delete.bin` | `0/19355C0` | `0/19355C0` | DELETE внутри той же транзакции, `before_kind = full` |
-| `0031_commit.bin` | `0/1935650` | `0/1935650` | Один COMMIT на три изменения — проверяет, что декодер группирует несколько row-сообщений под одним BEGIN/COMMIT в одну логическую транзакцию |
+| `0027_begin.bin` | `0/19354A0` | `0/19354A0` | BEGIN of one transaction covering three DML statements in a row |
+| `0028_insert.bin` | `0/19354A0` | `0/19354A0` | INSERT inside a multi-statement transaction — RELATION for `users` is not repeated (already sent in `0002_relation.bin`), the decoder must reuse the relation cache across transactions within a session |
+| `0029_update.bin` | `0/1935538` | `0/1935538` | UPDATE inside the same transaction, `before_kind = full` (only `email` changes, but REPLICA IDENTITY FULL still sends the full old tuple) |
+| `0030_delete.bin` | `0/19355C0` | `0/19355C0` | DELETE inside the same transaction, `before_kind = full` |
+| `0031_commit.bin` | `0/1935650` | `0/1935650` | A single COMMIT for three changes — checks that the decoder groups several row messages under one BEGIN/COMMIT into one logical transaction |
 
-## Транзакция 7 — ROLLBACK
+## Transaction 7 — ROLLBACK
 
 SQL:
 ```sql
@@ -139,47 +142,49 @@ INSERT INTO users VALUES (999, 'Ghost', 'ghost@example.com', NULL);
 ROLLBACK;
 ```
 
-**Файлов нет.** PostgreSQL не декодирует и не шлёт в pgoutput ничего для откаченных
-транзакций — ни BEGIN, ни INSERT, ни какого-либо аналога COMMIT/ABORT-сообщения в
-`proto_version=1`. После выполнения этого блока счётчик `seq` в spike остался на `31`
-(последний файл — `0031_commit.bin` от транзакции 6), новых файлов не появилось. Это
-подтверждает ожидание из брифа, а не проверяет наш код — сам факт отсутствия фикстуры
-и есть требуемый результат для этапа 2 (тест «rollback → decoder видит 0 событий» пишется
-без байтовых данных, просто как утверждение об отсутствии).
+**No files.** PostgreSQL neither decodes nor sends anything into pgoutput for rolled-back
+transactions — no BEGIN, no INSERT, no equivalent of a COMMIT/ABORT message in
+`proto_version=1`. After running this block, the `seq` counter in the spike stayed at `31`
+(the last file — `0031_commit.bin` from transaction 6), no new files appeared. This
+confirms the expectation from the brief rather than testing our own code — the mere absence
+of a fixture is itself the required result for stage 2 (the test "rollback → decoder sees 0
+events" is written without byte data, simply as an assertion of absence).
 
-## Примечание: RELATION-сообщения и `wal_start`/`wal_end` = `0/0` (причина не подтверждена)
+## Note: RELATION messages and `wal_start`/`wal_end` = `0/0` (cause unconfirmed)
 
-Оба сообщения RELATION (`0002_relation.bin`, `0012_relation.bin`) пришли с `wal_start` и
-`wal_end`, равными `0/0`, — в отличие от всех соседних сообщений той же логической
-транзакции: `0002_relation` (`0/0`) идёт прямо перед `0003_insert` (`0/192FFC0`) в рамках
-одного и того же изменения строки, и та же картина повторяется в паре `0012`/`0013`.
+Both RELATION messages (`0002_relation.bin`, `0012_relation.bin`) arrived with `wal_start`
+and `wal_end` equal to `0/0` — unlike every neighboring message in the same logical
+transaction: `0002_relation` (`0/0`) comes right before `0003_insert` (`0/192FFC0`) within
+the same row change, and the same pattern repeats in the `0012`/`0013` pair.
 
-Это не баг `spike.rs`: `pg_walstream::stream::parse_xlogdata_header` читает `wal_start`/
-`wal_end` напрямую из байтов 1..9 и 9..17 заголовка `XLogData`, без какой-либо ветки по типу
-сообщения — то есть клиентский код не мог сам обнулить именно эти два сообщения.
+This is not a bug in `spike.rs`: `pg_walstream::stream::parse_xlogdata_header` reads
+`wal_start`/`wal_end` directly from bytes 1..9 and 9..17 of the `XLogData` header, with no
+branch on message type whatsoever — so client-side code could not have zeroed out precisely
+these two messages on its own.
 
-При этом причина на стороне сервера **не подтверждена и, по всей видимости, ей не является**.
-По исходникам PostgreSQL `change_cb_wrapper` (`logical.c`) выставляет `ctx->write_location =
-change->lsn` один раз перед вызовом `pgoutput_change`; `pgoutput_change` (`pgoutput.c`) сперва
-вызывает `maybe_send_schema()` (эмитирует RELATION), затем эмитирует само row-сообщение —
-и оба идут через `WalSndPrepareWrite(ctx, lsn, ...)` с одним и тем же неизменным
-`ctx->write_location`. Ничего между этими двумя вызовами `write_location` не обнуляет. То есть
-по логике сервера RELATION и последовавшее за ним row-сообщение должны нести одинаковый,
-ненулевой LSN — ровно то, чего мы НЕ наблюдаем в захваченных данных. Причина обнуления
-неизвестна: код `pg_walstream` 0.8.1, заполняющий эти поля, тоже не содержит спецобработки по
-типу сообщения, так что механизм не локализован ни на сервере (по прочтении исходников), ни в
-клиентской библиотеке (по прочтении её кода) — то есть открытый вопрос, а не установленный факт.
-Дальнейшее расследование не проводилось: это было бы отдельной задачей (снятие дампа пакетов на
-проводе или повторное чтение того же стрима другой клиентской библиотекой, чтобы понять, идёт
-ли `0/0` уже по сети или обнуляется где-то ещё).
+At the same time, a server-side cause is **not confirmed and, by all appearances, is not the
+explanation**. Reading the PostgreSQL source, `change_cb_wrapper` (`logical.c`) sets
+`ctx->write_location = change->lsn` once before calling `pgoutput_change`; `pgoutput_change`
+(`pgoutput.c`) first calls `maybe_send_schema()` (which emits RELATION), then emits the row
+message itself — and both go through `WalSndPrepareWrite(ctx, lsn, ...)` with the same
+unchanged `ctx->write_location`. Nothing between these two calls zeroes `write_location`. In
+other words, by the server's own logic RELATION and the row message that follows it should
+carry the same, non-zero LSN — exactly what we do NOT observe in the captured data. The
+cause of the zeroing is unknown: the `pg_walstream` 0.8.1 code that fills these fields also
+contains no special handling by message type, so the mechanism isn't localized either on the
+server (by reading its source) or in the client library (by reading its code) — i.e. this is
+an open question, not an established fact. No further investigation was carried out: that
+would be a separate task (capturing a packet dump on the wire, or re-reading the same stream
+with a different client library, to find out whether the `0/0` already comes over the
+network or gets zeroed somewhere else).
 
-Операционный вывод не зависит от причины: декодер этапа 2 не должен полагаться на
-`wal_start`/`wal_end` из обёртки RELATION-сообщения как на значимую позицию для чего-либо
-(например, для чекпоинта прогресса).
+The operational conclusion doesn't depend on the cause: the stage-2 decoder must not rely on
+`wal_start`/`wal_end` from the RELATION message's wrapper as a meaningful position for
+anything (e.g. for a progress checkpoint).
 
-## Итоговая раскладка по типам сообщений
+## Final breakdown by message type
 
-| Тип | Кол-во файлов |
+| Type | File count |
 |-----|---------------|
 | `begin` | 9 |
 | `commit` | 9 |
@@ -187,10 +192,10 @@ change->lsn` один раз перед вызовом `pgoutput_change`; `pgout
 | `insert` | 4 |
 | `update` | 4 |
 | `delete` | 3 |
-| **Итого** | **31** |
+| **Total** | **31** |
 
-Все шесть обязательных типов сообщений присутствуют (BEGIN, COMMIT, RELATION, INSERT, UPDATE,
-DELETE). RELATION встречается ровно дважды — по одному разу на таблицу (`users`, `items`) в
-этом прогоне; это наблюдение для данного набора, а не правило протокола — см.
-`docs/pgoutput-notes.md` §6. TRUNCATE/TYPE/ORIGIN сообщений в этом наборе SQL не возникает —
-они не входили в объём Task 4.
+All six required message types are present (BEGIN, COMMIT, RELATION, INSERT, UPDATE,
+DELETE). RELATION occurs exactly twice — once per table (`users`, `items`) in this run;
+that's an observation about this particular set, not a protocol rule — see
+`docs/pgoutput-notes.md` §6. No TRUNCATE/TYPE/ORIGIN messages occur in this SQL set — they
+were out of scope for Task 4.

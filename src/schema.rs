@@ -1,10 +1,10 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     pub name: String,
-    /// Флаг 1 в сообщении RELATION: колонка входит в replica identity.
+    /// Flag 1 in the RELATION message: the column is part of the replica identity.
     pub is_key: bool,
     pub type_oid: u32,
-    /// Знаковый: -1 означает «модификатор не задан».
+    /// Signed: -1 means "no modifier set".
     pub atttypmod: i32,
 }
 
@@ -13,16 +13,16 @@ pub struct Relation {
     pub id: u32,
     pub namespace: String,
     pub name: String,
-    /// relreplident из pg_class: b'd' DEFAULT, b'n' NOTHING, b'f' FULL, b'i' INDEX.
+    /// relreplident from pg_class: b'd' DEFAULT, b'n' NOTHING, b'f' FULL, b'i' INDEX.
     pub replica_identity: u8,
     pub columns: Vec<Column>,
 }
 
 use std::collections::HashMap;
 
-/// Кэш описаний таблиц, живущий в рамках одной сессии репликации.
-/// Row-сообщения ссылаются на таблицу по OID и не несут имён колонок —
-/// имена берутся отсюда по индексу.
+/// A cache of table descriptions, scoped to a single replication session.
+/// Row messages reference a table by OID and carry no column names —
+/// names are looked up here by index.
 #[derive(Debug, Default)]
 pub struct RelationCache {
     by_id: HashMap<u32, Relation>,
@@ -33,7 +33,7 @@ impl RelationCache {
         Self::default()
     }
 
-    /// Повторный RELATION для известного OID заменяет запись целиком.
+    /// A repeated RELATION for a known OID replaces the entry entirely.
     pub fn put(&mut self, relation: Relation) {
         self.by_id.insert(relation.id, relation);
     }
@@ -42,8 +42,8 @@ impl RelationCache {
         self.by_id.get(&id)
     }
 
-    /// Полный сброс. Вызывается при реконнекте: сервер перешлёт RELATION
-    /// перед первым row-сообщением каждой таблицы в новой сессии.
+    /// A full reset. Called on reconnect: the server will resend RELATION
+    /// before the first row message for each table in the new session.
     pub fn clear(&mut self) {
         self.by_id.clear();
     }
@@ -81,24 +81,24 @@ mod tests {
 
     #[test]
     fn repeated_relation_for_same_oid_replaces_the_entry() {
-        // Повторный RELATION — штатное сообщение (DDL, смена replica identity,
-        // изменение публикации), и он обязан ЗАМЕНИТЬ запись, а не быть ошибкой
-        // и не быть проигнорированным.
+        // A repeated RELATION is a routine message (DDL, a replica identity change,
+        // a publication change), and it must REPLACE the entry, rather than being an error
+        // or being ignored.
         let mut cache = RelationCache::new();
         cache.put(rel(1, "users", &["id", "name"]));
         cache.put(rel(1, "users", &["id", "name", "email"]));
-        assert_eq!(cache.len(), 1, "тот же OID не создаёт вторую запись");
         assert_eq!(
-            cache.get(1).unwrap().columns.len(),
-            3,
-            "победила новая схема"
+            cache.len(),
+            1,
+            "the same OID does not create a second entry"
         );
+        assert_eq!(cache.get(1).unwrap().columns.len(), 3, "the new schema won");
     }
 
     #[test]
     fn clear_drops_everything() {
-        // Кэш живёт в рамках сессии репликации: при реконнекте сбрасывается целиком,
-        // потому что сервер перешлёт RELATION заново, а старая схема может быть устаревшей.
+        // The cache is scoped to the replication session: on reconnect it is reset entirely,
+        // because the server will resend RELATION, and the old schema may be stale.
         let mut cache = RelationCache::new();
         cache.put(rel(1, "users", &["id"]));
         cache.put(rel(2, "items", &["id"]));

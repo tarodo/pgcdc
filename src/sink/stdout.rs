@@ -3,11 +3,11 @@ use crate::error::PgcdcError;
 use crate::lsn::Lsn;
 use crate::transaction::Transaction;
 
-/// JSONL на stdout: одна строка на изменение. Только для разработки —
-/// durability у трубы нет, и это объявлено честно.
+/// JSONL on stdout: one line per change. Development only —
+/// a pipe has no durability, and that is stated honestly.
 #[derive(Debug, Default)]
 pub struct StdoutSink {
-    /// Наибольшая принятая позиция с прошлого барьера.
+    /// The highest position accepted since the last barrier.
     pending: Option<Lsn>,
 }
 
@@ -38,8 +38,8 @@ impl Sink for StdoutSink {
     }
 }
 
-/// Сериализация транзакции в JSONL. Вынесена из `StdoutSink`, чтобы её можно было
-/// проверить напрямую, а не через тестовый дублёр.
+/// Serializes a transaction into JSONL. Extracted out of `StdoutSink` so it can be
+/// tested directly, rather than through a test double.
 pub(crate) fn write_changes<W: std::io::Write>(
     w: &mut W,
     tx: &Transaction,
@@ -52,11 +52,11 @@ pub(crate) fn write_changes<W: std::io::Write>(
     Ok(())
 }
 
-/// Барьер: доводит `w` до устройства и возвращает то, что накопилось в
-/// `pending`. Вынесена из `StdoutSink`, чтобы можно было проверить напрямую,
-/// что `flush` потока действительно вызывается, а не только что метод
-/// возвращает верную позицию (review Task 2, round 1, F3) — дублёр в тестах
-/// мог бы забыть вызов `flush` и остаться неотличим от честной реализации.
+/// The barrier: commits `w` to the device and returns what has accumulated in
+/// `pending`. Extracted out of `StdoutSink` so it's possible to check directly
+/// that the stream's `flush` is really called, not just that the method
+/// returns the right position (review Task 2, round 1, F3) — a test double in tests
+/// could forget the `flush` call and remain indistinguishable from a genuine implementation.
 pub(crate) fn flush_pending<W: std::io::Write>(
     w: &mut W,
     pending: &mut Option<Lsn>,
@@ -102,53 +102,50 @@ mod tests {
 
     #[test]
     fn shipped_serializer_writes_one_line_per_change() {
-        // Прямое покрытие настоящего кода записи, а не дублёра: подмени здесь
-        // JSONL на один массив на транзакцию — и этот тест обязан покраснеть.
+        // Direct coverage of the real write code, not a test double: swap
+        // JSONL here for one array per transaction — and this test must go red.
         let mut buf: Vec<u8> = Vec::new();
         write_changes(&mut buf, &two_change_tx()).unwrap();
         let text = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "две строки на две записи");
+        assert_eq!(lines.len(), 2, "two lines for two changes");
         assert!(lines[0].contains(r#""id":"1""#));
         assert!(lines[1].contains(r#""id":"2""#));
-        assert!(
-            text.ends_with('\n'),
-            "каждая строка завершена переводом строки"
-        );
+        assert!(text.ends_with('\n'), "each line ends with a newline");
         for line in lines {
-            serde_json::from_str::<serde_json::Value>(line).expect("каждая строка — валидный JSON");
+            serde_json::from_str::<serde_json::Value>(line).expect("each line is valid JSON");
         }
     }
 
     #[tokio::test]
     async fn flush_with_nothing_pending_reports_no_position() {
-        // F1 (review, round 1): барьер на пустом sink'е не имеет права
-        // изобретать позицию — на пустом тике идле следующей задачи это
-        // означало бы подтвердить то, что никогда не писалось.
+        // F1 (review, round 1): a barrier on an empty sink has no right to
+        // invent a position — on an idle tick of the next task this would
+        // mean acknowledging something that was never written.
         let mut s = StdoutSink::new();
         assert_eq!(
             s.flush().await.unwrap(),
             None,
-            "нечего было принимать — нечего подтверждать"
+            "there was nothing to accept — nothing to acknowledge"
         );
     }
 
     #[tokio::test]
     async fn a_second_flush_right_after_the_first_reports_nothing_new() {
-        // F1 (review, round 1): второй барьер подряд, без новой транзакции
-        // между ними, обязан отчитаться `None`, а не повторить прошлую позицию.
+        // F1 (review, round 1): a second barrier right after the first, with no new
+        // transaction in between, must report `None`, not repeat the previous position.
         let mut s = StdoutSink::new();
         s.write_transaction(&two_change_tx()).await.unwrap();
         assert_eq!(s.flush().await.unwrap(), Some(Lsn(0x1030)));
         assert_eq!(
             s.flush().await.unwrap(),
             None,
-            "повторный барьер без новой транзакции не должен ничего доводить"
+            "a repeated barrier with no new transaction must not commit anything"
         );
     }
 
-    /// Пишет в память и запоминает, был ли реально вызван `flush`, — чтобы
-    /// проверить сам барьер, а не только его возвращаемое значение.
+    /// Writes into memory and remembers whether `flush` was actually called — to
+    /// check the barrier itself, not just its return value.
     struct RecordingWriter {
         flushed: bool,
     }
@@ -165,20 +162,20 @@ mod tests {
 
     #[test]
     fn flush_pending_actually_flushes_the_writer() {
-        // F3 (review, round 1): убери вызов `w.flush()` внутри барьера, оставь
-        // только возврат позиции — и этот тест обязан покраснеть, потому что
-        // проверяет реальный код `StdoutSink::flush`, а не дублёра.
+        // F3 (review, round 1): remove the `w.flush()` call inside the barrier, leave
+        // only the position return — and this test must go red, because it
+        // checks the real `StdoutSink::flush` code, not a test double.
         let mut w = RecordingWriter { flushed: false };
         let mut pending = Some(Lsn(0x1030));
         let durable = flush_pending(&mut w, &mut pending).unwrap();
         assert!(
             w.flushed,
-            "барьер обязан довести поток до устройства, а не только вернуть позицию"
+            "the barrier must commit the stream to the device, not just return the position"
         );
         assert_eq!(durable, Some(Lsn(0x1030)));
         assert_eq!(
             pending, None,
-            "барьер обязан забрать ожидающую позицию, оставив None"
+            "the barrier must take the pending position, leaving None"
         );
     }
 }

@@ -9,17 +9,17 @@ use crate::schema::{Relation, RelationCache};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transaction {
     pub xid: u32,
-    /// LSN самой записи коммита. Идёт в JSON как ключ дедупликации.
+    /// LSN of the commit record itself. Goes into JSON as the deduplication key.
     pub commit_lsn: Lsn,
-    /// LSN сразу за записью коммита. ЭТО подтверждаем PostgreSQL.
+    /// LSN right after the commit record. THIS is what we acknowledge to PostgreSQL.
     pub end_lsn: Lsn,
     pub commit_timestamp: DateTime<Utc>,
     pub changes: Vec<ChangeEvent>,
 }
 
-/// Накапливает изменения между BEGIN и COMMIT. Ничего не отдаёт наружу,
-/// пока не увидит COMMIT: откаченные транзакции PostgreSQL не присылает вовсе,
-/// но незавершённые — вполне, и отдавать их нельзя.
+/// Accumulates changes between BEGIN and COMMIT. Emits nothing outward
+/// until it sees COMMIT: PostgreSQL never sends rolled-back transactions at all,
+/// but it does send unfinished ones, and those must not be emitted.
 #[derive(Debug)]
 pub struct Assembler {
     open: Option<OpenTx>,
@@ -52,26 +52,27 @@ impl Assembler {
         }
     }
 
-    /// Пуст ли буфер. Пустота — часть условия из Q18, по которому keepalive
-    /// разрешено двигать слот, но НЕ единственная часть сама по себе: она
-    /// достаточна только пока запись, mark-durable и ack идут одним синхронным
-    /// шагом. Групповой ACK по таймеру это допущение ломает — см. DECISIONS.md
-    /// Q26(a): для этапа 3 условие — пустой буфер И processed == durable.
+    /// Whether the buffer is empty. Emptiness is part of the condition from Q18,
+    /// under which keepalive is allowed to advance the slot, but it is NOT the
+    /// only part on its own: it is sufficient only as long as write, mark-durable
+    /// and ack happen as one synchronous step. Group ACK on a timer breaks that
+    /// assumption — see DECISIONS.md Q26(a): for stage 3 the condition is
+    /// empty buffer AND processed == durable.
     pub fn is_empty(&self) -> bool {
         self.open.is_none()
     }
 
-    /// Сколько изменений накоплено в открытой транзакции. Для счётчика
-    /// `transaction_buffer_size`; на решения в коде не влияет.
+    /// How many changes have accumulated in the open transaction. For the
+    /// `transaction_buffer_size` counter; does not affect decisions in the code.
     ///
-    /// НЕ эквивалентно `is_empty()`, и это намеренно: открытая транзакция без
-    /// единой строки (например, сразу после BEGIN) даёт `len() == 0`, пока
-    /// `is_empty()` уже `false`, потому что одна считает буферизованные
-    /// изменения, а другая — открыта ли транзакция вообще. Гейт продвижения
-    /// слота по keepalive обязан оставаться на `is_empty()`: замена его на
-    /// `len() == 0` пропустила бы открытую, но ещё пустую транзакцию и
-    /// позволила бы слоту продвинуться поверх нерождённых строк — тихая
-    /// потеря данных, которая выглядела бы как безобидное упрощение.
+    /// NOT equivalent to `is_empty()`, and this is deliberate: an open transaction
+    /// without a single row (for example, right after BEGIN) gives `len() == 0`
+    /// while `is_empty()` is already `false`, because one counts buffered
+    /// changes, while the other tracks whether a transaction is open at all. The
+    /// keepalive slot-advancement gate must stay on `is_empty()`: replacing it
+    /// with `len() == 0` would let through an open but still empty transaction
+    /// and would allow the slot to advance past not-yet-born rows — a silent
+    /// loss of data that would look like a harmless simplification.
     pub fn len(&self) -> usize {
         self.open.as_ref().map_or(0, |o| o.changes.len())
     }
@@ -99,10 +100,11 @@ impl Assembler {
                 Ok(None)
             }
             PgOutputMessage::Insert { relation_id, tuple } => {
-                // Порядок проверок значим (M12 разбора всей ветки): без открытой
-                // транзакции ошибка обязана называться так, а не «неизвестное
-                // отношение», даже если relation тоже не в кэше. Лимит — следующая
-                // по дешевизне проверка, до похода в кэш и построения строки.
+                // The order of checks matters (M12 of the whole branch's review):
+                // without an open transaction, the error must be named this way, not
+                // "unknown relation", even if the relation isn't in the cache either.
+                // The limit is the next check by cost, before hitting the cache and
+                // building the row.
                 let open = self.open.as_mut().ok_or_else(|| {
                     PgcdcError::Decode("row message outside a transaction".into())
                 })?;
@@ -116,9 +118,9 @@ impl Assembler {
                     .ok_or(PgcdcError::UnknownRelation { relation_id })?;
                 let (after, unchanged) = build_full_row(rel, &tuple)?;
                 if !unchanged.is_empty() {
-                    // На INSERT этот тег не приходит: значение записывается в той
-                    // же транзакции и reorder buffer его разрешает. Если он
-                    // всё-таки появился — это не наш случай, и молчать нельзя.
+                    // This tag never arrives on INSERT: the value is written in the
+                    // same transaction and the reorder buffer resolves it. If it
+                    // shows up anyway — that's not our case, and staying silent is not an option.
                     return Err(PgcdcError::Decode(format!(
                         "unexpected unchanged-TOAST markers on INSERT: {unchanged:?}"
                     )));
@@ -252,11 +254,11 @@ impl Assembler {
     }
 }
 
-/// Полный кортеж — тег `'N'` или `'O'`. В нём запись на каждую колонку.
-/// `'n'` здесь означает настоящий SQL NULL. `'u'` означает, что сервер не переслал
-/// неизменившееся TOAST-значение: колонка в строку не попадает вовсе, её имя
-/// возвращается вторым элементом, чтобы уехать в `unchanged_columns`.
-/// Записать её как `null` было бы тихой порчей — потребитель решил бы, что значение обнулили.
+/// A full tuple — tag `'N'` or `'O'`. It carries an entry for every column.
+/// `'n'` here means a real SQL NULL. `'u'` means the server did not forward
+/// an unchanged TOAST value: the column doesn't make it into the row at all, its name
+/// is returned as the second element so it can end up in `unchanged_columns`.
+/// Writing it as `null` would be silent corruption — the consumer would conclude the value was nulled out.
 fn build_full_row(rel: &Relation, tuple: &TupleData) -> Result<(Row, Vec<String>), PgcdcError> {
     check_arity(rel, tuple)?;
     let mut row = Row::new();
@@ -275,9 +277,9 @@ fn build_full_row(rel: &Relation, tuple: &TupleData) -> Result<(Row, Vec<String>
     Ok((row, unchanged))
 }
 
-/// Кортеж `'K'` — только replica identity. Число элементов равно числу колонок
-/// таблицы, но неключевые заполнены `'n'`, и это НЕ NULL, а «сервер не прислал».
-/// Поэтому в строку попадает только то, что реально приехало.
+/// The `'K'` tuple — replica identity only. The number of elements equals the number
+/// of columns in the table, but non-key ones are filled with `'n'`, and that is NOT
+/// NULL, it means "the server did not send it". So only what actually arrived makes it into the row.
 fn build_key_row(rel: &Relation, tuple: &TupleData) -> Result<Row, PgcdcError> {
     check_arity(rel, tuple)?;
     let mut row = Row::new();
@@ -301,15 +303,16 @@ fn check_arity(rel: &Relation, tuple: &TupleData) -> Result<(), PgcdcError> {
     Ok(())
 }
 
-/// Полный старый кортеж (тег `'O'`, UPDATE или DELETE) не должен нести маркер
-/// unchanged-TOAST. На PostgreSQL 16 это недостижимо: сервер разворачивает
-/// внешние (TOASTed) атрибуты в старую строку целиком до того, как её увидит
-/// плагин — это же и есть причина, по которой заморозенный `'u'`-захват
-/// (`tests/fixtures/0025_update.bin`) несёт полные 9600 байт именно в старом
-/// кортеже, а однобайтовый маркер — только в новом. Но недостижимость на
-/// сегодняшнем сервере — это допущение о его поведении, а не гарантия;
-/// молча терять колонку без списка, если оно всё же нарушится, — ровно тот
-/// вариант, который отвергнут в Q15. Поэтому проверяем как инвариант.
+/// A full old tuple (tag `'O'`, UPDATE or DELETE) must not carry an
+/// unchanged-TOAST marker. On PostgreSQL 16 this is unreachable: the server
+/// flattens external (TOASTed) attributes into the old row in full before the
+/// plugin sees it — this is exactly why the frozen `'u'`-marker capture
+/// (`tests/fixtures/0025_update.bin`) carries the full 9600 bytes in the old
+/// tuple specifically, and the single-byte marker only in the new one. But
+/// unreachability on today's server is an assumption about its behavior, not
+/// a guarantee; silently dropping a column without a record of it, should
+/// that assumption ever break, is exactly the option rejected in Q15.
+/// So we check it as an invariant.
 fn reject_unchanged_toast_in_full_old_tuple(unchanged: &[String]) -> Result<(), PgcdcError> {
     if !unchanged.is_empty() {
         return Err(PgcdcError::Decode(format!(
@@ -374,9 +377,9 @@ mod tests {
 
     #[test]
     fn key_tuple_omits_columns_the_server_did_not_send() {
-        // В 0019_delete.bin строка на момент удаления имела title='Widget', qty=7.
-        // Оба приехали как 'n'. Подать их как null — вранье о данных: значения
-        // существовали, сервер их просто не прислал.
+        // In 0019_delete.bin the row at the time of deletion had title='Widget', qty=7.
+        // Both arrived as 'n'. Reporting them as null would be lying about the data: the
+        // values existed, the server simply did not send them.
         let tuple = TupleData {
             columns: vec![
                 ColumnValue::Text("10".into()),
@@ -385,13 +388,13 @@ mod tests {
             ],
         };
         let row = build_key_row(&items_relation(), &tuple).unwrap();
-        assert_eq!(row.len(), 1, "только присланная колонка");
+        assert_eq!(row.len(), 1, "only the column that arrived");
         assert_eq!(row.get("id").unwrap(), "10");
         assert!(
             !row.contains_key("title"),
-            "title отсутствует, а не равен null"
+            "title is absent, not equal to null"
         );
-        assert!(!row.contains_key("qty"), "qty отсутствует, а не равен null");
+        assert!(!row.contains_key("qty"), "qty is absent, not equal to null");
     }
 
     #[test]
@@ -406,9 +409,12 @@ mod tests {
         let (row, unchanged) = build_full_row(&items_relation(), &tuple).unwrap();
         assert!(
             row.get("title").unwrap().is_null(),
-            "'n' в полном кортеже — настоящий NULL"
+            "'n' in a full tuple is a real NULL"
         );
-        assert!(!row.contains_key("qty"), "'u' не попадает в строку вообще");
+        assert!(
+            !row.contains_key("qty"),
+            "'u' does not end up in the row at all"
+        );
         assert_eq!(unchanged, vec!["qty".to_string()]);
     }
 
@@ -458,7 +464,10 @@ mod tests {
             .handle(insert(), Lsn(0x200), &mut cache)
             .unwrap()
             .is_none());
-        assert!(!a.is_empty(), "открытая транзакция держит буфер непустым");
+        assert!(
+            !a.is_empty(),
+            "an open transaction keeps the buffer non-empty"
+        );
     }
 
     #[test]
@@ -476,21 +485,29 @@ mod tests {
         let tx = a
             .handle(commit(), Lsn(0x1000), &mut cache)
             .unwrap()
-            .expect("commit отдаёт транзакцию");
+            .expect("commit emits the transaction");
         assert_eq!(tx.xid, 737);
         assert_eq!(tx.commit_lsn, Lsn(0x1000));
-        assert_eq!(tx.end_lsn, Lsn(0x1030), "end_lsn отдельно от commit_lsn");
+        assert_eq!(
+            tx.end_lsn,
+            Lsn(0x1030),
+            "end_lsn is separate from commit_lsn"
+        );
         assert_eq!(tx.changes.len(), 1);
         let ev = &tx.changes[0];
         assert_eq!(ev.table, "users");
         assert_eq!(ev.transaction_id, 737);
-        assert_eq!(ev.lsn, Lsn(0x200), "у события — wal_start своей строки");
+        assert_eq!(
+            ev.lsn,
+            Lsn(0x200),
+            "the event carries its own row's wal_start"
+        );
         assert_eq!(
             ev.commit_lsn,
             Lsn(0x1000),
-            "а commit_lsn общий на транзакцию"
+            "while commit_lsn is shared across the transaction"
         );
-        assert!(a.is_empty(), "после коммита буфер пуст");
+        assert!(a.is_empty(), "after commit the buffer is empty");
     }
 
     #[test]
@@ -505,11 +522,11 @@ mod tests {
             &mut cache,
         )
         .unwrap();
-        assert_eq!(a.len(), 0, "BEGIN сам по себе изменений не добавляет");
+        assert_eq!(a.len(), 0, "BEGIN by itself does not add any changes");
         a.handle(insert(), Lsn(0x200), &mut cache).unwrap();
         assert_eq!(a.len(), 1);
         a.handle(commit(), Lsn(0x1000), &mut cache).unwrap();
-        assert_eq!(a.len(), 0, "коммит опустошает буфер");
+        assert_eq!(a.len(), 0, "commit empties the buffer");
     }
 
     #[test]
@@ -532,28 +549,28 @@ mod tests {
         assert_eq!(after.get("id").unwrap(), "1");
         assert!(
             after.get("name").unwrap().is_null(),
-            "SQL NULL становится JSON null"
+            "SQL NULL becomes JSON null"
         );
     }
 
     #[test]
     fn row_outside_a_transaction_wins_over_unknown_relation() {
-        // Без BEGIN ошибка обязана быть "row message outside a transaction",
-        // а не UnknownRelation, даже если relation тоже не в кэше (M12: порядок
-        // проверок в ветке Insert — open, затем лимит, затем поиск relation).
+        // Without BEGIN the error must be "row message outside a transaction",
+        // not UnknownRelation, even if the relation isn't in the cache either (M12:
+        // the order of checks in the Insert arm — open, then limit, then relation lookup).
         let mut cache = RelationCache::new();
         let mut a = Assembler::new(1000);
         let err = a.handle(insert(), Lsn(0x200), &mut cache).unwrap_err();
         assert!(
             matches!(&err, PgcdcError::Decode(msg) if msg.contains("outside a transaction")),
-            "получили {err:?}"
+            "got {err:?}"
         );
     }
 
     #[test]
     fn row_for_unknown_relation_is_fatal() {
-        // Невозможный поиск отношения — фатальная ошибка по спеке §15,
-        // а не повод пропустить строку.
+        // A failed relation lookup is a fatal error per spec §15,
+        // not a reason to skip the row.
         let mut cache = RelationCache::new();
         let mut a = Assembler::new(1000);
         a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
@@ -583,8 +600,8 @@ mod tests {
 
     #[test]
     fn reset_drops_a_half_assembled_transaction() {
-        // При реконнекте недособранная транзакция выбрасывается: её BEGIN был
-        // после confirmed_flush_lsn, значит она придёт заново целиком.
+        // On reconnect, an incompletely assembled transaction is discarded: its BEGIN was
+        // after confirmed_flush_lsn, so it will arrive again in full.
         let mut cache = RelationCache::new();
         let mut a = Assembler::new(1000);
         a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
@@ -595,8 +612,8 @@ mod tests {
 
     #[test]
     fn relation_outside_a_transaction_is_accepted() {
-        // RELATION приходит внутри транзакции в наших фикстурах, но кэш —
-        // сессионный, и сообщение не обязано быть частью транзакции.
+        // RELATION arrives inside a transaction in our fixtures, but the cache is
+        // session-scoped, and the message is not required to be part of a transaction.
         let mut cache = RelationCache::new();
         let mut a = Assembler::new(1000);
         assert!(a
@@ -608,7 +625,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(cache.len(), 1);
-        assert!(a.is_empty(), "RELATION не открывает транзакцию");
+        assert!(a.is_empty(), "RELATION does not open a transaction");
     }
 
     #[test]
@@ -705,13 +722,13 @@ mod tests {
         assert_eq!(ev.before.as_ref().unwrap().get("bio").unwrap(), "old bio");
         assert!(
             !ev.after.as_ref().unwrap().contains_key("bio"),
-            "несланное TOAST-значение не попадает в after"
+            "an unsent TOAST value does not end up in after"
         );
         assert_eq!(ev.unchanged_columns, vec!["bio".to_string()]);
         assert_eq!(
             ev.lsn,
             Lsn(0x200),
-            "C2: lsn — позиция самой строки (wal_start), а не Lsn(0)"
+            "C2: lsn is the position of the row itself (wal_start), not Lsn(0)"
         );
     }
 
@@ -786,19 +803,23 @@ mod tests {
         let ev = &tx.changes[0];
         assert_eq!(ev.operation, Operation::Delete);
         assert_eq!(ev.before_kind, Some(BeforeKind::Key));
-        assert!(ev.after.is_none(), "у DELETE нового кортежа нет");
-        assert_eq!(ev.lsn, Lsn(0x200), "у события — wal_start своей строки");
+        assert!(ev.after.is_none(), "DELETE has no new tuple");
+        assert_eq!(
+            ev.lsn,
+            Lsn(0x200),
+            "the event carries its own row's wal_start"
+        );
         let before = ev.before.as_ref().unwrap();
         assert_eq!(before.len(), 1);
         assert!(
             !before.contains_key("title"),
-            "заглушка не превращается в null"
+            "a stub does not turn into null"
         );
     }
 
     #[test]
     fn serialized_delete_event_matches_the_contract() {
-        // Проверка формы наружу, а не только внутренних структур.
+        // Checking the outward shape, not just internal structures.
         let mut cache = RelationCache::new();
         let mut a = Assembler::new(1000);
         a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
@@ -882,10 +903,10 @@ mod tests {
         let ev = &tx.changes[0];
         assert_eq!(ev.before_kind, Some(BeforeKind::Key));
         let before = ev.before.as_ref().unwrap();
-        assert_eq!(before.len(), 1, "только присланная колонка");
+        assert_eq!(before.len(), 1, "only the column that arrived");
         assert!(
             !before.contains_key("title"),
-            "заглушка не превращается в null"
+            "a stub does not turn into null"
         );
     }
 
@@ -930,7 +951,7 @@ mod tests {
         let before = ev.before.as_ref().unwrap();
         assert!(
             before.get("title").unwrap().is_null(),
-            "настоящий NULL в полном старом кортеже должен остаться null"
+            "a real NULL in a full old tuple must stay null"
         );
     }
 
@@ -960,7 +981,7 @@ mod tests {
                 &mut cache,
             )
             .unwrap_err();
-        assert!(matches!(err, PgcdcError::Decode(_)), "получили {err:?}");
+        assert!(matches!(err, PgcdcError::Decode(_)), "got {err:?}");
     }
 
     #[test]
@@ -996,7 +1017,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, PgcdcError::Decode(msg) if msg.contains("title")),
-            "получили {err:?}"
+            "got {err:?}"
         );
     }
 
@@ -1044,7 +1065,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, PgcdcError::Decode(msg) if msg.contains("title")),
-            "получили {err:?}"
+            "got {err:?}"
         );
     }
 
@@ -1080,7 +1101,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, PgcdcError::Decode(msg) if msg.contains("title")),
-            "получили {err:?}"
+            "got {err:?}"
         );
     }
 

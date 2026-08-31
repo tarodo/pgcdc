@@ -1,7 +1,7 @@
 [env]
-# Каждый интеграционный тест поднимает свой Testcontainers Postgres; без
-# явного предела `cargo test` гонит их все параллельно и на этом наборе (и
-# тем более со следующим тестом, тоже поднимающим процесс и контейнер) уже
-# упирается в Docker и CPU на обычной машине. RUST_TEST_THREADS читается
-# встроенным тестовым harness'ом Rust.
+# Every integration test spins up its own Testcontainers Postgres; without
+# an explicit cap, `cargo test` runs them all in parallel and this suite
+# (with each test also launching a process on top of the container) already
+# saturates Docker and the CPU on an ordinary machine. RUST_TEST_THREADS is
+# read by Rust's built-in test harness.
 RUST_TEST_THREADS = "4"

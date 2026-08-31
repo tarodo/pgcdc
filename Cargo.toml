@@ -20,7 +20,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [dev-dependencies]
 libc = "0.2.189"
 testcontainers = "0.28.0"
-# "process" только для тестов (F9: осиротевший дочерний процесс на таймауте
-# теста нужно уметь убить через async Child/kill_on_drop) — прод-бинарь его
-# не использует, поэтому фича не добавлена в [dependencies].
+# "process" is for tests only (F9: an orphaned child process on a test
+# timeout must be killable via async Child/kill_on_drop) — the production
+# binary doesn't use it, so the feature isn't added to [dependencies].
 tokio = { version = "1", features = ["process"] }
