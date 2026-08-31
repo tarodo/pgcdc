@@ -607,3 +607,112 @@ async fn several_transactions_are_acknowledged_as_one_group() {
 
     handle.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slot_advances_while_the_publication_is_idle() {
+    // Классическая проблема: пишут в таблицы вне публикации, нам не приходит
+    // ни одного события, слот стоит, WAL растёт. Продвижение по keepalive
+    // существует ровно ради этого.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    // Таблица ВНЕ публикации: записи в неё двигают WAL, но не порождают событий.
+    client
+        .batch_execute("CREATE TABLE public.noise (id BIGINT PRIMARY KEY, payload TEXT)")
+        .await
+        .unwrap();
+
+    let (tx_send, _tx_recv) = mpsc::unbounded_channel();
+    let cfg = config(&conn);
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None))).await
+    });
+
+    for id in 1..=50 {
+        client
+            .execute(
+                "INSERT INTO noise VALUES ($1, repeat('x', 1000))",
+                &[&(id as i64)],
+            )
+            .await
+            .unwrap();
+    }
+
+    let target: String = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let target = common::parse_lsn(&target).expect("позиция сервера");
+
+    let confirmed = common::wait_for_slot_at_least(&client, "pgcdc_slot", target).await;
+    assert!(
+        confirmed >= target,
+        "слот обязан догнать сервер на простаивающей публикации: {confirmed} < {target}"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
+    // Sink принимает записи, но барьер всегда падает: durable не двигается.
+    // Даже при активном keepalive слот обязан стоять.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let before: String = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'pgcdc_slot'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    let cfg = config(&conn);
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(FailingFlushSink)).await
+    });
+
+    client
+        .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        .await
+        .expect("run должен завершиться, а не висеть")
+        .expect("join");
+    assert!(matches!(result.unwrap_err(), PgcdcError::Sink(_)));
+
+    let after: String = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'pgcdc_slot'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(before, after, "барьер не прошёл — слот не двигается");
+}
+
+/// Принимает записи, но всегда падает на барьере.
+struct FailingFlushSink;
+
+#[async_trait::async_trait]
+impl Sink for FailingFlushSink {
+    fn durability(&self) -> Durability {
+        Durability::Fsync
+    }
+    async fn write_transaction(&mut self, _tx: &Transaction) -> Result<(), PgcdcError> {
+        Ok(())
+    }
+    async fn flush(&mut self) -> Result<Option<Lsn>, PgcdcError> {
+        Err(PgcdcError::Sink("deliberate barrier failure".into()))
+    }
+}

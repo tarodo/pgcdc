@@ -25,6 +25,17 @@ fn replication_url(base: &str) -> String {
     }
 }
 
+/// Можно ли подтвердить позицию, пришедшую в keepalive.
+///
+/// «Буфер пуст» само по себе НЕ достаточно (DECISIONS Q26a). Оно было достаточным,
+/// пока запись, отметка durable и подтверждение происходили в одной итерации; с
+/// групповым барьером появляется окно, где открытых транзакций нет, а принятые
+/// sink'ом и не доведённые до носителя данные есть. Подтвердить позицию внутри
+/// этого окна — значит подтвердить сверх durable и потерять данные при крахе.
+fn may_advance_from_keepalive(assembler_empty: bool, processed: Lsn, durable: Lsn) -> bool {
+    assembler_empty && processed <= durable
+}
+
 pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcError> {
     // Первым делом — до любого подключения и любого лога, где могла бы всплыть строка.
     config.database_url.validate()?;
@@ -148,5 +159,47 @@ pub async fn run(config: Config, mut sink: Box<dyn Sink>) -> Result<(), PgcdcErr
                 debug!(lsn = %durable, "group_acknowledged");
             }
         }
+
+        // Продвижение по keepalive: если мы ничего не должны sink'у, вся позиция,
+        // которую сервер уже отдал, вакуумно durable — в ней не было ни одной
+        // строки нашей публикации. Отмечаем это явно, а не ослабляем try_ack
+        // (DECISIONS Q26b).
+        let server_lsn = Lsn(stream.current_lsn());
+        if may_advance_from_keepalive(assembler.is_empty(), tracker.processed(), tracker.durable())
+            && server_lsn > tracker.acked()
+        {
+            tracker.note_durable(server_lsn);
+            tracker.try_ack(server_lsn)?;
+            stream.shared_lsn_feedback.update_flushed_lsn(server_lsn.0);
+            stream.shared_lsn_feedback.update_applied_lsn(server_lsn.0);
+            stream
+                .send_feedback()
+                .await
+                .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
+            debug!(lsn = %server_lsn, "advanced_from_keepalive");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keepalive_advance_requires_an_empty_buffer() {
+        // Открытая транзакция означает, что часть WAL мы ещё должны sink'у.
+        assert!(!may_advance_from_keepalive(false, Lsn(0x1000), Lsn(0x1000)));
+    }
+
+    #[test]
+    fn keepalive_advance_requires_processed_to_have_caught_up() {
+        // Буфер пуст, но транзакция принята sink'ом и ещё не доведена барьером.
+        // Подтвердить позицию из keepalive здесь — значит подтвердить сверх durable.
+        assert!(!may_advance_from_keepalive(true, Lsn(0x2000), Lsn(0x1000)));
+    }
+
+    #[test]
+    fn keepalive_advance_is_allowed_when_nothing_is_owed() {
+        assert!(may_advance_from_keepalive(true, Lsn(0x1000), Lsn(0x1000)));
     }
 }
