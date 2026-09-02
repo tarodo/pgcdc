@@ -1,0 +1,33 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Unit tests only. The 37 integration tests each start their own Postgres
+      # container and several assert on wall-clock deadlines, so they belong in
+      # the scheduled workflow where a load-induced miss does not block a push.
+      - name: Unit tests
+        run: cargo test --lib

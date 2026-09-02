@@ -1,5 +1,7 @@
 # pgcdc
 
+[![check](https://github.com/tarodo/pgcdc/actions/workflows/check.yml/badge.svg)](https://github.com/tarodo/pgcdc/actions/workflows/check.yml)
+
 A minimal Change Data Capture engine for PostgreSQL, in Rust. It reads logical replication
 events over the `pgoutput` protocol and emits normalized JSON Lines.
 
