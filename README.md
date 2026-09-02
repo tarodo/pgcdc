@@ -378,28 +378,16 @@ median and a spread — not one more run of the above.
 | [DECISIONS.md](DECISIONS.md) | every accepted decision and the alternatives rejected, with reasons |
 | [docs/pgoutput-notes.md](docs/pgoutput-notes.md) | byte-level breakdown of the protocol |
 | [docs/spike-findings.md](docs/spike-findings.md) | what we found in the transport crate, and what must not be used |
+| [docs/how-it-was-built.md](docs/how-it-was-built.md) | the process this project was built with, and what it caught |
 
 ---
 
 ## How this was built
 
-The specification came first and came from a language model: it was generated from a short
-prompt, read, and accepted as binding before any code existed. It was never edited to match
-what got built — every departure is a numbered amendment in
-[DECISIONS.md](DECISIONS.md), which now runs to thirty decisions, each carrying the
-alternatives that were rejected and why.
-
-Work went stage by stage, and each stage ended with an adversarial review whose standard was
-mutation, not coverage: break the code deliberately, and if the suite stays green, the
-coverage was imaginary. That standard earned its keep five times — most sharply at the end,
-when deleting an entire feature, swallowing a sink write failure, and sending the wrong LSN
-on the wire each left all 168 tests passing.
-
-The most serious defect was found by the spec rather than by the tests. Its acceptance
-checklist demands a non-zero exit code when the replication slot is unusable; walking that
-checklist line by line showed the process never exited at all, retrying a hopeless request
-forever while looking perfectly healthy from outside. See [docs/spec.md](docs/spec.md) for
-the checklist, and `Q30` in [DECISIONS.md](DECISIONS.md) for what it cost to fix.
+The initial specification was drafted with an LLM from my prompt, reviewed, and frozen as an
+immutable baseline. Implementation proceeded through staged development, adversarial review,
+and mutation testing. The complete process, and the defects it exposed, are documented
+separately: [docs/how-it-was-built.md](docs/how-it-was-built.md).
 
 ---
 
