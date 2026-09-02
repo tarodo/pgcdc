@@ -53,8 +53,8 @@ fn may_advance_from_keepalive(assembler_empty: bool, processed: Lsn, durable: Ls
 /// (DECISIONS Q19), while a half-assembled transaction arrives again in full, because
 /// its BEGIN was after `confirmed_flush_lsn`.
 ///
-/// The buffer gauge (`transaction_buffer_size`) is zeroed right here, by a separate call
-/// (F1, review Task 2, round 1): its only ordinary write site lives in the receiving
+/// The buffer gauge (`transaction_buffer_size`) is zeroed right here, by a separate call:
+/// its only ordinary write site lives in the receiving
 /// branch of `stream_once` and fires only on a data frame, while this reset happens on a
 /// connection drop without a single new frame. Not zeroing it would mean holding the
 /// last non-zero value arbitrarily long on a publication that goes idle after the drop —
@@ -171,7 +171,7 @@ const SLOT_BUSY_SQLSTATE: &str = "55006";
 /// (`connection/native/error.rs::PgErrorFields::Display`) puts the state code into the
 /// same string as the message text: `"{severity}: {message} (SQLSTATE {code})"`. Both
 /// live runs against a real Postgres confirmed this verbatim: `SQLSTATE 55000` on an
-/// invalidated slot, `SQLSTATE 22023` on a foreign output plugin (round after task 4).
+/// invalidated slot, `SQLSTATE 22023` on a foreign output plugin.
 /// The state code is a five-character identifier that the PostgreSQL protocol never
 /// translates; the `message` next to it is translated when the server has a localized
 /// `lc_messages`.
@@ -184,7 +184,7 @@ fn extract_sqlstate(message: &str) -> Option<&str> {
     (code.len() == 5 && code.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(code)
 }
 
-/// Classifies a `stream.start()` failure (C1, review round after task 4).
+/// Classifies a `stream.start()` failure.
 ///
 /// Before this function, ANY `START_REPLICATION` error was wrapped in
 /// `PgcdcError::Connection` — the recoverable variant — and the process went into an
@@ -282,7 +282,7 @@ fn is_busy_race_reason(reason: &str) -> bool {
 /// failure of a different nature (a transport fault, a pre-flight check failure, a TCP
 /// drop) may wedge itself between two observations of the race without closing the
 /// episode entirely. Zeroing everything on ANY such failure (the first version of this
-/// fix, review round 2 after task 4 finale, I1) fixed one hole and opened the opposite
+/// fix) fixed one hole and opened the opposite
 /// one: a slot held FOREVER by a FOREIGN consumer on a server that on top of that
 /// occasionally drops the connection for an unrelated reason would never accumulate more
 /// time than the interval between two such failures — reproduced by a unit test with the
@@ -404,7 +404,7 @@ fn classify_start_outcome(
         // at all.
         return Err(classify_start_error(slot, e));
     }
-    // P1 (review round 2 after task 4 finale): a failure of a different nature (not the
+    // A failure of a different nature (not the
     // busy race) BREAKS the chain of consecutive observations, it does not close the
     // episode entirely — closing it fully here would fix the summing of unrelated
     // episodes, but would open the opposite hole: a slot held forever by a foreign
@@ -419,7 +419,7 @@ fn classify_start_outcome(
 /// the reconnect check, opening the connection itself. None of these failures can be the
 /// busy race — SQLSTATE 55006 comes back only in the server's answer to
 /// `START_REPLICATION` itself — so such a failure unconditionally BREAKS the chain of
-/// consecutive observations of the race (P1, review round 2 after task 4 finale):
+/// consecutive observations of the race:
 /// without this, the clock accumulated by a past race would keep running for the whole
 /// time the server is unreachable for an entirely different reason, and the interval of
 /// unreachability would add into the accumulated total as if the slot had been answering
@@ -447,8 +447,7 @@ fn interrupt_patience_on_early_failure<T>(
 /// itself rather than bare `Lsn`s precisely so that this read can be pinned by a unit
 /// test at this level: the live proof that the divergence is real is a quiet run where
 /// the metrics report showed `acked` advanced with `received` at zero, the keepalive
-/// acknowledged WAL without accepting a single frame (review Task 2, round 1, F1;
-/// review Task 3, round 1, F3).
+/// acknowledged WAL without accepting a single frame.
 fn session_was_productive(tracker: &LsnTracker, acked_before: Lsn) -> bool {
     tracker.acked() > acked_before
 }
@@ -456,7 +455,7 @@ fn session_was_productive(tracker: &LsnTracker, acked_before: Lsn) -> bool {
 /// The pause before the next connection attempt. Wrapped in a type rather than a bare
 /// `Duration` living inside the infinite loop of `run()` with real `sleep`s — for
 /// testability: in that form the mutation "remove the reset" was caught by no test at
-/// all (review Task 2, round 1, F2).
+/// all.
 struct ReconnectBackoff {
     current: Duration,
     initial: Duration,
@@ -478,7 +477,7 @@ impl ReconnectBackoff {
     /// productivity is up to the caller; what must be passed in here is movement of the
     /// ACKNOWLEDGED position, not of the received one: the keepalive advance on an idle
     /// publication acknowledges WAL without reading anything, and would be wrongly
-    /// judged unproductive (review Task 2, round 1, F1).
+    /// judged unproductive.
     ///
     /// Returns the pause to wait BEFORE this attempt, and advances itself for the next
     /// call.
@@ -497,8 +496,7 @@ impl ReconnectBackoff {
 /// is settled, both places go on to mark it, acknowledge it in the tracker and send
 /// feedback — by word-for-word identical four steps. The barrier is NOT part of this and
 /// cannot be: only the caller decides what counts as durable, this function merely
-/// records the decision (review Task 3, round 1, F1 — otherwise the keepalive path could
-/// quietly acquire a barrier).
+/// records the decision — otherwise the keepalive path could quietly acquire a barrier.
 ///
 /// Returns the tracker's ACKNOWLEDGED position (acked), not the `durable` passed in:
 /// today they coincide, but with a reconnect inside the process (the next stage) a
@@ -521,7 +519,7 @@ async fn acknowledge_durable(
     state.tracker.try_ack(durable)?;
     let acked = state.tracker.acked();
 
-    // The only write site for this position (see the Task 2 brief): both the group
+    // The only write site for this position: both the group
     // barrier and the keepalive advance go through this common tail, so neither of them
     // will grow a second write site.
     metrics.set_last_acknowledged_lsn(acked.0);
@@ -543,7 +541,7 @@ async fn acknowledge_durable(
 /// acknowledge, runs the result through the common tail `acknowledge_durable`. Shared
 /// code for the group timer and for shutdown on a signal: without extracting it into a
 /// separate function these two places would drift apart, and the mutation coverage taken
-/// against the timer branch would not protect the second copy (see the Task 3 brief).
+/// against the timer branch would not protect the second copy.
 async fn flush_and_acknowledge(
     sink: &mut Box<dyn Sink>,
     state: &mut SessionState,
@@ -590,13 +588,13 @@ pub async fn run(
     // counters the report prints are process-wide and survive a reconnect; if the
     // countdown were started anew inside `stream_once` for each session, a process
     // reconnecting more often than `METRICS_REPORT_INTERVAL` would never live long
-    // enough inside a single session for the report to come out at all (review Task 3,
-    // round 1, F1) — and that is exactly the situation where it is needed most, because
+    // enough inside a single session for the report to come out at all — and that is
+    // exactly the situation where it is needed most, because
     // `reconnects`/`errors` in the line exist for its sake.
     let mut last_report = tokio::time::Instant::now();
 
     loop {
-        // I1: the first of two places where the outer reconnect loop looks at the
+        // The first of two places where the outer reconnect loop looks at the
         // shutdown flag (the second is the sliced backoff pause just below). The
         // slicing checks the flag BEFORE each chunk and never once AFTER the last
         // one — a signal landing in exactly that last chunk of the pause never
@@ -645,11 +643,10 @@ pub async fn run(
             Err(e) => return Err(e),
         }
 
-        // The productivity flag is pulled out into `session_was_productive` (review
-        // Task 3, round 1, F3): the decision about what counts as productivity reads
-        // acked, not received (review Task 2, round 1, F1), and that read is pinned by a
-        // unit test at the level of the function itself, not only indirectly through an
-        // integration scenario.
+        // The productivity flag is pulled out into `session_was_productive`: the
+        // decision about what counts as productivity reads acked, not received, and
+        // that read is pinned by a unit test at the level of the function itself, not
+        // only indirectly through an integration scenario.
         let productive = session_was_productive(&state.tracker, acked_before);
         if productive {
             attempt = 0;
@@ -663,7 +660,7 @@ pub async fn run(
             "reconnecting"
         );
 
-        // I1: the second of the two places (the first is the check at the start of
+        // The second of the two places (the first is the check at the start of
         // the pass above). The pause is sliced into chunks of SHUTDOWN_POLL_INTERVAL
         // instead of one sleep(delay) — otherwise a signal arriving in the middle of
         // a pause of up to reconnect_max_ms (30s by default) would be noticed only
@@ -682,7 +679,7 @@ pub async fn run(
         }
 
         // The cache and the assembler are reset, the positions are carried forward, the
-        // buffer gauge is zeroed along with them (F1, review Task 2, round 1).
+        // buffer gauge is zeroed along with them.
         state.reset_for_reconnect(&metrics);
     }
 }
@@ -694,7 +691,7 @@ pub async fn run(
 /// more often than the periodic barrier — with a production setting of several seconds
 /// that made the delay of an orderly stop equal to the length of the acknowledgement
 /// interval, and a supervisor with a short grace period killed the process before it
-/// even noticed the signal (review Task 3, round 2, F2). At the default value
+/// even noticed the signal. At the default value
 /// (`ack_interval_ms = 200`) the loop woke up at this frequency anyway — the constant
 /// costs nothing extra, it only unties the wake-up frequency from the barrier period.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -717,14 +714,13 @@ async fn stream_once(
 ) -> Result<SessionOutcome, PgcdcError> {
     // Captured BEFORE the pre-flight check rather than re-reading `state.durable()`
     // later: the "this is a reconnect" decision is made on entry to the function and
-    // must not quietly adjust itself to whatever happens further inside it (review
-    // Task 2, round 1, F7).
+    // must not quietly adjust itself to whatever happens further inside it.
     let reconnecting = is_reconnect(state.durable());
 
     // Commitment Q25(1): the guard goes BEFORE start(), because start() unconditionally
     // calls ensure_replication_slot() and, with the slot missing, will silently create a
     // new one at the current WAL position, losing everything committed earlier.
-    // I1/P1: wrapped in interrupt_patience_on_early_failure rather than a bare `?` — a
+    // Wrapped in interrupt_patience_on_early_failure rather than a bare `?` — a
     // failure here physically cannot be the busy race (that code comes back only in
     // answer to START_REPLICATION further on), so it MUST break the chain of consecutive
     // observations instead of leaving its clock ticking while the server is unreachable
@@ -748,7 +744,7 @@ async fn stream_once(
     // the gap is re-read as duplicates — this is permitted by invariant 2 (DECISIONS §1)
     // together with the line of the spike's transport commitments (DECISIONS Q25).
     if reconnecting {
-        // I1/P1: by the same device as the pre-flight check above — the reconnect check
+        // By the same device as the pre-flight check above — the reconnect check
         // cannot return the busy race, only SlotAhead or nothing.
         if let Some(warning) = interrupt_patience_on_early_failure(
             check_reconnect(&config.slot, &info_slot, state.durable()),
@@ -775,7 +771,7 @@ async fn stream_once(
     .with_messages(false);
 
     let url = replication_url(config.database_url.expose());
-    // I1/P1: by the same device — opening the TCP connection cannot return the busy race
+    // By the same device — opening the TCP connection cannot return the busy race
     // either, it comes back only in answer to START_REPLICATION itself.
     let mut stream = interrupt_patience_on_early_failure(
         LogicalReplicationStream::new(&url, stream_config)
@@ -806,7 +802,7 @@ async fn stream_once(
         // Only now: the stream is genuinely open and started by the server. Logging this
         // right after the slot check would mean declaring recovery before the server
         // confirmed it — on an unstable server the log would promise a recovery
-        // immediately followed by another drop (review Task 2, round 1, F7).
+        // immediately followed by another drop.
         info!(slot = %config.slot, "postgres_connection_restored");
     }
 
@@ -862,8 +858,7 @@ async fn stream_once(
         // behavior of the single-threaded runtime's driver under the same future drop is
         // NOT established; the integration tests carry `flavor = "multi_thread"` not
         // because frame loss has been proven there, but on the general principle: a test
-        // MUST drive the same driver as production (Task 1; the wording was refined in
-        // Task 4, review round 1, F2).
+        // MUST drive the same driver as production.
         //
         // ONLY next_raw_event is permitted: the other five APIs lead into
         // recover_connection, which restarts from last_received_lsn — the received
@@ -883,7 +878,7 @@ async fn stream_once(
                 metrics.set_last_received_lsn(raw.wal_end.0);
 
                 let msg = decode(&raw.data)?;
-                // F4 (review Task 2, round 1): the buffer length is captured BEFORE
+                // The buffer length is captured BEFORE
                 // `?`, not merely independently of a Some/None result — otherwise an
                 // error inside `handle` skips the gauge update entirely, and it stays
                 // at the last value from the previous frame.
@@ -939,7 +934,7 @@ mod tests {
 
     #[test]
     fn start_replication_rejected_by_the_server_is_fatal_wrong_plugin() {
-        // The cheap C1 branch: the slot carries a foreign output plugin, the server
+        // The cheap branch of SlotUnusable: the slot carries a foreign output plugin, the server
         // answers "option \"proto_version\" = \"1\" is unknown" (SQLSTATE 22023), and
         // pg_walstream wraps that in Protocol (the non-transient variant). The string
         // is constructed as a real one: "(SQLSTATE 22023)" at the tail is exactly what
@@ -955,7 +950,7 @@ mod tests {
 
     #[test]
     fn start_replication_rejected_by_the_server_is_fatal_invalidated_slot() {
-        // The expensive C1 branch: the slot is invalidated by exceeding
+        // The expensive branch of SlotUnusable: the slot is invalidated by exceeding
         // max_slot_wal_keep_size, the server answers SQLSTATE 55000 (reproduced
         // verbatim by a live run during the stage 5 review). The same Protocol
         // envelope, the same verdict.
@@ -970,8 +965,8 @@ mod tests {
     #[test]
     fn start_replication_transport_drop_stays_recoverable() {
         // A connection drop (the socket, not a server answer) MUST stay recoverable —
-        // otherwise the reconnect tests would go red (see the C1 report: the mutation
-        // "make a transport drop fatal").
+        // otherwise the reconnect tests would go red under the mutation
+        // "make a transport drop fatal".
         let e = ReplicationError::transient_connection("connection reset by peer");
         let err = classify_start_error("pgcdc_slot", e);
         assert!(matches!(err, PgcdcError::Connection(_)), "{err:?}");
@@ -984,7 +979,7 @@ mod tests {
         // the previous walsender has not released it yet. It resolves by itself on the
         // next attempt. SQLSTATE 55006 at the tail of the string is the real code of the
         // race (ERRCODE_OBJECT_IN_USE); the distinction MUST rest on it and not on the
-        // substring "is active for PID" (P1, re-review round after task 4): without it
+        // substring "is active for PID": without it
         // in the string this test would exercise only the fallback path.
         let e = ReplicationError::protocol(
             "START_REPLICATION did not enter COPY mode: ERROR:  replication slot \"pgcdc_slot\" is active for PID 4242 (SQLSTATE 55006)",
@@ -1172,9 +1167,9 @@ mod tests {
 
     #[test]
     fn a_non_busy_failure_inside_classify_start_outcome_interrupts_without_summing() {
-        // P1 scenario "an unrelated failure between two races does not sum" (review
-        // round 2 after task 4 finale). Originally this was a test for I1 ("reset ONLY
-        // in the Ok branch"), but a full reset on any failure of a different nature was
+        // Scenario: "an unrelated failure between two races does not sum". Originally
+        // this was a test for "reset ONLY in the Ok branch", but a full reset on any
+        // failure of a different nature was
         // itself excessive — it closed the episode entirely instead of only subtracting
         // the idle interval itself. The numbers here are chosen to check exactly the
         // subtraction: the failure happens 900ms after the first observation, and the
@@ -1277,7 +1272,7 @@ mod tests {
 
     #[test]
     fn a_busy_episode_does_not_survive_an_unrelated_pre_start_failure_in_between() {
-        // I1 reproduction (verbatim from the review): the busy race at moment zero;
+        // Reproduces the scenario: the busy race at moment zero;
         // then the server is unreachable — every attempt fails EARLIER than it gets to
         // classify_start_outcome (the slot pre-flight check or opening the connection,
         // not the answer to START_REPLICATION); then the server came back, and our own
@@ -1336,9 +1331,9 @@ mod tests {
 
     #[test]
     fn slot_busy_patience_escalates_despite_a_periodic_unrelated_failure() {
-        // P1 scenario "a continuously busy slot with a periodic unrelated failure
-        // escalates instead of spinning forever" (review round 2 after task 4 finale).
-        // Reproduces literally the scenario the reviewer described: the default budget
+        // Scenario: "a continuously busy slot with a periodic unrelated failure
+        // escalates instead of spinning forever".
+        // Reproduces literally the scenario described during review: the default budget
         // (30000ms), the slot busy on every attempt EXCEPT one unrelated failure once
         // every 29 seconds, one attempt per second, a simulated hour. Under the first
         // version of this fix (a full reset on any failure of a different nature,
@@ -1471,7 +1466,7 @@ mod tests {
 
     #[test]
     fn session_is_productive_when_acked_advances_via_keepalive_without_new_frames() {
-        // The live proof of the divergence (review Task 3, round 1, F3): in a quiet run
+        // The live proof of the divergence: in a quiet run
         // the metrics report showed the acknowledged position advanced with the
         // received one at zero — the keepalive acknowledged WAL without accepting a
         // single frame. The flag MUST count this session as productive, and a mutation
@@ -1511,8 +1506,8 @@ mod tests {
 
     #[test]
     fn backoff_keeps_growing_across_unproductive_attempts() {
-        // Closes the gap that the previous test set survived (review Task 3, round 1,
-        // F2): the mutation "make the reset unconditional" — `next_delay` always resets
+        // Closes the gap that the previous test set survived: the mutation
+        // "make the reset unconditional" — `next_delay` always resets
         // `current` regardless of `productive` — left both existing backoff tests
         // green, because neither of them looks at the intermediate values when
         // `productive = false`. Under that mutation every call with
@@ -1655,7 +1650,7 @@ mod tests {
 
     #[test]
     fn reconnect_zeroes_the_buffer_gauge_even_with_an_open_transaction() {
-        // F1 (review Task 2, round 1): the reset on a reconnect does not go through the
+        // The reset on a reconnect does not go through the
         // receiving branch of stream_once, where this gauge is normally set — it MUST
         // zero it itself. Without that, on a publication that goes idle after a drop the
         // gauge would hold the last non-zero value forever, instead of honestly showing
