@@ -40,6 +40,17 @@ fn may_advance_from_keepalive(assembler_empty: bool, processed: Lsn, durable: Ls
     assembler_empty && processed <= durable
 }
 
+/// Whether the slot's reported `wal_status` means it can never stream again.
+///
+/// Only `lost` qualifies. `unreserved` means the required WAL is scheduled for
+/// removal at the next checkpoint but has not gone yet, and PostgreSQL documents
+/// that the slot can climb back to `reserved` or `extended` — refusing it would
+/// abort a recoverable process. `None` means the column was NULL or unreadable;
+/// that is not a diagnosis, so it is not fatal either.
+fn slot_health_is_terminal(wal_status: Option<&str>) -> bool {
+    matches!(wal_status, Some("lost"))
+}
+
 /// The state that survives a connection drop.
 ///
 /// The split here is not cosmetic. The tracker's positions are **carried** across a
@@ -729,10 +740,22 @@ async fn stream_once(
         preflight_slot(config.database_url.expose(), &config.slot).await,
         slot_busy_patience,
     )?;
+    if slot_health_is_terminal(info_slot.wal_status.as_deref()) {
+        return Err(PgcdcError::SlotUnusable {
+            slot: config.slot.clone(),
+            reason: "PostgreSQL reports wal_status = 'lost': the WAL this slot \
+                     needed has been removed, so it can never stream again"
+                .to_owned(),
+        });
+    }
     info!(
         slot = %config.slot,
         restart_lsn = ?info_slot.restart_lsn.map(|l| l.to_string()),
         confirmed_flush_lsn = ?info_slot.confirmed_flush_lsn.map(|l| l.to_string()),
+        wal_status = ?info_slot.wal_status,
+        safe_wal_size = ?info_slot.safe_wal_size,
+        catalog_xmin = ?info_slot.catalog_xmin,
+        active = info_slot.active,
         "slot_preflight_ok"
     );
 
@@ -1569,6 +1592,22 @@ mod tests {
     #[test]
     fn keepalive_advance_is_allowed_when_nothing_is_owed() {
         assert!(may_advance_from_keepalive(true, Lsn(0x1000), Lsn(0x1000)));
+    }
+
+    #[test]
+    fn only_a_lost_slot_is_refused_before_streaming() {
+        // `lost` is terminal: the WAL the slot needed is gone and no retry can
+        // bring it back. `unreserved` is not — PostgreSQL documents that it can
+        // return to `reserved` or `extended`, so refusing it would kill a
+        // process that is about to recover, which is the mirror of the defect
+        // Q30 fixed.
+        assert!(slot_health_is_terminal(Some("lost")));
+        assert!(!slot_health_is_terminal(Some("unreserved")));
+        assert!(!slot_health_is_terminal(Some("extended")));
+        assert!(!slot_health_is_terminal(Some("reserved")));
+        // An older server, or a column we could not read, must not be treated
+        // as a failure: absence of evidence is not evidence of a dead slot.
+        assert!(!slot_health_is_terminal(None));
     }
 
     #[test]
