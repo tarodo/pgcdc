@@ -322,6 +322,7 @@ median and a spread — not one more run of the above.
 
 | | |
 |---|---|
+| [docs/spec.md](docs/spec.md) | the binding specification the code was built against, and where it came from |
 | [docs/how-it-works.md](docs/how-it-works.md) | how the code is laid out — written for someone reading Rust for the first time |
 | [DECISIONS.md](DECISIONS.md) | every accepted decision and the alternatives rejected, with reasons |
 | [docs/pgoutput-notes.md](docs/pgoutput-notes.md) | byte-level breakdown of the protocol |
