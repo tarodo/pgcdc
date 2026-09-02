@@ -27,8 +27,17 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       # Unit tests only. 32 of the 37 integration tests start their own Postgres
-      # container, and several of the rest assert on wall-clock deadlines, so
-      # they belong in the scheduled workflow where a load-induced miss does not
+      # container, and two of the rest assert on wall-clock deadlines, so they
+      # belong in the scheduled workflow where a load-induced miss does not
       # block a push.
       - name: Unit tests
         run: cargo test --lib
+
+      # Two integration tests need neither a container nor a clock: they run the
+      # built binary and check what it refuses. The first is the regression test
+      # for a password leaking into stderr, which belongs on every push.
+      - name: Binary-level checks
+        run: |
+          cargo test --test integration -- --exact \
+            libpq_connection_string_is_rejected_without_echoing_the_password \
+            file_output_without_a_path_is_rejected_by_the_binary
