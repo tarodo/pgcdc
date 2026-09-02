@@ -176,7 +176,7 @@ re-reads in full once it's grown long.
 ## Whose decisions these were
 
 None of the above was generated and accepted wholesale. The specification was drafted by a
-language model, on request, from a prompt I wrote; the thirty decisions that followed, the
+language model, on request, from a prompt I wrote; the thirty-one decisions that followed, the
 six-stage plan, the pre-flight guard the spike demanded, what got deliberately broken at each
 review, and the fix for every defect described here were mine. The model was a tool used at
 each of those points — to draft the spec text, to help write and review code — the way a

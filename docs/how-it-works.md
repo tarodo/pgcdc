@@ -626,6 +626,6 @@ classified in `is_fatal()`.
 
 ---
 
-Next: [DECISIONS.md](../DECISIONS.md) — why it was done this way (30 decisions),
+Next: [DECISIONS.md](../DECISIONS.md) — why it was done this way (31 decisions),
 [spike-findings.md](spike-findings.md) — what we found out about the transport library and what
 must not be used, [pgoutput-notes.md](pgoutput-notes.md) — the bytes of the protocol.
