@@ -496,6 +496,14 @@ The most useful part. All of these defects were found by review and **not one of
 Five times over the project. The technique that caught them: **break the code deliberately and see
 whether the suite goes red.** It did not go red, so there is no coverage, whatever the report says.
 
+One trap in the technique, and it fakes a *pass* rather than a failure. Cargo decides what to
+rebuild by comparing modification times, so restoring a mutated file with anything that preserves
+the old timestamp leaves the previous binary in place. The test then goes green without ever
+running the restored code, and the mutation looks like it was caught when nothing was rebuilt at
+all. `touch` the file before rebuilding, and treat a suspiciously instant `cargo test` as the
+symptom rather than as luck. The same trap has a Docker-shaped twin, documented in the
+`Dockerfile`: a `COPY` that restores an mtime lets cargo skip the real build and ship the stub.
+
 Three cases in a row at the finish, all on central claims. The count below is the size of the
 suite **at the time those mutations were run** — do not "correct" it to today's number: the point
 is that 168 tests were green while the code was broken. All three mutations are caught now,
@@ -618,6 +626,6 @@ classified in `is_fatal()`.
 
 ---
 
-Next: [DECISIONS.md](../DECISIONS.md) — why it was done this way (29 decisions),
+Next: [DECISIONS.md](../DECISIONS.md) — why it was done this way (30 decisions),
 [spike-findings.md](spike-findings.md) — what we found out about the transport library and what
 must not be used, [pgoutput-notes.md](pgoutput-notes.md) — the bytes of the protocol.
