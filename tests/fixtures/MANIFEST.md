@@ -1,6 +1,6 @@
 # pgoutput byte fixtures — manifest
 
-Captured in Task 4 (2026-08-30) on a clean slot after `docker compose down -v && docker
+Captured on 2026-08-30 on a clean slot after `docker compose down -v && docker
 compose up -d --wait`: `pgcdc_slot` recreated by `docker/init.sql` at the position right
 after `CREATE PUBLICATION`, then a single run of `./target/debug/spike` drove
 `scripts/gen-fixtures.sql` through in full. File numbering `NNNN_kind.bin` is the ordinal
@@ -198,4 +198,4 @@ All six required message types are present (BEGIN, COMMIT, RELATION, INSERT, UPD
 DELETE). RELATION occurs exactly twice — once per table (`users`, `items`) in this run;
 that's an observation about this particular set, not a protocol rule — see
 `docs/pgoutput-notes.md` §6. No TRUNCATE/TYPE/ORIGIN messages occur in this SQL set — they
-were out of scope for Task 4.
+were out of scope for the capture that produced these fixtures.
