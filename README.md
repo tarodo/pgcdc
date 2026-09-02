@@ -348,3 +348,14 @@ checklist demands a non-zero exit code when the replication slot is unusable; wa
 checklist line by line showed the process never exited at all, retrying a hopeless request
 forever while looking perfectly healthy from outside. See [docs/spec.md](docs/spec.md) for
 the checklist, and `Q30` in [DECISIONS.md](DECISIONS.md) for what it cost to fix.
+
+---
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in this crate by you, as defined in the Apache-2.0 license, shall be dual
+licensed as above, without any additional terms or conditions.
