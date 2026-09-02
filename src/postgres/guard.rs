@@ -28,8 +28,12 @@ pub struct SlotInfo {
 
 /// The slot guard: called on EVERY replication session (`stream_once` in
 /// `replication.rs`) — both on a cold start and on every reconnect, not
-/// just once at first launch. Only the slot's existence is checked here;
-/// on a cold start there's nothing to compare `confirmed_flush_lsn` against —
+/// just once at first launch. Existence and health (`wal_status`,
+/// `safe_wal_size`, `catalog_xmin`, `active`) are checked here; identity is
+/// not — a slot dropped and recreated under the same name passes this guard
+/// indistinguishably from the original, because nothing read here pins a
+/// slot to a particular creation. On a cold start there's nothing to
+/// compare `confirmed_flush_lsn` against —
 /// we have no persistent durable position and never will (DECISIONS
 /// Q4) — while on reconnect the positions returned from here are checked by the
 /// caller via `check_reconnect`. If the slot is missing — we fail, we do NOT create it:

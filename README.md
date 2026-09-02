@@ -235,9 +235,10 @@ durable itself — and is simply skipped. Concretely:
 
 - another consumer advancing the slot while pgcdc was down looks identical to an ordinary
   cold start;
-- the pre-flight check only confirms that a slot with the configured name *exists*
-  (`preflight_slot`, `src/postgres/guard.rs`) — it has no way to tell a recreated slot
-  from the original one;
+- the pre-flight check reads the slot's health (`wal_status`, `safe_wal_size`,
+  `catalog_xmin`, `active`) as well as confirming that a slot with the configured name
+  *exists* (`preflight_slot`, `src/postgres/guard.rs`) — but health and identity are
+  different questions, and it has no way to tell a recreated slot from the original one;
 - pgcdc decodes whatever `pgoutput` sends and keeps no independent record of what the
   publication should contain, so a table quietly dropped from it raises nothing;
 - every sink only appends (`FileSink::open`, `src/sink/file.rs`) and never reads back its
@@ -342,8 +343,8 @@ attempted:
 INFO slot_preflight_ok slot=pgcdc_slot restart_lsn=Some("0/19B4970") confirmed_flush_lsn=Some("0/19B49A8") wal_status=Some("reserved") safe_wal_size=None catalog_xmin=Some(741) active=false
 ```
 
-Five positions, each answering a different question. They are **not** summed into a single
-"lag" number, on purpose:
+Six fields, each answering a different question — positions, a status, a byte volume, and a
+flag, not six of a kind. They are **not** summed into a single "lag" number, on purpose:
 
 - `restart_lsn` — the oldest WAL the server must keep for this slot: the disk risk.
 - `catalog_xmin` — the transaction horizon the slot pins: the vacuum and wraparound risk.
@@ -354,6 +355,12 @@ Five positions, each answering a different question. They are **not** summed int
 - `wal_status` — `reserved` / `extended` / `unreserved` / `lost`; only `lost` is fatal
   (`error_kind=slot_unusable`, see Exit codes above). `unreserved` is not: PostgreSQL
   documents that it can climb back to `reserved` or `extended` on its own.
+- `active` — whether a consumer is currently streaming from this slot right now. Logged
+  but not judged here: the guard fires on every reconnect too, where `active = true` is
+  routine (our own prior session may not have released the slot yet), and telling that
+  apart from a foreign consumer holding it forever is not this field's job — it belongs to
+  the busy-slot patience budget (Q27/Q29 in [DECISIONS.md](DECISIONS.md)), which tells the
+  two apart by duration, not by a single flag.
 
 Why not one number: a single acknowledgement was measured moving `confirmed_flush_lsn` by
 15 MB, `restart_lsn` by only 141 KB, and releasing 14 transaction ids — three different
