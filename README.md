@@ -303,8 +303,11 @@ than keeping pace with a live producer — produced these figures:
 | wide (~4.3 KB of JSON) | file, fsync | 20k ev/s | 13k ev/s | 33k ev/s |
 
 Two runs of the identical load on the identical machine disagreed by 35% end-to-end and
-57% on the peak second. Row width moves the event rate 14× — while moving byte throughput
-the other way, from 18.7 MB/s to 82.6 MB/s. Choosing which of these three definitions to
+57% on the peak second. Row width moves the event rate 14× — while the JSON actually
+written stays near 86–91 MB/s either way, the same machine doing the same work reported
+as two wildly different numbers. (Raw WAL received from the server does move, 18.7 to
+82.6 MB/s: wide rows cost far more on the wire than they do at the sink. That is a third
+quantity again, and it is not in the table above.) Choosing which of these definitions to
 print moves the headline figure by 3.9×.
 
 So a single number would be a decision about presentation dressed up as a fact, and this
