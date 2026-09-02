@@ -17,8 +17,8 @@ mod common;
 /// from filling the default `BufWriter` enough for it to flush itself —
 /// which means here "the line is visible in the file" does still mean "a
 /// real fsync from the honest timer branch has already run", and killing
-/// after that point cannot catch task 4's mutation (step 3: acknowledging
-/// the position BEFORE the barrier). We must wait for exactly what that
+/// after that point cannot catch the mutation that acknowledges
+/// the position BEFORE the barrier. We must wait for exactly what that
 /// mutation fakes — the slot's `confirmed_flush_lsn`, not a side effect in
 /// the file.
 #[tokio::test(flavor = "multi_thread")]

@@ -30,7 +30,7 @@ pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
         .await
         .expect("start postgres");
 
-    // C4: the wait-strategy checks that Postgres accepts connections, not that
+    // The wait-strategy checks that Postgres accepts connections, not that
     // Docker's port forwarding already answers requests — that's a separate race
     // that was caught roughly once every ten runs. A bounded retry without a
     // blocking sleep in the wait loop: tokio::time::sleep is not a thread-blocking sleep.
@@ -98,7 +98,7 @@ pub async fn create_slot(client: &tokio_postgres::Client, slot: &str) {
 }
 
 /// Waits until the slot's `confirmed_flush_lsn` catches up with `target`.
-/// The budget is time-based, not attempt-based (I3, review round after task 4).
+/// The budget is time-based, not attempt-based.
 ///
 /// The previous design bounded the number of ATTEMPTS (100 × 100ms sleep),
 /// not the time: under the suite's parallel load (`RUST_TEST_THREADS=4`,
@@ -211,7 +211,7 @@ pub async fn wait_until_slot_inactive(client: &tokio_postgres::Client, slot: &st
 /// Drops the slot, but only once it is actually inactive: `pg_terminate_backend`
 /// only sends a signal and returns without waiting for the actual close —
 /// `pg_drop_replication_slot` fails with "slot is active" during that window.
-/// We retry instead of sleeping once at random (review Task 2, round 1, F4).
+/// We retry instead of sleeping once at random.
 pub async fn drop_slot_once_inactive(client: &tokio_postgres::Client, slot: &str) {
     for _ in 0..100 {
         if client
@@ -230,7 +230,7 @@ pub async fn drop_slot_once_inactive(client: &tokio_postgres::Client, slot: &str
 /// field into a shared buffer. Does not use `tracing-subscriber` — a minimal
 /// hand-rolled implementation is enough and avoids a new dependency.
 ///
-/// M8: the buffer is shared across the whole test binary (the tracing
+/// The buffer is shared across the whole test binary (the tracing
 /// dispatcher is global for the process), so events from ALL tests running
 /// in parallel land in one list. The message text alone — e.g.
 /// `"postgres_connection_restored"` — is not tied to the test that triggered
@@ -290,7 +290,7 @@ static LOG_EVENTS: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
 /// `set_global_default` cannot be called twice) and returns the shared
 /// buffer. Messages from ALL tests running at the same time land in one
 /// list, but the strings looked for here are unique to the reconnect
-/// scenario, so there will be no false matches (review Task 2, round 1, F3).
+/// scenario, so there will be no false matches.
 pub fn capture_log_events() -> Arc<Mutex<Vec<String>>> {
     LOG_EVENTS
         .get_or_init(|| {
@@ -316,7 +316,7 @@ pub fn capture_log_events() -> Arc<Mutex<Vec<String>>> {
 /// without this guard, a panic partway through a test would orphan a
 /// process that (now that it retries reconnecting forever) would keep
 /// hammering the Postgres container even after it disappeared along with
-/// the test (M7).
+/// the test.
 pub struct KillOnDrop(pub std::process::Child);
 
 impl std::ops::Deref for KillOnDrop {
@@ -368,10 +368,10 @@ pub fn spawn_with_stderr(args: &[&str]) -> KillOnDrop {
 /// `"backoff_ms"`, `ESC[0m` (reset), `ESC[2m` (dim), `"="`, one more
 /// `ESC[0m`, and only then the value — that is, TWO codes sit between the
 /// field name and the equals sign, not one, and the string `"backoff_ms="`
-/// never appeared in the bytes at all (review Task 3, round 1, F6 — the
-/// previous version of this comment mentioned only one code between them).
+/// never appeared in the bytes at all (an earlier version of this comment
+/// mentioned only one code between them).
 /// Since then `main.rs` enables coloring only when stderr is a real
-/// terminal (F4, review Task 3, round 2), and the pipe this test uses no
+/// terminal, and the pipe this test uses no
 /// longer gets colored, but the stripping stays: the setting could become
 /// unconditional again, and this helper must survive that regression
 /// without relying on production not breaking it. Without this cleanup,
@@ -405,8 +405,8 @@ fn strip_ansi(line: &str) -> String {
 /// series ever needs a second attempt (`retry=2`), its delay will also
 /// grow — that is growth WITHIN one series along the same exponential, not
 /// a broken reset between series, and "the first n lines in a row" would
-/// conflate the two, failing red on a correct exponential (review Task 3,
-/// round 1, F5). Filtering by `retry=1` picks exactly the first attempt of
+/// conflate the two, failing red on a correct exponential.
+/// Filtering by `retry=1` picks exactly the first attempt of
 /// each series regardless of how many attempts that series ultimately
 /// took. The budget is bounded: if not enough delays showed up, we fail
 /// with what we actually saw instead of hanging.
