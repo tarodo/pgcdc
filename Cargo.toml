@@ -3,6 +3,7 @@ name = "pgcdc"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 pg_walstream = "0.8"

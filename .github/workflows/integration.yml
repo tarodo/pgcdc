@@ -1,0 +1,29 @@
+name: integration
+
+on:
+  schedule:
+    # 03:00 UTC daily.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Pulled explicitly so a registry problem is a distinct, readable failure
+      # rather than 32 tests timing out one after another.
+      - name: Pull the Postgres image
+        run: docker pull postgres:16-alpine
+
+      - name: Full suite
+        run: cargo test

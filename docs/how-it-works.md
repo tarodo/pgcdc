@@ -409,15 +409,15 @@ With a comment worth reading in full:
 | File | Lines | What is in it |
 |---|---|---|
 | [src/main.rs](../src/main.rs) | 58 | entry point: parse the flags, pick a sink, run, return an exit code |
-| [src/config.rs](../src/config.rs) | 493 | ten CLI flags and their paired environment variables |
+| [src/config.rs](../src/config.rs) | 490 | ten CLI flags and their paired environment variables |
 | [src/postgres/replication.rs](../src/postgres/replication.rs) | 1686 | **the heart**: two loops, reconnect, acknowledgement, shutdown |
-| [src/postgres/pgoutput.rs](../src/postgres/pgoutput.rs) | 627 | binary protocol decoding |
+| [src/postgres/pgoutput.rs](../src/postgres/pgoutput.rs) | 631 | binary protocol decoding |
 | [src/postgres/guard.rs](../src/postgres/guard.rs) | 142 | the pre-flight check on the slot |
-| [src/transaction.rs](../src/transaction.rs) | 1148 | `Assembler` — buffers until `COMMIT` |
-| [src/lsn.rs](../src/lsn.rs) | 185 | the four positions and the rules between them |
+| [src/transaction.rs](../src/transaction.rs) | 1166 | `Assembler` — buffers until `COMMIT` |
+| [src/lsn.rs](../src/lsn.rs) | 189 | the four positions and the rules between them |
 | [src/schema.rs](../src/schema.rs) | 109 | cache of table descriptions (`RELATION`) |
 | [src/event.rs](../src/event.rs) | 126 | `ChangeEvent` — what goes out as JSON |
-| [src/sink/](../src/sink/) | 701 | the `Sink` trait + two implementations |
+| [src/sink/](../src/sink/) | 700 | the `Sink` trait + two implementations |
 | [src/error.rs](../src/error.rs) | 164 | every kind of error and the fatal / recoverable split |
 | [src/metrics.rs](../src/metrics.rs) | 133 | eight counters |
 
@@ -536,8 +536,11 @@ never is.
 
 ### A comment describing a mechanism that does not exist
 
-Eleven times. Every one was found by a reader, not by the author — and twice in a row the comment lied
-inside the very construct that was being fixed at that moment.
+Fourteen times. Every one was found by a reader, not by the author — and twice in a row the comment lied
+inside the very construct that was being fixed at that moment. The three most recent landed in the
+documents written specifically to earn trust in the rest of the text: a spec header with the wrong test
+count, a CI comment overstating how many tests need a container, and a README sentence that explained
+one throughput swing with a number pulled from a different metric.
 
 > Whoever changes a mechanism is the last person able to notice that the description has stopped
 > matching it.

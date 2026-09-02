@@ -1,6 +1,6 @@
 # pgcdc — accepted decisions for the MVP
 
-Base spec: [input/pgcdc_mvp_task.md](input/pgcdc_mvp_task.md).
+Base spec: [docs/spec.md](docs/spec.md).
 This document records decisions on questions the spec left open, and
 corrects the places where it contradicts itself.
 **Where they diverge, this document takes precedence.**

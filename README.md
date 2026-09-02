@@ -1,5 +1,7 @@
 # pgcdc
 
+[![check](https://github.com/tarodo/pgcdc/actions/workflows/check.yml/badge.svg)](https://github.com/tarodo/pgcdc/actions/workflows/check.yml)
+
 A minimal Change Data Capture engine for PostgreSQL, in Rust. It reads logical replication
 events over the `pgoutput` protocol and emits normalized JSON Lines.
 
@@ -277,8 +279,9 @@ INFO metrics_report events=3 transactions=3 bytes=395 reconnects=0 errors=0 last
 ```
 
 Per-event lines (`transaction_accepted`, `group_acknowledged`, `advanced_from_keepalive`)
-are at **DEBUG** — at thousands of transactions per second a line each would make the log
-both a bottleneck and noise. Turn them on with `RUST_LOG=pgcdc=debug`.
+are at **DEBUG** — an exploratory run reached six figures of events per second (see
+"Throughput" below), and a line each would make the log both a bottleneck and noise. Turn
+them on with `RUST_LOG=pgcdc=debug`.
 
 **Row contents never appear in the logs.** Counters, positions and transaction ids only.
 This holds for every log line at every level.
@@ -288,11 +291,72 @@ Worth alerting on: `last_received_lsn` advancing while `last_acknowledged_lsn` s
 
 ---
 
+## Throughput
+
+There is no benchmark here, and the reason is itself a measurement. An exploratory run on
+a laptop — producer, Postgres and consumer sharing one machine, draining a backlog rather
+than keeping pace with a live producer — produced these figures:
+
+| Rows | Sink | Best 10s window | End-to-end | Peak second |
+|---|---|---|---|---|
+| narrow (~320 B of JSON) | file, fsync | 269k–283k ev/s | 127k–171k ev/s | 313k–491k ev/s |
+| wide (~4.3 KB of JSON) | file, fsync | 20k ev/s | 13k ev/s | 33k ev/s |
+
+Two runs of the identical load on the identical machine disagreed by 35% end-to-end and
+57% on the peak second. Row width moves the event rate 14× — while the JSON actually
+written stays near 86–91 MB/s either way, the same machine doing the same work reported
+as two wildly different numbers. (Raw WAL received from the server does move, 18.7 to
+82.6 MB/s: wide rows cost far more on the wire than they do at the sink. That is a third
+quantity again, and it is not in the table above.) Choosing which of these definitions to
+print moves the headline figure by 3.9×.
+
+So a single number would be a decision about presentation dressed up as a fact, and this
+project's whole argument is that a green result is not a proof. Throughput was never a
+goal ([DECISIONS.md](DECISIONS.md), Q1); if it becomes one, it needs a harness with a
+rate-controlled producer, a warm-up separated from steady state, and repeats with a
+median and a spread — not one more run of the above.
+
+---
+
 ## Documentation
 
 | | |
 |---|---|
+| [docs/spec.md](docs/spec.md) | the binding specification the code was built against, and where it came from |
 | [docs/how-it-works.md](docs/how-it-works.md) | how the code is laid out — written for someone reading Rust for the first time |
 | [DECISIONS.md](DECISIONS.md) | every accepted decision and the alternatives rejected, with reasons |
 | [docs/pgoutput-notes.md](docs/pgoutput-notes.md) | byte-level breakdown of the protocol |
 | [docs/spike-findings.md](docs/spike-findings.md) | what we found in the transport crate, and what must not be used |
+
+---
+
+## How this was built
+
+The specification came first and came from a language model: it was generated from a short
+prompt, read, and accepted as binding before any code existed. It was never edited to match
+what got built — every departure is a numbered amendment in
+[DECISIONS.md](DECISIONS.md), which now runs to thirty decisions, each carrying the
+alternatives that were rejected and why.
+
+Work went stage by stage, and each stage ended with an adversarial review whose standard was
+mutation, not coverage: break the code deliberately, and if the suite stays green, the
+coverage was imaginary. That standard earned its keep five times — most sharply at the end,
+when deleting an entire feature, swallowing a sink write failure, and sending the wrong LSN
+on the wire each left all 168 tests passing.
+
+The most serious defect was found by the spec rather than by the tests. Its acceptance
+checklist demands a non-zero exit code when the replication slot is unusable; walking that
+checklist line by line showed the process never exited at all, retrying a hopeless request
+forever while looking perfectly healthy from outside. See [docs/spec.md](docs/spec.md) for
+the checklist, and `Q30` in [DECISIONS.md](DECISIONS.md) for what it cost to fix.
+
+---
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in this crate by you, as defined in the Apache-2.0 license, shall be dual
+licensed as above, without any additional terms or conditions.
