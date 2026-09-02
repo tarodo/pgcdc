@@ -37,4 +37,19 @@ async fn cold_start_returns_slot_positions_when_the_slot_exists() {
         "a fresh slot already has a position"
     );
     assert!(info.restart_lsn.is_some());
+
+    // A freshly created slot on a server with default retention: reserved, not
+    // yet held by anyone, with a catalog horizon pinned. safe_wal_size is NULL
+    // under the default max_slot_wal_keep_size = -1 — unlimited retention is
+    // not a number, and reading it as one would be wrong.
+    assert_eq!(info.wal_status.as_deref(), Some("reserved"));
+    assert!(!info.active, "nothing is streaming from it yet");
+    assert!(
+        info.catalog_xmin.is_some(),
+        "a logical slot always pins a catalog horizon"
+    );
+    assert!(
+        info.safe_wal_size.is_none(),
+        "unlimited retention reports NULL, not a size"
+    );
 }
