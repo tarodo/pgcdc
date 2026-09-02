@@ -271,11 +271,14 @@ pub async fn drop_slot_once_inactive(client: &tokio_postgres::Client, slot: &str
 /// `"postgres_connection_restored"` — is not tied to the test that triggered
 /// it; if that same message ever starts being logged by another
 /// successfully-reconnecting test, matching on the text alone becomes a
-/// coincidence. So the visitor also records the `slot` field when the event
-/// has one (`info!(slot = %..., "message")` — this is how preflight, start,
-/// and connection restoration are all logged), and appends it to the message
-/// as `"message slot=value"` — the caller can check both instead of relying
-/// on one text being unique.
+/// coincidence. So the visitor also records every other named field on the
+/// event (`info!(slot = %..., restart_lsn = ?..., "message")` — this is how
+/// preflight, start, and connection restoration are all logged), and
+/// appends each as `"message name=value"` in the order the event recorded
+/// them — the caller can check the message, `slot`, or any other field
+/// (e.g. `restart_lsn`/`confirmed_flush_lsn` on `slot_preflight_ok`,
+/// `tests/guard.rs`) instead of relying on the message text alone being
+/// unique.
 struct CapturingSubscriber {
     events: Arc<Mutex<Vec<String>>>,
 }
@@ -283,15 +286,14 @@ struct CapturingSubscriber {
 #[derive(Default)]
 struct MessageVisitor {
     message: String,
-    slot: Option<String>,
+    fields: Vec<(String, String)>,
 }
 
 impl tracing::field::Visit for MessageVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         match field.name() {
             "message" => self.message = format!("{value:?}"),
-            "slot" => self.slot = Some(format!("{value:?}")),
-            _ => {}
+            name => self.fields.push((name.to_string(), format!("{value:?}"))),
         }
     }
 }
@@ -308,10 +310,10 @@ impl tracing::Subscriber for CapturingSubscriber {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);
-        let combined = match visitor.slot {
-            Some(slot) => format!("{} slot={slot}", visitor.message),
-            None => visitor.message,
-        };
+        let mut combined = visitor.message;
+        for (name, value) in &visitor.fields {
+            combined.push_str(&format!(" {name}={value}"));
+        }
         self.events.lock().unwrap().push(combined);
     }
     fn enter(&self, _span: &tracing::span::Id) {}
