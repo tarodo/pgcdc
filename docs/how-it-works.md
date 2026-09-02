@@ -408,17 +408,17 @@ With a comment worth reading in full:
 
 | File | Lines | What is in it |
 |---|---|---|
-| [src/main.rs](../src/main.rs) | 58 | entry point: parse the flags, pick a sink, run, return an exit code |
-| [src/config.rs](../src/config.rs) | 490 | ten CLI flags and their paired environment variables |
-| [src/postgres/replication.rs](../src/postgres/replication.rs) | 1686 | **the heart**: two loops, reconnect, acknowledgement, shutdown |
+| [src/main.rs](../src/main.rs) | 56 | entry point: parse the flags, pick a sink, run, return an exit code |
+| [src/config.rs](../src/config.rs) | 487 | ten CLI flags and their paired environment variables |
+| [src/postgres/replication.rs](../src/postgres/replication.rs) | 1732 | **the heart**: two loops, reconnect, acknowledgement, shutdown |
 | [src/postgres/pgoutput.rs](../src/postgres/pgoutput.rs) | 631 | binary protocol decoding |
-| [src/postgres/guard.rs](../src/postgres/guard.rs) | 142 | the pre-flight check on the slot |
+| [src/postgres/guard.rs](../src/postgres/guard.rs) | 182 | the pre-flight check on the slot |
 | [src/transaction.rs](../src/transaction.rs) | 1166 | `Assembler` — buffers until `COMMIT` |
 | [src/lsn.rs](../src/lsn.rs) | 189 | the four positions and the rules between them |
 | [src/schema.rs](../src/schema.rs) | 109 | cache of table descriptions (`RELATION`) |
 | [src/event.rs](../src/event.rs) | 126 | `ChangeEvent` — what goes out as JSON |
-| [src/sink/](../src/sink/) | 700 | the `Sink` trait + two implementations |
-| [src/error.rs](../src/error.rs) | 164 | every kind of error and the fatal / recoverable split |
+| [src/sink/](../src/sink/) | 699 | the `Sink` trait + two implementations |
+| [src/error.rs](../src/error.rs) | 167 | every kind of error and the fatal / recoverable split |
 | [src/metrics.rs](../src/metrics.rs) | 133 | eight counters |
 
 Where to start reading: `main.rs` → `run()` in `replication.rs` → `stream_once()` in the same file.
