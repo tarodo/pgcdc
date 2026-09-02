@@ -55,7 +55,7 @@ pub(crate) fn write_changes<W: std::io::Write>(
 /// The barrier: commits `w` to the device and returns what has accumulated in
 /// `pending`. Extracted out of `StdoutSink` so it's possible to check directly
 /// that the stream's `flush` is really called, not just that the method
-/// returns the right position (review Task 2, round 1, F3) — a test double in tests
+/// returns the right position — a test double in tests
 /// could forget the `flush` call and remain indistinguishable from a genuine implementation.
 pub(crate) fn flush_pending<W: std::io::Write>(
     w: &mut W,
@@ -119,7 +119,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_with_nothing_pending_reports_no_position() {
-        // F1 (review, round 1): a barrier on an empty sink has no right to
+        // A barrier on an empty sink has no right to
         // invent a position — on an idle tick of the next task this would
         // mean acknowledging something that was never written.
         let mut s = StdoutSink::new();
@@ -132,7 +132,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_flush_right_after_the_first_reports_nothing_new() {
-        // F1 (review, round 1): a second barrier right after the first, with no new
+        // A second barrier right after the first, with no new
         // transaction in between, must report `None`, not repeat the previous position.
         let mut s = StdoutSink::new();
         s.write_transaction(&two_change_tx()).await.unwrap();
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn flush_pending_actually_flushes_the_writer() {
-        // F3 (review, round 1): remove the `w.flush()` call inside the barrier, leave
+        // Remove the `w.flush()` call inside the barrier, leave
         // only the position return — and this test must go red, because it
         // checks the real `StdoutSink::flush` code, not a test double.
         let mut w = RecordingWriter { flushed: false };

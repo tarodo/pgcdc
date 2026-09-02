@@ -10,7 +10,7 @@ use crate::transaction::Transaction;
 
 /// An abstraction over "make it durable on the device", separate from `std::io::Write`.
 /// The only reason it exists is to give the barrier a test double type in
-/// tests (review Task 3, round 1, F2): `sync_data` is not a secondary
+/// tests: `sync_data` is not a secondary
 /// detail, it is the single line that makes `Durability::Fsync` true
 /// for this sink, and the replication loop marks positions durable precisely on its
 /// basis. Holding it to a lower verification standard than the pipe's `flush`
@@ -80,10 +80,9 @@ fn flush_durable<W: DurableWrite>(
 ) -> Result<Option<Lsn>, PgcdcError> {
     // Nothing accepted since the last barrier => the buffer is empty and already
     // synchronized — otherwise there would be something to accept. Without this
-    // check, the timer barrier (Task 4) would call flush and fsync on every tick
+    // check, the timer barrier would call flush and fsync on every tick
     // unconditionally, including a fully idle stream — several
-    // fsyncs a second on a file no one has touched (review
-    // Task 4, round 1, F3).
+    // fsyncs a second on a file no one has touched.
     if pending.is_none() {
         return Ok(None);
     }
@@ -171,7 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_survives_closing_and_reopening_the_sink() {
-        // F1 (review Task 3, round 1): `OpenOptions::append` only takes effect
+        // `OpenOptions::append` only takes effect
         // while the file is open — a test that writes twice through ONE and the same
         // `FileSink` cannot distinguish `.append(true)` from `.truncate(true).write(true)`:
         // both forms behave the same as long as the descriptor hasn't been closed and
@@ -234,7 +233,7 @@ mod tests {
 
     /// A test-double writer that stores no bytes, only records the ORDER
     /// in which `flush` and `durable_sync` were called. Mirrors `RecordingWriter`
-    /// from the stdout sink (review Task 2, round 1, F3), where the test double proved
+    /// from the stdout sink, where the test double proved
     /// that the stream's `flush` is actually called, not just that the barrier returns
     /// the right position. Here the stakes are higher: `durable_sync` is the only
     /// line that makes `Durability::Fsync` true — so the test double checks not just
@@ -272,7 +271,7 @@ mod tests {
 
     #[test]
     fn flush_durable_calls_flush_then_sync_in_order() {
-        // F2 (review Task 3, round 1): tests the real `flush_durable` code,
+        // Tests the real `flush_durable` code,
         // not a test double. Remove the `durable_sync` call — red. Swap
         // `flush` and `durable_sync` — also red, because what's checked is
         // the ORDER of calls, not just their count.
@@ -293,7 +292,7 @@ mod tests {
 
     #[test]
     fn flush_durable_does_not_touch_the_device_when_nothing_is_pending() {
-        // F3 (review Task 4, round 1): the timer barrier is reached on every
+        // The timer barrier is reached on every
         // tick, including idle ones — calling flush/fsync unconditionally would
         // mean synchronizing an untouched file several times a second on a forever
         // idle stream. Nothing accepted => the buffer is already empty and already

@@ -24,7 +24,7 @@ impl DatabaseUrl {
         // Look for `://user:password@` and replace the password with asterisks. The
         // password can also arrive as a query parameter (`?password=...`) — this
         // is not made up, drivers accept both forms — so a second pass
-        // cleans that too (C3 of the whole branch's review).
+        // cleans that too.
         redact_query_password(&self.redact_credentials())
     }
 
@@ -144,15 +144,12 @@ pub struct Config {
     #[arg(long, env = "PGCDC_MAX_TRANSACTION_EVENTS", default_value = "100000")]
     pub max_transaction_events: usize,
 
-    // M8: the lower bound — 1 — is forbidden by the parser, not just described in
+    // The lower bound — 1 — is forbidden by the parser, not just described in
     // the help text, because with zero the "interval elapsed" condition is true
-    // on every loop iteration — a busy spin with an fsync on every idle tick
-    // (review Task 4, round 1, F4). Reading is bounded by a separate constant
-    // SHUTDOWN_POLL_INTERVAL (200ms, replication.rs), not by this field
-    // (review Task 3, round 3, F4) — both consequences of that are spelled out
-    // in the --help text itself below, but without internal references to review
-    // rounds: the end user shouldn't see those, they're noise at the stage named
-    // wiring.
+    // on every loop iteration — a busy spin with an fsync on every idle tick.
+    // Reading is bounded by a separate constant SHUTDOWN_POLL_INTERVAL (200ms,
+    // replication.rs), not by this field — both consequences of that are
+    // spelled out in the --help text itself below.
     /// How often the durability barrier is invoked and an acknowledgement goes out.
     /// A delayed acknowledgement does not affect correctness: invariant 1
     /// still holds, and the contract allows duplicates after a failure. The lower
@@ -243,7 +240,7 @@ impl Config {
     /// relationship to each other. An initial pause greater than the ceiling means
     /// the first attempt would sleep through the long pause, and `next_backoff`
     /// would immediately collapse it back to the ceiling — a configuration that is
-    /// technically valid for the parser but pointless (review Task 2, round 1, F8).
+    /// technically valid for the parser but pointless.
     pub fn validate_reconnect_bounds(&self) -> Result<(), PgcdcError> {
         if self.reconnect_initial_ms > self.reconnect_max_ms {
             return Err(PgcdcError::InvalidReconnectBounds {
@@ -278,11 +275,11 @@ mod tests {
 
     #[test]
     fn ack_interval_ms_rejects_zero_at_the_parser_level() {
-        // F4 (review Task 4, round 1): 0 means `elapsed() >= interval` is
-        // true on every loop iteration — a busy spin with an fsync on every
-        // pass. The parser must reject this, so that a configuration with zero
-        // cannot be expressed at all, rather than merely hoping the loop
-        // somehow survives such a value.
+        // 0 means `elapsed() >= interval` is true on every loop iteration —
+        // a busy spin with an fsync on every pass. The parser must reject
+        // this, so that a configuration with zero cannot be expressed at
+        // all, rather than merely hoping the loop somehow survives such a
+        // value.
         let mut args = base_args();
         args.extend(["--ack-interval-ms", "0"]);
         let err = Config::try_parse_from(args).unwrap_err();
@@ -297,9 +294,9 @@ mod tests {
         assert_eq!(cfg.ack_interval_ms, 1);
     }
 
-    // Review Task 2, round 1, F8: `ack_interval_ms` had two such tests
-    // (zero forbidden, one allowed), the new backoff flags had none — so
-    // the disappearance of the parser constraint would have gone unnoticed.
+    // `ack_interval_ms` had two such tests (zero forbidden, one allowed),
+    // the new backoff flags had none — so the disappearance of the parser
+    // constraint would have gone unnoticed.
     #[test]
     fn reconnect_initial_ms_rejects_zero_at_the_parser_level() {
         let mut args = base_args();
@@ -357,7 +354,7 @@ mod tests {
     #[test]
     fn an_initial_delay_above_the_ceiling_is_rejected() {
         // The parser only sees each bound separately; the relationship between
-        // them is checked by validate_reconnect_bounds() (review Task 2, round 1, F8).
+        // them is checked by validate_reconnect_bounds().
         let mut args = base_args();
         args.extend([
             "--reconnect-initial-ms",
@@ -438,7 +435,7 @@ mod tests {
         assert!(format!("{url}").contains("db.example"));
         assert_eq!(url.expose(), "postgres://cdc:hunter2@db.example:5432/app");
 
-        // C3: the password can also arrive as a query parameter, not in the
+        // The password can also arrive as a query parameter, not in the
         // credentials segment. `validate()` only looks at the scheme and would let
         // such a URL through — redaction must separately cover this form.
         let query_form = DatabaseUrl::new("postgres://cdc@db.example/app?password=hunter2".into());

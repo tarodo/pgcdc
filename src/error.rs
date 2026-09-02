@@ -22,8 +22,7 @@ pub enum PgcdcError {
     /// same refusal an hour from now too. Unlike `SlotAhead`, here we don't even
     /// know the position discrepancy — the server refused before it got that
     /// far; unlike `Connection`, a retry is not a matter of transport
-    /// luck, but a guaranteed repeat of the same refusal (review round after
-    /// task 4, C1).
+    /// luck, but a guaranteed repeat of the same refusal.
     #[error("replication slot {slot} rejected START_REPLICATION: {reason}")]
     SlotUnusable { slot: String, reason: String },
 
@@ -132,7 +131,7 @@ mod tests {
 
     #[test]
     fn a_slot_that_the_server_refuses_to_stream_from_is_fatal() {
-        // C1: a server that refused START_REPLICATION (invalidation,
+        // A server that refused START_REPLICATION (invalidation,
         // foreign output plugin) is not the same as a dropped connection.
         let err = PgcdcError::SlotUnusable {
             slot: "s".into(),

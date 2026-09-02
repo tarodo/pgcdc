@@ -100,7 +100,7 @@ impl Assembler {
                 Ok(None)
             }
             PgOutputMessage::Insert { relation_id, tuple } => {
-                // The order of checks matters (M12 of the whole branch's review):
+                // The order of checks matters:
                 // without an open transaction, the error must be named this way, not
                 // "unknown relation", even if the relation isn't in the cache either.
                 // The limit is the next check by cost, before hitting the cache and
@@ -556,8 +556,8 @@ mod tests {
     #[test]
     fn row_outside_a_transaction_wins_over_unknown_relation() {
         // Without BEGIN the error must be "row message outside a transaction",
-        // not UnknownRelation, even if the relation isn't in the cache either (M12:
-        // the order of checks in the Insert arm — open, then limit, then relation lookup).
+        // not UnknownRelation, even if the relation isn't in the cache either:
+        // the order of checks in the Insert arm — open, then limit, then relation lookup.
         let mut cache = RelationCache::new();
         let mut a = Assembler::new(1000);
         let err = a.handle(insert(), Lsn(0x200), &mut cache).unwrap_err();
@@ -728,7 +728,7 @@ mod tests {
         assert_eq!(
             ev.lsn,
             Lsn(0x200),
-            "C2: lsn is the position of the row itself (wal_start), not Lsn(0)"
+            "lsn is the position of the row itself (wal_start), not Lsn(0)"
         );
     }
 
@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn update_with_key_only_old_tuple_omits_unsent_columns() {
-        // F1: swapping build_key_row for build_full_row on the Key arm would
+        // Swapping build_key_row for build_full_row on the Key arm would
         // turn the server's "did not send" stub into a lying `null` for
         // title and qty. before must carry only the column that arrived.
         let mut cache = RelationCache::new();
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn delete_with_full_old_tuple_keeps_real_nulls() {
-        // F2: collapsing this arm to build_key_row + BeforeKind::Key would
+        // Collapsing this arm to build_key_row + BeforeKind::Key would
         // both mislabel before_kind and silently drop a genuinely-NULL
         // column: this test's old tuple carries title = NULL as a real 'n'
         // under an 'O' tag on the three-column items relation, and that
@@ -957,7 +957,7 @@ mod tests {
 
     #[test]
     fn delete_key_tuple_arity_mismatch_is_a_decode_error() {
-        // F3: check_arity must also guard the key path. A short key tuple
+        // check_arity must also guard the key path. A short key tuple
         // would otherwise zip-truncate to the shorter side in silence.
         let mut cache = RelationCache::new();
         let mut a = Assembler::new(1000);
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn insert_rejects_unchanged_toast_marker() {
-        // F4: 'u' cannot legitimately arrive on an INSERT — the value is
+        // 'u' cannot legitimately arrive on an INSERT — the value is
         // written in the same transaction and the reorder buffer resolves
         // it before the plugin sees it. Silence here would be the worst
         // response, so the guard must actually fire.
@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     fn update_full_old_tuple_rejects_unchanged_toast_marker() {
-        // C1: this arm used to do `let (row, _) = build_full_row(...)`, throwing
+        // This arm used to do `let (row, _) = build_full_row(...)`, throwing
         // away the unchanged-TOAST list. Unreachable on PostgreSQL 16 — the server
         // flattens external attributes into the old-tuple WAL image before the
         // plugin sees it — but that is an assumption about server behaviour, not
@@ -1071,7 +1071,7 @@ mod tests {
 
     #[test]
     fn delete_full_old_tuple_rejects_unchanged_toast_marker() {
-        // C1: same guard, DELETE's Full arm. Before the fix it silently dropped
+        // Same guard, DELETE's Full arm. Before the fix it silently dropped
         // the unchanged-TOAST list the same way the UPDATE arm did.
         let mut cache = RelationCache::new();
         let mut a = Assembler::new(1000);
@@ -1107,7 +1107,7 @@ mod tests {
 
     #[test]
     fn update_respects_the_max_events_limit() {
-        // C2: the max_events guard is duplicated per match arm. A test that only
+        // The max_events guard is duplicated per match arm. A test that only
         // ever sends INSERT (transaction_larger_than_the_limit_fails_loudly)
         // exercises none of the copy living in the Update arm — deleting that
         // copy would leave the whole suite green without this test.
@@ -1138,7 +1138,7 @@ mod tests {
 
     #[test]
     fn delete_respects_the_max_events_limit() {
-        // C2: same guard, DELETE arm's own copy.
+        // Same guard, DELETE arm's own copy.
         let mut cache = RelationCache::new();
         let mut a = Assembler::new(1);
         a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();

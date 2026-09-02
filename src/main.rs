@@ -22,9 +22,7 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         // Coloring only for a real terminal: without this check, ANSI codes
         // would unconditionally leak into output redirected to a file and into
-        // any log collector's pipe (review Task 3, round 1, F4) — this
-        // stage is called wiring, and such output must remain
-        // machine-readable.
+        // any log collector's pipe — such output must remain machine-readable.
         .with_ansi(std::io::stderr().is_terminal())
         .init();
 
