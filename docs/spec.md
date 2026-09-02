@@ -10,7 +10,7 @@
 > item 14 demands a
 > non-zero exit code when the slot is unusable, and walking the checklist line
 > by line revealed the process never exited at all, retrying forever instead.
-> A suite of 168 tests was green throughout.
+> A suite of 145 tests was green throughout.
 
 ## 1. Goal
 
