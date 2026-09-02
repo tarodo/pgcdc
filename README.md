@@ -9,6 +9,11 @@ events over the `pgoutput` protocol and emits normalized JSON Lines.
 {"schema":"public","table":"users","operation":"insert","after":{"id":"1","name":"Alice"},"transaction_id":748,"lsn":"0/19742B8","commit_lsn":"0/19743B0","commit_timestamp":"2026-08-31T09:12:26.946113Z"}
 ```
 
+While testing a small Kafka-less CDC consumer, I observed a failure mode that silently
+skipped 39 committed rows while the process still exited with code 0. pgcdc explores how to
+prevent that class of failure, which is why so much of it is about exit codes and about the
+order of two operations.
+
 **The design rule everything else follows from:** a WAL position is never acknowledged to
 PostgreSQL before the sink has confirmed the data is durable. Acknowledging is
 irreversible — it permits the server to delete that WAL.
