@@ -1,16 +1,39 @@
 use crate::error::PgcdcError;
 use crate::lsn::Lsn;
 
+/// What the pre-flight learned about the slot. The three positions are kept
+/// separate on purpose and never collapsed into one "lag" number: they pin
+/// different risks. `restart_lsn` is the disk risk — WAL the server must keep.
+/// `catalog_xmin` is the vacuum and wraparound risk — the transaction horizon
+/// the slot pins. `confirmed_flush_lsn` is our own acknowledged position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotInfo {
+    /// The oldest WAL position the server must retain for this slot.
     pub restart_lsn: Option<Lsn>,
+    /// The position the consumer has acknowledged as durably processed.
     pub confirmed_flush_lsn: Option<Lsn>,
+    /// PostgreSQL's own verdict on retention health: e.g. `reserved`,
+    /// `extended`, `unreserved`, or `lost` once the required WAL is gone.
+    pub wal_status: Option<String>,
+    /// Bytes of WAL that may still be written before this slot starts
+    /// eating into the safety margin. NULL means retention is unlimited
+    /// (`max_slot_wal_keep_size = -1`), not that the size is unknown.
+    pub safe_wal_size: Option<i64>,
+    /// The oldest transaction ID this slot prevents autovacuum from
+    /// reclaiming — the wraparound risk it pins.
+    pub catalog_xmin: Option<u32>,
+    /// Whether a consumer is currently streaming from this slot.
+    pub active: bool,
 }
 
 /// The slot guard: called on EVERY replication session (`stream_once` in
 /// `replication.rs`) — both on a cold start and on every reconnect, not
-/// just once at first launch. Only the slot's existence is checked here;
-/// on a cold start there's nothing to compare `confirmed_flush_lsn` against —
+/// just once at first launch. Existence and health (`wal_status`,
+/// `safe_wal_size`, `catalog_xmin`, `active`) are checked here; identity is
+/// not — a slot dropped and recreated under the same name passes this guard
+/// indistinguishably from the original, because nothing read here pins a
+/// slot to a particular creation. On a cold start there's nothing to
+/// compare `confirmed_flush_lsn` against —
 /// we have no persistent durable position and never will (DECISIONS
 /// Q4) — while on reconnect the positions returned from here are checked by the
 /// caller via `check_reconnect`. If the slot is missing — we fail, we do NOT create it:
@@ -26,7 +49,8 @@ pub async fn preflight_slot(conn_str: &str, slot: &str) -> Result<SlotInfo, Pgcd
 
     let rows = client
         .query(
-            "SELECT restart_lsn::text, confirmed_flush_lsn::text \
+            "SELECT restart_lsn::text, confirmed_flush_lsn::text, \
+                    wal_status, safe_wal_size, catalog_xmin::text, active \
              FROM pg_replication_slots WHERE slot_name = $1",
             &[&slot],
         )
@@ -47,6 +71,14 @@ pub async fn preflight_slot(conn_str: &str, slot: &str) -> Result<SlotInfo, Pgcd
             .get::<_, Option<String>>(1)
             .as_deref()
             .and_then(parse_lsn),
+        wal_status: row.get::<_, Option<String>>(2),
+        // NULL under the default max_slot_wal_keep_size = -1, which means
+        // unlimited retention — not an error. Observed on a healthy slot.
+        safe_wal_size: row.get::<_, Option<i64>>(3),
+        catalog_xmin: row
+            .get::<_, Option<String>>(4)
+            .and_then(|s| s.parse::<u32>().ok()),
+        active: row.get::<_, bool>(5),
     })
 }
 
@@ -91,6 +123,10 @@ mod tests {
         SlotInfo {
             restart_lsn: Some(Lsn(confirmed - 0x100)),
             confirmed_flush_lsn: Some(Lsn(confirmed)),
+            wal_status: Some("reserved".to_owned()),
+            safe_wal_size: None,
+            catalog_xmin: Some(1),
+            active: false,
         }
     }
 
@@ -128,6 +164,10 @@ mod tests {
         let empty = SlotInfo {
             restart_lsn: None,
             confirmed_flush_lsn: None,
+            wal_status: None,
+            safe_wal_size: None,
+            catalog_xmin: None,
+            active: false,
         };
         // The slot exists but has never been acknowledged — it is behind any position of ours.
         assert!(check_reconnect("s", &empty, Lsn(0x1000)).unwrap().is_some());

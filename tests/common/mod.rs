@@ -6,10 +6,24 @@ use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-/// A fresh PostgreSQL for every test. The replication slot is a global
-/// stateful object, and on a shared instance tests would fight over it and
-/// depend on run order (DECISIONS Q10).
-pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
+/// Shared container setup: the base flags every test needs (logical
+/// decoding enabled, room for slots/senders), plus whatever extra `-c`
+/// flags the caller wants appended. Kept private — `start_postgres` and
+/// `start_postgres_with_tight_wal_retention` are the two public entry
+/// points, so a change to the wait-strategy or port-retry logic below
+/// cannot accidentally diverge between them.
+async fn start_postgres_with_extra_args(extra: &[&str]) -> (ContainerAsync<GenericImage>, String) {
+    let mut cmd = vec![
+        "postgres",
+        "-c",
+        "wal_level=logical",
+        "-c",
+        "max_replication_slots=10",
+        "-c",
+        "max_wal_senders=10",
+    ];
+    cmd.extend_from_slice(extra);
+
     let container = GenericImage::new("postgres", "16-alpine")
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -17,15 +31,7 @@ pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_DB", "app")
-        .with_cmd(vec![
-            "postgres",
-            "-c",
-            "wal_level=logical",
-            "-c",
-            "max_replication_slots=10",
-            "-c",
-            "max_wal_senders=10",
-        ])
+        .with_cmd(cmd)
         .start()
         .await
         .expect("start postgres");
@@ -49,6 +55,35 @@ pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
     };
     let conn = format!("postgres://postgres:postgres@127.0.0.1:{port}/app");
     (container, conn)
+}
+
+/// A fresh PostgreSQL for every test. The replication slot is a global
+/// stateful object, and on a shared instance tests would fight over it and
+/// depend on run order (DECISIONS Q10).
+pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
+    start_postgres_with_extra_args(&[]).await
+}
+
+/// A PostgreSQL tuned so a replication slot's WAL retention can be blown
+/// through with a few megabytes of writes instead of gigabytes: pinning
+/// `max_slot_wal_keep_size` this low means a single checkpoint past that
+/// budget is enough for the server to mark the slot `wal_status = 'lost'`.
+/// `min_wal_size`/`max_wal_size` are kept small too, purely so the
+/// checkpoint that does the marking is cheap. Verified directly against
+/// this image before use: one ~8MB insert plus one `CHECKPOINT` reliably
+/// flips a freshly created slot straight to `lost` in well under a second,
+/// matching the "reserved → lost in one step" transition this project's own
+/// lab measured (docs/superpowers/plans/2026-09-02-slot-health-preflight.md).
+pub async fn start_postgres_with_tight_wal_retention() -> (ContainerAsync<GenericImage>, String) {
+    start_postgres_with_extra_args(&[
+        "-c",
+        "max_slot_wal_keep_size=1MB",
+        "-c",
+        "min_wal_size=32MB",
+        "-c",
+        "max_wal_size=64MB",
+    ])
+    .await
 }
 
 pub async fn connect(conn_str: &str) -> tokio_postgres::Client {
@@ -236,11 +271,14 @@ pub async fn drop_slot_once_inactive(client: &tokio_postgres::Client, slot: &str
 /// `"postgres_connection_restored"` — is not tied to the test that triggered
 /// it; if that same message ever starts being logged by another
 /// successfully-reconnecting test, matching on the text alone becomes a
-/// coincidence. So the visitor also records the `slot` field when the event
-/// has one (`info!(slot = %..., "message")` — this is how preflight, start,
-/// and connection restoration are all logged), and appends it to the message
-/// as `"message slot=value"` — the caller can check both instead of relying
-/// on one text being unique.
+/// coincidence. So the visitor also records every other named field on the
+/// event (`info!(slot = %..., restart_lsn = ?..., "message")` — this is how
+/// preflight, start, and connection restoration are all logged), and
+/// appends each as `"message name=value"` in the order the event recorded
+/// them — the caller can check the message, `slot`, or any other field
+/// (e.g. `restart_lsn`/`confirmed_flush_lsn` on `slot_preflight_ok`,
+/// `tests/guard.rs`) instead of relying on the message text alone being
+/// unique.
 struct CapturingSubscriber {
     events: Arc<Mutex<Vec<String>>>,
 }
@@ -248,15 +286,14 @@ struct CapturingSubscriber {
 #[derive(Default)]
 struct MessageVisitor {
     message: String,
-    slot: Option<String>,
+    fields: Vec<(String, String)>,
 }
 
 impl tracing::field::Visit for MessageVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         match field.name() {
             "message" => self.message = format!("{value:?}"),
-            "slot" => self.slot = Some(format!("{value:?}")),
-            _ => {}
+            name => self.fields.push((name.to_string(), format!("{value:?}"))),
         }
     }
 }
@@ -273,10 +310,10 @@ impl tracing::Subscriber for CapturingSubscriber {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);
-        let combined = match visitor.slot {
-            Some(slot) => format!("{} slot={slot}", visitor.message),
-            None => visitor.message,
-        };
+        let mut combined = visitor.message;
+        for (name, value) in &visitor.fields {
+            combined.push_str(&format!(" {name}={value}"));
+        }
         self.events.lock().unwrap().push(combined);
     }
     fn enter(&self, _span: &tracing::span::Id) {}

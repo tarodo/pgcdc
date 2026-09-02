@@ -17,7 +17,7 @@ rewriting to match whatever got built.
 That constraint held. The spec was never edited to match the implementation. Every place I
 needed to depart from it — because it was wrong, silent on a question, or contradicted itself —
 became a numbered, justified entry in [DECISIONS.md](../DECISIONS.md) instead of a quiet
-rewrite of the source document. By the end there were thirty of them (`Q1`–`Q30`), each
+rewrite of the source document. By the end there were thirty-two of them (`Q1`–`Q32`), each
 recording the decision, the reasoning, and the alternative I rejected.
 
 Seven places in the spec needed correction outright: an assumption that a ready-made
@@ -176,7 +176,7 @@ re-reads in full once it's grown long.
 ## Whose decisions these were
 
 None of the above was generated and accepted wholesale. The specification was drafted by a
-language model, on request, from a prompt I wrote; the thirty-one decisions that followed, the
+language model, on request, from a prompt I wrote; the thirty-two decisions that followed, the
 six-stage plan, the pre-flight guard the spike demanded, what got deliberately broken at each
 review, and the fix for every defect described here were mine. The model was a tool used at
 each of those points — to draft the spec text, to help write and review code — the way a
