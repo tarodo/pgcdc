@@ -195,10 +195,53 @@ A process that could lose events never exits `0`. Every fatal reason carries an
 
 ---
 
+## Operating assumptions
+
+The guarantee below holds as long as, between two runs of pgcdc:
+
+- no one else advances the replication slot;
+- the slot is not dropped and a new one created under the same name;
+- the publication's table membership is unchanged;
+- output pgcdc already wrote and fsynced is not edited, truncated, or deleted.
+
+pgcdc cannot verify any of these itself, because it keeps no checkpoint of its own — the
+slot's `confirmed_flush_lsn` is the only durable position that outlives the process
+([DECISIONS.md](DECISIONS.md), Q4). What it *can* check is bounded by that fact:
+
+**Within a running process, a violation of the first assumption is caught, and is fatal.**
+A connection drop that forces a reconnect compares the slot's `confirmed_flush_lsn`
+against the durable position this process itself built up (`check_reconnect`,
+`src/postgres/guard.rs`). A slot *ahead* of that position — WAL acknowledged by something
+other than this process's own sink — exits 1 with `error_kind=slot_ahead`.
+
+**Across a restart, none of the four are caught.** The durable position above is created
+fresh on every launch and starts at zero (`SessionState::new` in
+`src/postgres/replication.rs`), so the first connection of a run has nothing to compare
+the slot against — the reconnect check stays off until this process has made something
+durable itself — and is simply skipped. Concretely:
+
+- another consumer advancing the slot while pgcdc was down looks identical to an ordinary
+  cold start;
+- the pre-flight check only confirms that a slot with the configured name *exists*
+  (`preflight_slot`, `src/postgres/guard.rs`) — it has no way to tell a recreated slot
+  from the original one;
+- pgcdc decodes whatever `pgoutput` sends and keeps no independent record of what the
+  publication should contain, so a table quietly dropped from it raises nothing;
+- every sink only appends (`FileSink::open`, `src/sink/file.rs`) and never reads back its
+  own output, so there is nothing to notice if a file shrank since the last run.
+
+None of this needs malice. An operator who recreates a stuck slot by hand, or truncates a
+log file to reclaim disk, reproduces two of these exactly.
+
+---
+
 ## Guarantees
 
 **Duplicates after a failure are acceptable; silent loss is not.** After a crash you may
-see events again around the boundary — consumers must be idempotent. You will not miss any.
+see events again around the boundary — consumers must be idempotent. Under the operating
+assumptions above, pgcdc never acknowledges a WAL position before the sink has confirmed
+it durable: a failure may produce duplicates, it does not produce gaps in the stream pgcdc
+manages.
 
 **A position is acknowledged only after the durability barrier**, never after the write was
 merely accepted. There is a window between the two, and acknowledging inside it would mean
