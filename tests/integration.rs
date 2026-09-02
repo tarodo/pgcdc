@@ -11,8 +11,7 @@ use tokio::sync::mpsc;
 
 /// Accumulates transactions into a channel so the test can wait for them.
 /// The highest received position since the last barrier is stored
-/// separately: a `write_transaction` return does not mean durable (that is
-/// the whole point of Task 2).
+/// separately: a `write_transaction` return does not mean durable.
 struct ChannelSink(mpsc::UnboundedSender<Transaction>, Option<Lsn>);
 
 #[async_trait::async_trait]
@@ -52,13 +51,12 @@ impl Sink for FailingSink {
 /// is something to fail on. Exists separately from `FailingSink` because
 /// that one fails inside `write_transaction` and never reaches the code
 /// that marks durable — so it does not guard the "write went through" /
-/// "barrier went through" split that task 2 was set up for in the first
-/// place (review Task 2, round 1, F2).
+/// "barrier went through" split in the first place.
 ///
-/// Task 4 review, round 1, F1: `flush` used to fail UNCONDITIONALLY,
-/// including on an empty tick with no writes at all. After task 4 the
-/// barrier is reachable on idle ticks too (that is the whole point of the
-/// timer), so a test double like that could abort `run()` with the expected
+/// `flush` used to fail UNCONDITIONALLY,
+/// including on an empty tick with no writes at all. Once the timer made the
+/// barrier reachable on idle ticks too (that is the whole point of the
+/// timer), a test double like that could abort `run()` with the expected
 /// error before the first `write_transaction` even ran — the test would
 /// pass without checking anything. Its shape matches the other sinks:
 /// `write_transaction` records the received position, `flush` on an empty
@@ -93,7 +91,7 @@ impl Sink for FlushFailsSink {
 /// write failure" apart from "a barrier failure": even a mutation that
 /// ignores the `Err` from `write_transaction` would still bring `run()`
 /// down on the very next barrier (which fails unconditionally), and the
-/// sink-failure test would pass green for the wrong reason (I4).
+/// sink-failure test would pass green for the wrong reason.
 ///
 /// `WriteFailsSink` holds no state at all (unlike `FlushFailsSink`, which
 /// has an `Option<Lsn>` field) — the write always fails before there is
@@ -142,7 +140,7 @@ fn config(conn: &str) -> Config {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reconnect_bounds_above_the_ceiling_fail_before_any_connection() {
-    // M6: `validate_reconnect_bounds()` was added to `run()` in a previous
+    // `validate_reconnect_bounds()` was added to `run()` in a previous
     // round, but without a test that specifically hits the call inside
     // `run()` — the call itself could be deleted and the whole suite would
     // still stay green (the unit tests in `config.rs` only check the method
@@ -177,7 +175,7 @@ async fn reconnect_bounds_above_the_ceiling_fail_before_any_connection() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
-    // I1: previously a signal arriving while the DB was unreachable went
+    // Previously a signal arriving while the DB was unreachable went
     // unnoticed entirely — neither did the outer reconnect loop read the
     // shutdown flag, nor was the backoff sleep interruptible. The reviewer
     // reproduced this live: the binary on a dead port, SIGTERM, still alive
@@ -227,10 +225,10 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
     // one are indistinguishable. The check below must catch the SIGNAL
     // exactly while a pause up to the ceiling (3000ms, several times
     // SHUTDOWN_POLL_INTERVAL) is in progress — only that way does the test
-    // tell a sliced pause apart from a whole sleep(delay) (stage 5 round 1, F1).
+    // tell a sliced pause apart from a whole sleep(delay).
     //
-    // The budget is 20s (400×50ms), not the previous 10s (round 1 review,
-    // F3): the mandatory part of the wait alone (the sum of pauses up to
+    // The budget is 20s (400×50ms), not the previous 10s: the mandatory part
+    // of the wait alone (the sum of pauses up to
     // the seventh retry) is already ~3.15s, and on a locally loaded machine
     // this test suite has been measured to vary by 2.4x (9.5-22.4s across
     // runs) — 10s left only a threefold margin, not the sixtyfold margin
@@ -262,7 +260,7 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
 
     // Polling via try_wait() rather than a blocking wait() inside
-    // spawn_blocking: if this test catches an I1 regression and the process
+    // spawn_blocking: if this test catches a regression and the process
     // does NOT react to SIGTERM, a blocking wait() would hang forever, and
     // tokio's runtime Drop waits specifically for blocking tasks to finish —
     // the test would hang the whole test binary instead of simply failing
@@ -295,7 +293,7 @@ async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_in_the_last_backoff_chunk_needs_the_top_of_loop_check() {
-    // Round 1 review, F1/F2: backoff slicing checks the flag BEFORE each
+    // Backoff slicing checks the flag BEFORE each
     // chunk and never AFTER the last one — a signal that lands in exactly
     // the last chunk does not reach that check and is only caught by the
     // check at the top of the NEXT pass of the outer loop. This test's
@@ -396,7 +394,7 @@ async fn sigterm_in_the_last_backoff_chunk_needs_the_top_of_loop_check() {
     // chunk (800-1000) is the very one that the slicing does not re-check
     // after its own end; the signal must land exactly there.
     //
-    // Round 2 review, F5: our "now" is always LATER than the true moment
+    // Our "now" is always LATER than the true moment
     // of the log line — that's what polling every 50ms would give. So the
     // offset can only INCREASE the actual point where we land inside the
     // pause, never decrease it. Hence: aim closer to the start of the
@@ -490,11 +488,11 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
     assert_eq!(json["unchanged_columns"], serde_json::json!([]));
 
     // The core of the LSN contract: PostgreSQL must acknowledge NOT EARLIER
-    // than end_lsn, not commit_lsn (they differ by a fixed 0x30 bytes —
-    // DECISIONS/Task 6 brief). We wait for "not earlier", not an exact
+    // than end_lsn, not commit_lsn (they differ by a fixed 0x30 bytes).
+    // We wait for "not earlier", not an exact
     // match: idle-keepalive-advance (stage 3) can move confirmed_flush_lsn
     // past end_lsn even before our poll — under load this was caught in
-    // about 20% of runs (review Task 2, round 1, F5), and it's not that
+    // about 20% of runs, and it's not that
     // the wrong thing got acknowledged, but that the server kept doing its
     // own WAL activity in the background (a recorded example — 0x38 bytes
     // from one background standby-snapshot record).
@@ -723,9 +721,9 @@ async fn barrier_failure_stops_us_before_the_slot_advances() {
     // Complements sink_failure_stops_us_before_the_slot_advances: that one
     // checks a failure INSIDE write_transaction, this one checks a barrier
     // failure AFTER a successful write. Without this test, the code path
-    // task 2 added (durable is marked only by flush's return, not
-    // write_transaction's) is completely unguarded: FailingSink never
-    // reaches it (review Task 2, round 1, F2).
+    // that marks durable only from flush's return, not
+    // write_transaction's, is completely unguarded: FailingSink never
+    // reaches it.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -783,7 +781,7 @@ async fn barrier_failure_stops_us_before_the_slot_advances() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_failure_stops_us_before_the_slot_advances_and_is_not_swallowed() {
-    // I4: complements sink_failure_stops_us_before_the_slot_advances and
+    // Complements sink_failure_stops_us_before_the_slot_advances and
     // barrier_failure_stops_us_before_the_slot_advances with a test double
     // where ONLY the write fails while the (empty) barrier succeeds —
     // WriteFailsSink, the mirror of FlushFailsSink. FailingSink does not
@@ -860,7 +858,7 @@ async fn we_acknowledge_the_end_of_the_commit_record_not_its_start() {
     // cases. The counter reads OUR decision, not the server's state, and
     // so it does distinguish.
     //
-    // M5 (review round after task 4): this is a pin test for the dam
+    // This is a pin test for the dam
     // between acknowledge_durable (src/postgres/replication.rs) and
     // Transaction::end_lsn (src/transaction.rs), going through
     // ChannelSink — the test double sink declared in this same file, which
@@ -922,7 +920,7 @@ async fn we_acknowledge_the_end_of_the_commit_record_not_its_start() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_servers_confirmed_position_never_races_ahead_of_what_we_acknowledged() {
-    // I3: DECISIONS Q25(2) forbids five calls to `pg_walstream` leading into
+    // DECISIONS Q25(2) forbids five calls to `pg_walstream` leading into
     // `recover_connection`, precisely because they restart the stream from
     // the RECEIVED position rather than the DURABLE one. The test above
     // (we_acknowledge_the_end_of_the_commit_record_not_its_start) reads OUR
@@ -959,8 +957,7 @@ async fn the_servers_confirmed_position_never_races_ahead_of_what_we_acknowledge
     // that B manages to create while it streams — and that's calibrated by
     // the time it takes to parse one row, not the sum of all rows. The
     // previous version of the test ran 3000 rows (≈600MB): five times more
-    // expensive in time and memory, without buying a bigger gap (review
-    // round 2 after task 4 finale, P2) — at the same threshold
+    // expensive in time and memory, without buying a bigger gap — at the same threshold
     // (`max_gap_after_some_ack >= 1_000_000` below), the observed gap
     // stays in the tens of megabytes, with margin to spare by orders of
     // magnitude.
@@ -1152,7 +1149,7 @@ async fn a_failing_barrier_leaves_the_acknowledged_counter_at_zero() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error() {
-    // I2: "JSONL on stdout, logs on stderr" is behaviorally correct, but
+    // "JSONL on stdout, logs on stderr" is behaviorally correct, but
     // nothing would have failed on a regression. `--help` doesn't work for
     // this: it doesn't go through any branch that logs. A missing slot is a
     // deterministic and fast way to guaranteedly hit the logging branch:
@@ -1168,7 +1165,7 @@ async fn stdout_stays_json_only_when_the_real_binary_hits_a_fatal_error() {
     // the blocking thread inside cmd.output() and the orphaned child
     // process itself keep living. Now that the process retries reconnecting
     // forever, such an orphan never finishes on its own and hangs the
-    // whole test binary on runtime shutdown (review Task 2, round 1, F9).
+    // whole test binary on runtime shutdown.
     // kill_on_drop(true) gives us a handle that kills the process if the
     // future is cancelled by the timeout: an async Child, unlike std, gets
     // dropped along with the future.
@@ -1283,8 +1280,7 @@ async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
 
     // The slot is currently classified as immediately fatal, but run() can
     // now retry forever on recoverable errors — without the timeout, this
-    // await would hang the test forever if the classification ever broke
-    // (review Task 2, round 1, F9).
+    // await would hang the test forever if the classification ever broke.
     let err = tokio::time::timeout(
         Duration::from_secs(20),
         pgcdc::postgres::replication::run(
@@ -1311,7 +1307,7 @@ async fn missing_slot_is_fatal_and_the_slot_is_not_created() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slot_with_a_foreign_output_plugin_is_fatal_and_the_process_exits() {
-    // C1 (review round after task 4): §20 item 14 requires a nonzero exit
+    // §20 item 14 requires a nonzero exit
     // code when the slot is either missing OR unusable. "Missing" is
     // covered by missing_slot_is_fatal_and_the_slot_is_not_created above;
     // "unusable" wasn't covered at all — a slot where START_REPLICATION
@@ -1387,7 +1383,7 @@ async fn slot_with_a_foreign_output_plugin_is_fatal_and_the_process_exits() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slot_busy_with_our_own_prior_session_is_recoverable_not_fatal() {
-    // The flip side of C1: the server ALSO responds with a refusal on
+    // The flip side of the previous test: the server ALSO responds with a refusal on
     // START_REPLICATION ("replication slot ... is active for PID ...",
     // ERRCODE_OBJECT_IN_USE), but this isn't about the slot being unusable
     // — a concurrent reader is still holding it. A naive "any server
@@ -1476,7 +1472,7 @@ async fn slot_busy_forever_exhausts_the_patience_budget_and_the_process_exits_no
     // test; with a small patience budget the process must exhaust it and
     // exit with a nonzero code instead of going into an endless reconnect
     // — exactly this was reproduced by hand (34 cycles, not a single
-    // nonzero exit code) in the task 4 report.
+    // nonzero exit code).
     //
     // We run the real compiled binary: checklist item 14 is about the
     // PROCESS exit code, not about the library's Result.
@@ -1560,7 +1556,7 @@ async fn slot_busy_forever_exhausts_the_patience_budget_and_the_process_exits_no
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reconnect_zeroes_the_buffer_gauge_at_the_run_call_site() {
-    // M4 (review round after task 4): removing the call to
+    // Removing the call to
     // state.reset_for_reconnect(&metrics) from run() leaves every other
     // test green — the function itself is covered by a unit test
     // (reconnect_zeroes_the_buffer_gauge_even_with_an_open_transaction in
@@ -1797,7 +1793,7 @@ async fn several_transactions_are_not_lost_and_the_slot_catches_up() {
     // double, grouped and per-transaction acknowledgement are
     // indistinguishable. What is actually checked here is only that
     // grouping does not lose transactions and that the slot eventually
-    // catches up with the last delivered position (review round 2, F3).
+    // catches up with the last delivered position.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -1901,8 +1897,8 @@ async fn slot_advances_while_the_publication_is_idle() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
-    // FlushFailsSink, not the test double that fails unconditionally
-    // (review round 2, F2): that one failed the barrier on an EMPTY tick
+    // FlushFailsSink, not the test double that fails unconditionally:
+    // that one failed the barrier on an EMPTY tick
     // too, aborting run() with an error before the first write_transaction
     // — the INSERT below never got the chance to happen, and the "slot did
     // not move" assertion would pass without checking anything about the
@@ -1961,14 +1957,14 @@ async fn keepalive_does_not_advance_the_slot_past_an_unwritten_transaction() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_connection_is_recovered_without_losing_rows() {
-    // Capture logs before run() starts: the check below (F3) must see the
+    // Capture logs before run() starts: the check below must see the
     // recovery event, not just guess that it happened.
     let log_events = common::capture_log_events();
 
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
-    // M8: the slot name here is unique to this test, rather than the
+    // The slot name here is unique to this test, rather than the
     // common "pgcdc_slot" most neighbors use — `log_events` accumulates
     // messages from ALL tests running in parallel within one process (a
     // shared global buffer), and without a unique marker inside the
@@ -1978,7 +1974,7 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
     let slot = "pgcdc_slot_recover_no_loss";
     common::create_slot(&client, slot).await;
 
-    // F5 (review Task 2, round 1): a shared instance, not a throwaway one —
+    // A shared instance, not a throwaway one —
     // this is the only test that is guaranteed to cross the reconnect
     // branch, and hence the only mutation coverage `reconnects_total` will
     // ever get at all.
@@ -2016,8 +2012,7 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
     // drop below would almost certainly happen before the first flush,
     // `state.durable()` would stay at zero, is_reconnect() would never
     // become true, and the whole reconnect-check block would go
-    // unexercised by this test — exactly the risk from review Task 2,
-    // round 1, F3.
+    // unexercised by this test.
     common::wait_for_slot_at_least(&client, slot, first.end_lsn).await;
 
     // The server drops our replication connection.
@@ -2052,12 +2047,12 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
         "the row after the drop did not arrive, saw: {names:?}"
     );
 
-    // F3: this is the task's headline check — that check_reconnect
+    // This is the headline check — that check_reconnect
     // actually ran and the recovery was actually logged, not just "the row
     // somehow arrived". Deleting the whole reconnect-check block would not
     // touch any of the earlier assertions in this test.
     //
-    // M8: the message must carry EXACTLY our `slot` — `log_events` is
+    // The message must carry EXACTLY our `slot` — `log_events` is
     // shared across the whole test binary, and another test that lives
     // long enough for a successful reconnect would log the same message
     // with a DIFFERENT slot name. Today the only reconnect neighbor
@@ -2071,7 +2066,7 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
         "the connection-restored event was not logged for slot {slot}"
     );
 
-    // F5 (review Task 2, round 1): by this point the outer reconnect loop
+    // By this point the outer reconnect loop
     // has already made at least one full lap (proven by the restoration
     // log above), so the counter must have advanced. This is the only
     // mutation check `reconnects_total` gets at all — removing the
@@ -2082,7 +2077,7 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
         "reconnects_total must have advanced after the drop and recovery"
     );
 
-    // F4: a slot that disappears during a drop must be fatal immediately,
+    // A slot that disappears during a drop must be fatal immediately,
     // not retried forever — otherwise the process would sit in the
     // reconnect loop while the data it was supposed to capture aged out of WAL.
     common::terminate_replication_backend(&client).await;
@@ -2187,7 +2182,7 @@ async fn a_replayed_transactions_lsn_values_match_the_first_delivery() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slot_advanced_past_our_durable_position_is_fatal_on_reconnect() {
     // Direct proof that check_reconnect() is now ACTUALLY called, not just
-    // sitting there untouched (review Task 2, round 1, F3). The test in the
+    // sitting there untouched. The test in the
     // neighboring function doesn't check this: there, on an ordinary
     // reconnect, the slot either exactly matches durable or lags behind —
     // it never touches the asymmetric case "the slot is AHEAD — fatal".
@@ -2265,8 +2260,8 @@ async fn file_output_binary_writes_durable_json_lines() {
     // The `--output file` branch in main.rs is completely uncovered:
     // replace FileSink with StdoutSink in the match and no test fails red.
     // FileSink is the stage's only sink that honestly promises Fsync, and
-    // this exact branch of the binary never exercises it at all (review
-    // round 2, F7). We run the real binary end to end: CLI parsing, guard,
+    // this exact branch of the binary never exercises it at all. We run
+    // the real binary end to end: CLI parsing, guard,
     // the replication loop, and the file sink with fsync.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
@@ -2455,7 +2450,7 @@ async fn a_transaction_over_the_limit_is_fatal_and_the_slot_stays_put() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
-    // Round 1, F2: `a_terminated_process_exits_zero_after_draining` stays
+    // `a_terminated_process_exits_zero_after_draining` stays
     // green even without a barrier in the shutdown branch itself, because
     // at the default interval (200ms) the periodic barrier almost always
     // manages to fire before we even send the signal. This test closes
@@ -2475,7 +2470,7 @@ async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
     // `send_feedback`, and in the shutdown branch that only happens inside
     // `flush_and_acknowledge`.
     //
-    // Round 3, F1: previously a fixed `sleep` stood here instead of waiting
+    // Previously a fixed `sleep` stood here instead of waiting
     // for proof. The reviewer uncovered the real cause of the flakiness: at
     // 150ms the child process hadn't even managed to install its signal
     // handler yet, at 700ms it passed by a hair (~0.4s of margin) — under
@@ -2622,7 +2617,7 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
     // Checks only what the name claims: after a reconnect, SIGTERM still
     // brings the process to a graceful exit with code 0.
     //
-    // Round 2, F3: this test used to claim more — that it catches
+    // This test used to claim more — that it catches
     // `spawn_shutdown_listener()` being moved inside the reconnect loop
     // (recreating the listener on every session). That's wrong:
     // `tokio::signal::unix::signal` and `ctrl_c()` deliver the signal to
@@ -2668,7 +2663,7 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
     // we need to PROVE that a reconnect happened before sending the
     // signal, not just hope based on timing.
     // `postgres_connection_restored` is only logged on a successful
-    // reconnection (stream_once, review Task 2).
+    // reconnection (stream_once).
     let stderr = child.stderr.take().expect("stderr was requested as piped");
     let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2705,7 +2700,7 @@ async fn sending_sigterm_after_a_reconnect_still_exits_zero() {
     );
 
     // Drop the replication connection from the server side — the process
-    // must reconnect on its own (task 2), not fail.
+    // must reconnect on its own, not fail.
     common::terminate_replication_backend(&client).await;
 
     // Wait for the connection-restored log line: without it, the check
@@ -2793,8 +2788,8 @@ async fn sigint_also_stops_the_process_cleanly() {
 
     unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
 
-    // Polling via try_wait() rather than a blocking wait() (round 1
-    // review, F5): just like in this test's dead-port neighbor, a
+    // Polling via try_wait() rather than a blocking wait(): just like in
+    // this test's dead-port neighbor, a
     // regression that installs the handler but never sets the flag would
     // leave a blocking wait() hanging forever, and tokio's runtime Drop
     // specifically waits for blocking tasks — the test would hang the
@@ -2885,13 +2880,13 @@ async fn a_productive_session_resets_the_backoff() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect() {
-    // I2: deleting the whole periodic-report block (`metrics_report`,
+    // Deleting the whole periodic-report block (`metrics_report`,
     // `METRICS_REPORT_INTERVAL`) left all 168 tests green — neither that
     // the line comes out at all, nor the interval, nor that the countdown
     // survives a reconnect, was pinned down by anything but a manual demo
     // run. And it was precisely surviving a reconnect that justified
-    // hoisting `last_report` outside the reconnect loop in a previous round
-    // (review Task 3, round 1, F1): without it, a process reconnecting more
+    // hoisting `last_report` outside the reconnect loop in a previous
+    // round: without it, a process reconnecting more
     // often than ten seconds would never live long enough inside a single
     // session for the report to come out.
     //
