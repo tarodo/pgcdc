@@ -426,11 +426,11 @@ fn classify_start_outcome(
 }
 
 /// The common tail for ANY `stream_once` failure that happened BEFORE
-/// `classify_start_outcome` got to classify `stream.start()`: the slot pre-flight check,
-/// the reconnect check, opening the connection itself. None of these failures can be the
-/// busy race — SQLSTATE 55006 comes back only in the server's answer to
-/// `START_REPLICATION` itself — so such a failure unconditionally BREAKS the chain of
-/// consecutive observations of the race:
+/// `classify_start_outcome` got to classify `stream.start()`: the slot pre-flight check
+/// itself, its terminal-`wal_status` refusal, the reconnect check, opening the connection.
+/// None of these failures can be the busy race — SQLSTATE 55006 comes back only in the
+/// server's answer to `START_REPLICATION` itself — so such a failure unconditionally
+/// BREAKS the chain of consecutive observations of the race:
 /// without this, the clock accumulated by a past race would keep running for the whole
 /// time the server is unreachable for an entirely different reason, and the interval of
 /// unreachability would add into the accumulated total as if the slot had been answering
@@ -741,12 +741,24 @@ async fn stream_once(
         slot_busy_patience,
     )?;
     if slot_health_is_terminal(info_slot.wal_status.as_deref()) {
-        return Err(PgcdcError::SlotUnusable {
-            slot: config.slot.clone(),
-            reason: "PostgreSQL reports wal_status = 'lost': the WAL this slot \
-                     needed has been removed, so it can never stream again"
-                .to_owned(),
-        });
+        // Wrapped for the same reason as the preflight call just above: this refusal is
+        // read from wal_status a moment earlier, not from START_REPLICATION, so it
+        // physically cannot be the busy race either, and must break the chain of
+        // consecutive observations like every other early failure. No observable effect
+        // today — SlotUnusable is fatal, the process exits before the counter is ever
+        // read again — but interrupt_patience_on_early_failure's own doc comment claims
+        // to cover ANY pre-classification stream_once failure, and leaving this one out
+        // would make that claim false for a reader who trusts it without re-checking the
+        // code.
+        return interrupt_patience_on_early_failure(
+            Err(PgcdcError::SlotUnusable {
+                slot: config.slot.clone(),
+                reason: "PostgreSQL reports wal_status = 'lost': the WAL this slot \
+                         needed has been removed, so it can never stream again"
+                    .to_owned(),
+            }),
+            slot_busy_patience,
+        );
     }
     info!(
         slot = %config.slot,
