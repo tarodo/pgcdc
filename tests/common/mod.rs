@@ -6,10 +6,24 @@ use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-/// A fresh PostgreSQL for every test. The replication slot is a global
-/// stateful object, and on a shared instance tests would fight over it and
-/// depend on run order (DECISIONS Q10).
-pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
+/// Shared container setup: the base flags every test needs (logical
+/// decoding enabled, room for slots/senders), plus whatever extra `-c`
+/// flags the caller wants appended. Kept private — `start_postgres` and
+/// `start_postgres_with_tight_wal_retention` are the two public entry
+/// points, so a change to the wait-strategy or port-retry logic below
+/// cannot accidentally diverge between them.
+async fn start_postgres_with_extra_args(extra: &[&str]) -> (ContainerAsync<GenericImage>, String) {
+    let mut cmd = vec![
+        "postgres",
+        "-c",
+        "wal_level=logical",
+        "-c",
+        "max_replication_slots=10",
+        "-c",
+        "max_wal_senders=10",
+    ];
+    cmd.extend_from_slice(extra);
+
     let container = GenericImage::new("postgres", "16-alpine")
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -17,15 +31,7 @@ pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_DB", "app")
-        .with_cmd(vec![
-            "postgres",
-            "-c",
-            "wal_level=logical",
-            "-c",
-            "max_replication_slots=10",
-            "-c",
-            "max_wal_senders=10",
-        ])
+        .with_cmd(cmd)
         .start()
         .await
         .expect("start postgres");
@@ -49,6 +55,35 @@ pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
     };
     let conn = format!("postgres://postgres:postgres@127.0.0.1:{port}/app");
     (container, conn)
+}
+
+/// A fresh PostgreSQL for every test. The replication slot is a global
+/// stateful object, and on a shared instance tests would fight over it and
+/// depend on run order (DECISIONS Q10).
+pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
+    start_postgres_with_extra_args(&[]).await
+}
+
+/// A PostgreSQL tuned so a replication slot's WAL retention can be blown
+/// through with a few megabytes of writes instead of gigabytes: pinning
+/// `max_slot_wal_keep_size` this low means a single checkpoint past that
+/// budget is enough for the server to mark the slot `wal_status = 'lost'`.
+/// `min_wal_size`/`max_wal_size` are kept small too, purely so the
+/// checkpoint that does the marking is cheap. Verified directly against
+/// this image before use: one ~8MB insert plus one `CHECKPOINT` reliably
+/// flips a freshly created slot straight to `lost` in well under a second,
+/// matching the "reserved → lost in one step" transition this project's own
+/// lab measured (docs/superpowers/plans/2026-09-02-slot-health-preflight.md).
+pub async fn start_postgres_with_tight_wal_retention() -> (ContainerAsync<GenericImage>, String) {
+    start_postgres_with_extra_args(&[
+        "-c",
+        "max_slot_wal_keep_size=1MB",
+        "-c",
+        "min_wal_size=32MB",
+        "-c",
+        "max_wal_size=64MB",
+    ])
+    .await
 }
 
 pub async fn connect(conn_str: &str) -> tokio_postgres::Client {

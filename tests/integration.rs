@@ -1382,6 +1382,124 @@ async fn slot_with_a_foreign_output_plugin_is_fatal_and_the_process_exits() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_slot_invalidated_before_streaming_is_refused_without_starting_replication() {
+    // The mutation coverage gap this closes: `slot_health_is_terminal` itself is
+    // pinned by a unit test in src/postgres/replication.rs, but its ONE call site
+    // inside `stream_once` was not covered by anything that runs the real
+    // preflight-then-refuse path end to end. Deleting that call site, or moving
+    // it to after the `slot_preflight_ok` log line, left all 180 tests green —
+    // this project already closed exactly this shape of gap once before, for
+    // `reset_for_reconnect`'s call site (see
+    // `reconnect_zeroes_the_buffer_gauge_at_the_run_call_site` above).
+    //
+    // This is deliberately a DIFFERENT path from
+    // `slot_with_a_foreign_output_plugin_is_fatal_and_the_process_exits`: that
+    // test gets `SlotUnusable` from the server's refusal of START_REPLICATION
+    // (SQLSTATE 22023) — a mid-connection rejection. This test gets the SAME
+    // error variant, but from the pre-flight query, before any replication
+    // connection is attempted at all. The two are told apart by the log: on
+    // this path `slot_preflight_ok` must never appear, because the refusal
+    // fires before that line runs.
+    //
+    // A real `wal_status = 'lost'` slot is produced against a real server
+    // rather than assumed — `max_slot_wal_keep_size` is pinned low enough
+    // (tests/common::start_postgres_with_tight_wal_retention) that a single
+    // multi-megabyte insert plus one CHECKPOINT reliably flips a fresh slot
+    // straight to `lost` (measured: well under a second, matching the
+    // "reserved → lost in one step" transition from this project's own lab
+    // notes). `wal_status` is polled after each attempt rather than assumed,
+    // with a bounded budget and a message naming the last status seen if it
+    // is never reached.
+    let (_pg, conn) = common::start_postgres_with_tight_wal_retention().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    const DRIVE_BUDGET: Duration = Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + DRIVE_BUDGET;
+    loop {
+        client
+            .batch_execute(
+                "INSERT INTO public.users \
+                 SELECT g, 'x', NULL, repeat('y', 4000) FROM generate_series(1, 2000) g \
+                 ON CONFLICT (id) DO UPDATE SET bio = EXCLUDED.bio",
+            )
+            .await
+            .expect("push WAL past the slot's tight retention budget");
+        client
+            .batch_execute("SELECT pg_switch_wal(); CHECKPOINT;")
+            .await
+            .expect("force a checkpoint that can retire WAL past max_slot_wal_keep_size");
+
+        let row = client
+            .query_one(
+                "SELECT wal_status FROM pg_replication_slots WHERE slot_name = $1",
+                &[&"pgcdc_slot"],
+            )
+            .await
+            .expect("query wal_status");
+        let status: Option<String> = row.get(0);
+        if status.as_deref() == Some("lost") {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "slot pgcdc_slot did not reach wal_status = 'lost' within {DRIVE_BUDGET:?}; \
+                 last observed status: {status:?}"
+            );
+        }
+    }
+
+    // We run the real compiled binary, not run() in-process, for the same
+    // reason as the foreign-plugin test: this is about the PROCESS exit code
+    // and its stderr, not the library's Result.
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"));
+    cmd.env("PGCDC_DATABASE_URL", &conn)
+        .env("PGCDC_PUBLICATION", "pgcdc_pub")
+        .env("PGCDC_SLOT", "pgcdc_slot")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn().expect("spawn pgcdc");
+
+    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+        .await
+        .expect("the process must finish within 20 seconds, not go into an endless reconnect")
+        .expect("wait for pgcdc to finish");
+
+    assert!(
+        !output.status.success(),
+        "a slot with wal_status = 'lost' must be fatal for the real binary"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a fatal error must produce exit code 1 (DECISIONS Q22)"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
+    assert!(
+        stdout.is_empty(),
+        "stdout must stay empty on a fatal startup error, got: {stdout:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be valid UTF-8");
+    assert!(
+        stderr.contains("slot_unusable"),
+        "stderr must name the reason via the machine-readable error_kind label, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("slot_preflight_ok"),
+        "a slot invalidated before streaming must be refused BEFORE the preflight-ok log line, \
+         not after it: {stderr}"
+    );
+    assert!(
+        !stderr.contains("reconnecting"),
+        "an invalidated slot must stop the process, not send it into a reconnect loop: {stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn slot_busy_with_our_own_prior_session_is_recoverable_not_fatal() {
     // The flip side of the previous test: the server ALSO responds with a refusal on
     // START_REPLICATION ("replication slot ... is active for PID ...",
