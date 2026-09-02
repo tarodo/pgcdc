@@ -536,8 +536,11 @@ never is.
 
 ### A comment describing a mechanism that does not exist
 
-Eleven times. Every one was found by a reader, not by the author — and twice in a row the comment lied
-inside the very construct that was being fixed at that moment.
+Fourteen times. Every one was found by a reader, not by the author — and twice in a row the comment lied
+inside the very construct that was being fixed at that moment. The three most recent landed in the
+documents written specifically to earn trust in the rest of the text: a spec header with the wrong test
+count, a CI comment overstating how many tests need a container, and a README sentence that explained
+one throughput swing with a number pulled from a different metric.
 
 > Whoever changes a mechanism is the last person able to notice that the description has stopped
 > matching it.
