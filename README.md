@@ -197,7 +197,7 @@ A process that could lose events never exits `0`. Every fatal reason carries an
 | `error_kind` | What happened | What to do |
 |---|---|---|
 | `slot_missing` | the slot does not exist | create it, then decide whether the gap matters |
-| `slot_unusable` | the server refuses to stream it: invalidated (`SQLSTATE 55000`) or a foreign output plugin (`22023`) | the WAL is gone — recreate the slot and re-sync |
+| `slot_unusable` | invalidated (`SQLSTATE 55000`) or a foreign output plugin (`22023`) from the server, **or** caught earlier: the pre-flight check already found `wal_status = 'lost'` before `START_REPLICATION` was even attempted | the WAL is gone — recreate the slot and re-sync |
 | `slot_ahead` | the slot is ahead of our durable position | someone else acknowledged WAL that never passed through our sink; investigate before restarting |
 | `slot_busy_timed_out` | the slot stayed busy past the budget | find the other consumer holding it |
 | `transaction_too_large` | a transaction exceeded `--max-transaction-events` | raise the limit or split the write |
@@ -333,6 +333,35 @@ interval is not configurable: it is volume, not behavior.
 ```text
 INFO metrics_report events=3 transactions=3 bytes=395 reconnects=0 errors=0 last_received_lsn=0/1974170 last_acknowledged_lsn=0/19741A8 buffer=0
 ```
+
+Once per replication session — on a cold start and on every reconnect — the pre-flight
+check logs what it read about the slot, at **INFO**, before `START_REPLICATION` is ever
+attempted:
+
+```text
+INFO slot_preflight_ok slot=pgcdc_slot restart_lsn=Some("0/19B4970") confirmed_flush_lsn=Some("0/19B49A8") wal_status=Some("reserved") safe_wal_size=None catalog_xmin=Some(741) active=false
+```
+
+Five positions, each answering a different question. They are **not** summed into a single
+"lag" number, on purpose:
+
+- `restart_lsn` — the oldest WAL the server must keep for this slot: the disk risk.
+- `catalog_xmin` — the transaction horizon the slot pins: the vacuum and wraparound risk.
+- `confirmed_flush_lsn` — the position we have acknowledged.
+- `safe_wal_size` — how much more WAL can be written before this slot is at risk. **`None`
+  means unlimited retention** under the default `max_slot_wal_keep_size = -1`, not an error
+  — expect it on a healthy, unconstrained slot.
+- `wal_status` — `reserved` / `extended` / `unreserved` / `lost`; only `lost` is fatal
+  (`error_kind=slot_unusable`, see Exit codes above). `unreserved` is not: PostgreSQL
+  documents that it can climb back to `reserved` or `extended` on its own.
+
+Why not one number: a single acknowledgement was measured moving `confirmed_flush_lsn` by
+15 MB, `restart_lsn` by only 141 KB, and releasing 14 transaction ids — three different
+magnitudes answering three different questions. A "lag" figure would collapse all three into
+one and hide which risk actually moved. `safe_wal_size` is logged even though nothing here
+acts on it, because it is the one field that can move *before* the slot dies: a transition
+from `wal_status=reserved` straight to `lost` has been observed with neither `extended` nor
+`unreserved` appearing in between, `safe_wal_size` falling as the only advance warning.
 
 Per-event lines (`transaction_accepted`, `group_acknowledged`, `advanced_from_keepalive`)
 are at **DEBUG** — an exploratory run reached six figures of events per second (see
