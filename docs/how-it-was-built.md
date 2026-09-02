@@ -17,7 +17,7 @@ rewriting to match whatever got built.
 That constraint held. The spec was never edited to match the implementation. Every place I
 needed to depart from it — because it was wrong, silent on a question, or contradicted itself —
 became a numbered, justified entry in [DECISIONS.md](../DECISIONS.md) instead of a quiet
-rewrite of the source document. By the end there were thirty of them (`Q1`–`Q30`), each
+rewrite of the source document. By the end there were thirty-two of them (`Q1`–`Q32`), each
 recording the decision, the reasoning, and the alternative I rejected.
 
 Seven places in the spec needed correction outright: an assumption that a ready-made
