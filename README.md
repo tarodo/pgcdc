@@ -161,6 +161,14 @@ pgcdc --output stdout … | jq -r '.table'
 
 Column order follows the table, not the alphabet.
 
+**`lsn` is the event identifier — use it for deduplication, not `commit_lsn`.** It is the
+WAL address of the change's own record, assigned by the server, not a counter we keep — so
+it is unique within a transaction, stable across a redelivery after a crash, and increases
+in the order the changes happened. `commit_lsn` cannot serve that role: every change in the
+same transaction carries the same `commit_lsn`, because it names the commit record, not the
+individual change. Group by `commit_lsn` to find everything one transaction touched;
+identify or deduplicate an individual change by `lsn`.
+
 ---
 
 ## Exit codes

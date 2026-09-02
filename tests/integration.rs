@@ -528,6 +528,92 @@ async fn insert_travels_end_to_end_and_arrives_as_one_event() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn changes_in_one_transaction_share_commit_lsn_but_each_lsn_is_distinct_and_increasing() {
+    // commit_lsn names the commit record, so every change in the same
+    // transaction carries the same value — it cannot tell two changes in
+    // that transaction apart, and README's "## Output" section says so.
+    // lsn is the WAL address of the change's OWN record, assigned by the
+    // server rather than counted by us, so it must differ for every change
+    // and grow in the order the changes were decoded. Without a test, that
+    // claim is only a comment: this pins it against a real transaction that
+    // touches two tables with three different kinds of change.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::setup_items_table(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let cfg = config(&conn);
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
+    });
+
+    // One transaction, five changes, two tables: three inserts, an update
+    // and a delete.
+    client
+        .batch_execute(
+            "BEGIN;
+             INSERT INTO users VALUES (1, 'Alice', NULL, NULL);
+             INSERT INTO users VALUES (2, 'Bob', NULL, NULL);
+             INSERT INTO items VALUES (10, 'Widget', 5);
+             UPDATE users SET name = 'Alice2' WHERE id = 1;
+             DELETE FROM users WHERE id = 2;
+             COMMIT;",
+        )
+        .await
+        .unwrap();
+
+    let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("the transaction should arrive within 20 seconds")
+        .expect("channel closed");
+
+    assert_eq!(
+        tx.changes.len(),
+        5,
+        "all five changes must land in one transaction"
+    );
+
+    for ev in &tx.changes {
+        assert_eq!(
+            ev.commit_lsn, tx.commit_lsn,
+            "commit_lsn must be the same for every change in the transaction"
+        );
+    }
+
+    let lsns: Vec<Lsn> = tx.changes.iter().map(|ev| ev.lsn).collect();
+
+    // Distinctness, checked independently of order: sorting a copy and
+    // deduplicating it must not drop anything.
+    let mut sorted_unique = lsns.clone();
+    sorted_unique.sort();
+    sorted_unique.dedup();
+    assert_eq!(
+        sorted_unique.len(),
+        lsns.len(),
+        "lsn must be pairwise distinct within the transaction, got {lsns:?}"
+    );
+
+    // Order, checked independently of distinctness: each lsn is strictly
+    // greater than the one before it, in the order the changes were
+    // emitted — this is what "assigned in event order" means.
+    for pair in lsns.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "lsn must increase strictly in emission order, got {lsns:?}"
+        );
+    }
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn postgres_does_not_send_rolled_back_transactions() {
     // Checks OUR understanding of the protocol, not our code: logical
     // decoding physically never hands out rolled-back transactions. If
@@ -2009,6 +2095,93 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
     let err = result.unwrap_err();
     assert!(matches!(err, PgcdcError::SlotMissing { .. }), "got {err:?}");
     assert!(err.is_fatal());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replayed_transactions_lsn_values_match_the_first_delivery() {
+    // The reviewer's other question: do lsn/commit_lsn survive a redelivery?
+    // They must, because they are the server's own WAL addresses, not
+    // something pgcdc computes — decoding the same bytes twice has to
+    // produce the same numbers. To prove that honestly, the transaction
+    // below must still be UNACKNOWLEDGED at the moment the connection
+    // drops, so the reconnect is forced to replay it rather than move on to
+    // something else. ack_interval_ms is set far beyond this test's
+    // lifetime so the periodic barrier cannot fire, and the keepalive path
+    // stays shut too: it only advances once the buffered transaction's
+    // position is already durable, which needs that same barrier
+    // (`may_advance_from_keepalive`, `src/postgres/replication.rs`). So the
+    // drop below is guaranteed to force a real replay of this exact
+    // transaction, not a race against our own acknowledgement.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::setup_items_table(&client).await;
+    let slot = "pgcdc_slot_lsn_replay";
+    common::create_slot(&client, slot).await;
+
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let mut cfg = config(&conn);
+    cfg.slot = slot.into();
+    cfg.ack_interval_ms = 600_000;
+    let m = metrics.clone();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None)), m).await
+    });
+
+    client
+        .batch_execute(
+            "BEGIN;
+             INSERT INTO users VALUES (1, 'Alice', NULL, NULL);
+             INSERT INTO users VALUES (2, 'Bob', NULL, NULL);
+             INSERT INTO items VALUES (10, 'Widget', 5);
+             UPDATE users SET name = 'Alice2' WHERE id = 1;
+             DELETE FROM users WHERE id = 2;
+             COMMIT;",
+        )
+        .await
+        .unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("the first delivery should arrive within 20 seconds")
+        .expect("channel closed");
+    assert_eq!(first.changes.len(), 5);
+    let first_lsns: Vec<Lsn> = first.changes.iter().map(|ev| ev.lsn).collect();
+
+    // Nothing was acknowledged yet (see the comment above), so this forces
+    // PostgreSQL to resend the same, still-unconfirmed transaction once
+    // pgcdc reconnects.
+    common::terminate_replication_backend(&client).await;
+
+    let second = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("the replayed transaction should arrive within 20 seconds")
+        .expect("channel closed");
+
+    assert_eq!(
+        second.xid, first.xid,
+        "this must be the SAME transaction replayed, not a different one"
+    );
+    assert_eq!(
+        second.commit_lsn, first.commit_lsn,
+        "commit_lsn must be identical after a replay"
+    );
+    let second_lsns: Vec<Lsn> = second.changes.iter().map(|ev| ev.lsn).collect();
+    assert_eq!(
+        second_lsns, first_lsns,
+        "each change's lsn must be identical after a replay — it is the server's own \
+         WAL address, not something recomputed on redecoding"
+    );
+
+    // Proof this was an actual reconnect and not the first session somehow
+    // redelivering the transaction by itself.
+    assert!(
+        metrics.snapshot().reconnects_total >= 1,
+        "reconnects_total must have advanced after the drop"
+    );
+
+    handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
