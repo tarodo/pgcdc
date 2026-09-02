@@ -16,14 +16,18 @@ pub enum PgcdcError {
         durable: String,
     },
 
-    /// The server RESPONDED to `START_REPLICATION` and explicitly refused: the slot
-    /// is invalidated (`SQLSTATE 55000`) or carries a foreign output plugin
-    /// (`SQLSTATE 22023`) — the same request with the same parameters will get the
-    /// same refusal an hour from now too. Unlike `SlotAhead`, here we don't even
-    /// know the position discrepancy — the server refused before it got that
-    /// far; unlike `Connection`, a retry is not a matter of transport
-    /// luck, but a guaranteed repeat of the same refusal.
-    #[error("replication slot {slot} rejected START_REPLICATION: {reason}")]
+    /// Reached by two different paths, and the message below is deliberately
+    /// neutral to which one fired: (1) the server RESPONDED to `START_REPLICATION`
+    /// and explicitly refused — the slot is invalidated (`SQLSTATE 55000`) or
+    /// carries a foreign output plugin (`SQLSTATE 22023`); or (2) the pre-flight
+    /// check (`preflight_slot`/`slot_health_is_terminal`, `src/postgres/guard.rs`,
+    /// `src/postgres/replication.rs`) already read `wal_status = 'lost'` from
+    /// `pg_replication_slots` and refuses BEFORE `START_REPLICATION` is ever sent,
+    /// saving the round trip. Either way, retrying is not a matter of transport
+    /// luck: the same slot will get the same refusal an hour from now too. Unlike
+    /// `SlotAhead`, we don't even know the position discrepancy here — path (1)
+    /// never gets that far, and path (2) never asks.
+    #[error("replication slot {slot} is unusable: {reason}")]
     SlotUnusable { slot: String, reason: String },
 
     /// The slot responds with a "busy" race (`SQLSTATE 55006`,
