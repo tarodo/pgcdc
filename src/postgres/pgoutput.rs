@@ -447,7 +447,7 @@ mod tests {
     fn other_message_kinds_are_still_explicitly_unsupported() {
         // TRUNCATE, TYPE, ORIGIN and anything unknown must still produce an
         // explicit error, not a silent skip (spec §8).
-        for kind in [b'T', b'Y', b'O', b'M', b'S'] {
+        for kind in *b"TYOMS" {
             let payload = [kind, 0x00, 0x00, 0x00, 0x00];
             assert!(
                 matches!(decode(&payload), Err(PgcdcError::UnsupportedMessage { .. })),
