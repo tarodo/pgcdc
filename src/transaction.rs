@@ -250,16 +250,41 @@ impl Assembler {
                     changes,
                 }))
             }
-            // The decoder now understands 'T' (pgoutput.rs), but turning it into
-            // ChangeEvent(s) at the transaction level is separate follow-up work:
-            // deciding what a truncate looks like as a row-level event is not yet
-            // settled. Failing loudly here is not a regression — before this match
-            // arm existed, a TRUNCATE never reached this far at all: the decoder
-            // itself rejected 'T' as PgcdcError::UnsupportedMessage.
-            PgOutputMessage::Truncate { relation_ids } => Err(PgcdcError::Decode(format!(
-                "TRUNCATE decoded (relations {relation_ids:?}) but transaction-level handling \
-                 is not implemented yet"
-            ))),
+            // One TRUNCATE message can name several tables; it becomes one
+            // event per relation so every event still carries exactly one
+            // schema and one table, as every consumer of this output assumes.
+            // Neither tuple has row identity here — a truncate says "this
+            // table is now empty", not "these rows are gone" — so before and
+            // after both stay None, same as the row arms leave them None
+            // where the tag they saw doesn't supply one.
+            PgOutputMessage::Truncate { relation_ids } => {
+                let open = self.open.as_mut().ok_or_else(|| {
+                    PgcdcError::Decode("row message outside a transaction".into())
+                })?;
+                for relation_id in relation_ids {
+                    if open.changes.len() >= self.max_events {
+                        return Err(PgcdcError::TransactionTooLarge {
+                            limit: self.max_events,
+                        });
+                    }
+                    // Same lookup as the row arms, so an id the RELATION
+                    // message never announced is the same fatal UnknownRelation.
+                    let rel = cache
+                        .get(relation_id)
+                        .ok_or(PgcdcError::UnknownRelation { relation_id })?;
+                    open.changes.push(PendingChange {
+                        schema: rel.namespace.clone(),
+                        table: rel.name.clone(),
+                        operation: Operation::Truncate,
+                        before: None,
+                        before_kind: None,
+                        after: None,
+                        unchanged_columns: Vec::new(),
+                        lsn: wal_start,
+                    });
+                }
+                Ok(None)
+            }
         }
     }
 }
@@ -1144,6 +1169,49 @@ mod tests {
         a.handle(update_msg(), Lsn(0x200), &mut cache).unwrap();
         let err = a.handle(update_msg(), Lsn(0x210), &mut cache).unwrap_err();
         assert!(matches!(err, PgcdcError::TransactionTooLarge { limit: 1 }));
+    }
+
+    #[test]
+    fn a_truncate_becomes_one_event_per_relation() {
+        // A single TRUNCATE can name several tables. One event each keeps every
+        // event carrying exactly one schema and table, which every consumer of
+        // this output already assumes.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(100);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(users_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        a.handle(
+            PgOutputMessage::Relation(items_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        a.handle(
+            PgOutputMessage::Truncate {
+                relation_ids: vec![16385, 16392],
+            },
+            Lsn(0x200),
+            &mut cache,
+        )
+        .unwrap();
+        let tx = a
+            .handle(commit(), Lsn(0x1000), &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tx.changes.len(), 2, "one event per relation named");
+        for ev in &tx.changes {
+            assert_eq!(ev.operation, Operation::Truncate);
+            assert!(ev.before.is_none(), "a truncate has no row identity");
+            assert!(ev.before_kind.is_none());
+            assert!(ev.after.is_none());
+        }
+        let tables: Vec<&str> = tx.changes.iter().map(|ev| ev.table.as_str()).collect();
+        assert_eq!(tables, vec!["users", "items"]);
     }
 
     #[test]

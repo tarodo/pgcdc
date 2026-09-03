@@ -13,6 +13,10 @@ pub enum Operation {
     Insert,
     Update,
     Delete,
+    /// The table was emptied. `before` and `after` are both null: a truncate
+    /// has no row identity, so a consumer must drop everything it holds for
+    /// this table rather than match rows against it.
+    Truncate,
 }
 
 /// What exactly the server sent in the old tuple. The consumer must distinguish
