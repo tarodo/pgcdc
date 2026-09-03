@@ -6,7 +6,7 @@ A minimal Change Data Capture engine for PostgreSQL, in Rust. It reads logical r
 events over the `pgoutput` protocol and emits normalized JSON Lines.
 
 ```json
-{"schema":"public","table":"users","operation":"insert","after":{"id":"1","name":"Alice"},"transaction_id":748,"lsn":"0/19742B8","commit_lsn":"0/19743B0","commit_timestamp":"2026-08-31T09:12:26.946113Z"}
+{"schema":"public","table":"users","operation":"insert","after":{"id":"1","name":"Alice"},"transaction_id":737,"lsn":"0/192FF88","commit_lsn":"0/1930098","commit_timestamp":"2026-09-03T10:48:43.022891Z"}
 ```
 
 While testing a small Kafka-less CDC consumer, I observed a failure mode that silently
@@ -44,6 +44,19 @@ and other DDL), fetching TOAST values the server did not send, multi-database or
 | PostgreSQL | 14+, started with `wal_level=logical` and at least one free `max_replication_slots` / `max_wal_senders`. Tested against 16 |
 | Rust | 1.95+ (stable) |
 | Role | `REPLICATION` privilege, plus `SELECT` on the published tables |
+
+---
+
+## Installation
+
+Requires Rust 1.95+ (stable) — see Requirements above.
+
+```bash
+cargo build --release
+```
+
+The binary lands at `target/release/pgcdc`. To build the Docker image instead, see the
+`demo` profile under Quick start below.
 
 ---
 
@@ -112,9 +125,9 @@ docker compose --profile demo down -v
 <summary>Actual output from a real run</summary>
 
 ```json
-{"schema":"public","table":"users","operation":"insert","before":null,"before_kind":null,"after":{"id":"1","name":"Alice","email":"alice@example.com","bio":null},"unchanged_columns":[],"transaction_id":748,"lsn":"0/1973EE8","commit_lsn":"0/1973FE0","commit_timestamp":"2026-08-31T09:12:26.946113Z"}
-{"schema":"public","table":"users","operation":"update","before":{"id":"1","name":"Alice","email":"alice@example.com","bio":null},"before_kind":"full","after":{"id":"1","name":"Bob","email":"alice@example.com","bio":null},"unchanged_columns":[],"transaction_id":749,"lsn":"0/1974028","commit_lsn":"0/19740B0","commit_timestamp":"2026-08-31T09:12:26.973402Z"}
-{"schema":"public","table":"users","operation":"delete","before":{"id":"1","name":"Bob","email":"alice@example.com","bio":null},"before_kind":"full","after":null,"unchanged_columns":[],"transaction_id":750,"lsn":"0/19740E0","commit_lsn":"0/1974140","commit_timestamp":"2026-08-31T09:12:26.997366Z"}
+{"schema":"public","table":"users","operation":"insert","before":null,"before_kind":null,"after":{"id":"1","name":"Alice","email":"alice@example.com","bio":null},"unchanged_columns":[],"transaction_id":737,"event_index":0,"lsn":"0/192FF88","commit_lsn":"0/1930098","commit_timestamp":"2026-09-03T10:48:43.022891Z"}
+{"schema":"public","table":"users","operation":"update","before":{"id":"1","name":"Alice","email":"alice@example.com","bio":null},"before_kind":"full","after":{"id":"1","name":"Bob","email":"alice@example.com","bio":null},"unchanged_columns":[],"transaction_id":738,"event_index":0,"lsn":"0/19300C8","commit_lsn":"0/1930150","commit_timestamp":"2026-09-03T10:48:43.025395Z"}
+{"schema":"public","table":"users","operation":"delete","before":{"id":"1","name":"Bob","email":"alice@example.com","bio":null},"before_kind":"full","after":null,"unchanged_columns":[],"transaction_id":739,"event_index":0,"lsn":"0/1930180","commit_lsn":"0/19301E0","commit_timestamp":"2026-09-03T10:48:43.026547Z"}
 ```
 
 </details>
@@ -350,105 +363,11 @@ has leaked ahead would release `synchronous_commit` waiters early.
 
 ## Observability
 
-Eight counters, all `AtomicU64` (`src/metrics.rs`):
-
-| Counter | Meaning |
-|---|---|
-| `events_total` | row changes handed to the sink |
-| `transactions_total` | transactions committed and handed to the sink |
-| `bytes_received_total` | raw `XLogData` bytes received |
-| `reconnects_total` | reconnect-loop passes after a drop |
-| `errors_total` | recoverable connection errors caught |
-| `last_received_lsn` | last received WAL position (monotonic) |
-| `last_acknowledged_lsn` | last position acknowledged to Postgres — our own decision, not the slot's state |
-| `transaction_buffer_size` | changes buffered in an open transaction — a gauge; must fall to zero on commit and on reconnect |
-
-Two more fields ride in the same `metrics_report` line. They are not counters — they are
-observations of state, which is why they get a description here instead of a ninth and tenth
-row above:
-
-- `streaming` — whether a replication session is running right now. It is written `true`
-  once a session actually starts, and `false` on every one of the ways a session or the
-  process itself can stop again — a disconnect, a recoverable error, a clean shutdown, and
-  a fatal error alike — because a gauge only success updates reports health nobody has
-  actually observed. The line carrying `streaming=false` is not limited to the moment a
-  session just ended, either: it also comes out periodically while the process sits with
-  no connection at all, retrying against a server that is not answering — see "That first
-  pair misses a disconnected process" below.
-- `ack_age_s` — seconds since this process last acknowledged a position to Postgres, or
-  `None` if it never has. `None` and `Some(0)` are kept deliberately distinct: a process that
-  just started and one that has been stuck for an hour without ever acknowledging anything
-  must not read the same.
-
-A `metrics_report` line carrying all eight counters plus these two goes out at **INFO** every
-ten seconds. The interval is not configurable: it is volume, not behavior.
-
-```text
-INFO metrics_report events=3 transactions=3 bytes=395 reconnects=0 errors=0 last_received_lsn=0/1974170 last_acknowledged_lsn=0/19741A8 buffer=0 streaming=true ack_age_s=Some(2)
-```
-
-Once per replication session — on a cold start and on every reconnect — the pre-flight
-check logs what it read about the slot, at **INFO**, before `START_REPLICATION` is ever
-attempted:
-
-```text
-INFO slot_preflight_ok slot=pgcdc_slot restart_lsn=Some("0/19B4970") confirmed_flush_lsn=Some("0/19B49A8") wal_status=Some("reserved") safe_wal_size=None catalog_xmin=Some(741) active=false
-```
-
-Six fields, each answering a different question — positions, a status, a byte volume, and a
-flag, not six of a kind. They are **not** summed into a single "lag" number, on purpose:
-
-- `restart_lsn` — the oldest WAL the server must keep for this slot: the disk risk.
-- `catalog_xmin` — the transaction horizon the slot pins: the vacuum and wraparound risk.
-- `confirmed_flush_lsn` — the position we have acknowledged.
-- `safe_wal_size` — how much more WAL can be written before this slot is at risk. **`None`
-  means unlimited retention** under the default `max_slot_wal_keep_size = -1`, not an error
-  — expect it on a healthy, unconstrained slot.
-- `wal_status` — `reserved` / `extended` / `unreserved` / `lost`; only `lost` is fatal
-  (`error_kind=slot_unusable`, see Exit codes above). `unreserved` is not: PostgreSQL
-  documents that it can climb back to `reserved` or `extended` on its own.
-- `active` — whether a consumer is currently streaming from this slot right now. Logged
-  but not judged here: the guard fires on every reconnect too, where `active = true` is
-  routine (our own prior session may not have released the slot yet), and telling that
-  apart from a foreign consumer holding it forever is not this field's job — it belongs to
-  the busy-slot patience budget (Q27/Q29 in [DECISIONS.md](DECISIONS.md)), which tells the
-  two apart by duration, not by a single flag.
-
-Why not one number: a single acknowledgement was measured moving `confirmed_flush_lsn` by
-15 MB, `restart_lsn` by only 141 KB, and releasing 14 transaction ids — three different
-magnitudes answering three different questions. A "lag" figure would collapse all three into
-one and hide which risk actually moved. `safe_wal_size` is logged even though nothing here
-acts on it, because it is the one field that can move *before* the slot dies: a transition
-from `wal_status=reserved` straight to `lost` has been observed with neither `extended` nor
-`unreserved` appearing in between, `safe_wal_size` falling as the only advance warning.
-
-Per-event lines (`transaction_accepted`, `group_acknowledged`, `advanced_from_keepalive`)
-are at **DEBUG** — an exploratory run reached six figures of events per second (see
-"Throughput" below), and a line each would make the log both a bottleneck and noise. Turn
-them on with `RUST_LOG=pgcdc=debug`.
-
-**Row contents never appear in the logs.** Counters, positions and transaction ids only.
-This holds for every log line at every level.
-
-Worth alerting on: `last_received_lsn` advancing while `last_acknowledged_lsn` stands still;
-`transaction_buffer_size` that never returns to zero; a steadily climbing `reconnects_total`.
-
-**That first pair misses a disconnected process.** While the connection is down neither
-position moves at all, so a process that lost its connection an hour ago keeps printing the
-exact same positions it printed while healthy — the pair looks identical to a healthy, idle
-one. The signal for that case is different: `streaming=false` together with a climbing
-`ack_age_s`.
-
-A `metrics_report` line comes out even while the process cannot reach the server at all, not
-only from inside a running session: the countdown to the next report is also checked once
-per poll interval during the paused wait between reconnect attempts, specifically so a line
-with `streaming=false` keeps coming out on schedule through an outage, not only right at the
-moment a session ends. Measured against a dead port: the process kept printing `reconnecting`
-warnings — how many depends on the backoff settings and the machine, tens of them over tens
-of seconds is typical — while also printing a `metrics_report` line with `streaming=false`
-roughly every ten seconds throughout. Alert on `reconnecting` itself too, not only on what a
-`metrics_report` line says: it is the one signal that starts immediately, rather than after
-the first ten-second interval elapses.
+Eight counters (`events_total`, `transactions_total`, `bytes_received_total`,
+`reconnects_total`, `errors_total`, `last_received_lsn`, `last_acknowledged_lsn`,
+`transaction_buffer_size`), plus two state observations (`streaming`, `ack_age_s`), all in
+one `metrics_report` line at **INFO** every ten seconds. Field meanings, the
+`slot_preflight_ok` pre-flight line, and alerting advice: [docs/operability.md](docs/operability.md).
 
 ---
 
@@ -485,6 +404,7 @@ median and a spread — not one more run of the above.
 |---|---|
 | [docs/spec.md](docs/spec.md) | the binding specification the code was built against, and where it came from |
 | [docs/how-it-works.md](docs/how-it-works.md) | how the code is laid out — written for someone reading Rust for the first time |
+| [docs/operability.md](docs/operability.md) | metrics, log fields, and alerting advice for someone running pgcdc |
 | [DECISIONS.md](DECISIONS.md) | every accepted decision and the alternatives rejected, with reasons |
 | [docs/pgoutput-notes.md](docs/pgoutput-notes.md) | byte-level breakdown of the protocol |
 | [docs/spike-findings.md](docs/spike-findings.md) | what we found in the transport crate, and what must not be used |
