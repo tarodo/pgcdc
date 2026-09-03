@@ -25,3 +25,8 @@ testcontainers = "0.28.0"
 # timeout must be killable via async Child/kill_on_drop) — the production
 # binary doesn't use it, so the feature isn't added to [dependencies].
 tokio = { version = "1", features = ["process"] }
+# Both already sit in the dependency tree via tokio-postgres; declared here
+# only so the COPY test can drive tokio_postgres::CopyInSink directly
+# (bytes::Bytes as its item type, futures_util::SinkExt for `.send()`).
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }

@@ -532,10 +532,19 @@ async fn changes_in_one_transaction_share_commit_lsn_but_each_lsn_is_distinct_an
     // transaction carries the same value — it cannot tell two changes in
     // that transaction apart, and README's "## Output" section says so.
     // lsn is the WAL address of the change's OWN record, assigned by the
-    // server rather than counted by us, so it must differ for every change
-    // and grow in the order the changes were decoded. Without a test, that
-    // claim is only a comment: this pins it against a real transaction that
-    // touches two tables with three different kinds of change.
+    // server rather than counted by us — but "own record" is the load-bearing
+    // part: this only holds while every change gets its own WAL record, which
+    // is true of a standalone INSERT/UPDATE/DELETE statement (what this
+    // transaction uses below) but NOT of a bulk COPY load or a multi-relation
+    // TRUNCATE, where several changes share one record and therefore one lsn.
+    // That is exactly why event_index exists — see
+    // a_bulk_copy_load_shares_one_lsn_and_is_told_apart_by_event_index and
+    // two_truncates_sharing_an_lsn_are_told_apart_by_event_index below, and
+    // Q35 in DECISIONS.md. Within this statement-per-row transaction's shape,
+    // lsn must differ for every change and grow in the order the changes were
+    // decoded. Without a test, that claim is only a comment: this pins it
+    // against a real transaction that touches two tables with three different
+    // kinds of change.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -608,6 +617,111 @@ async fn changes_in_one_transaction_share_commit_lsn_but_each_lsn_is_distinct_an
             "lsn must increase strictly in emission order, got {lsns:?}"
         );
     }
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bulk_copy_load_shares_one_lsn_and_is_told_apart_by_event_index() {
+    // The counterexample to the test right above this one, and the reason
+    // Q31 (DECISIONS.md) was corrected rather than merely refined: Q31
+    // reasoned that lsn is "assigned by the server rather than counted by
+    // us, therefore unique within a transaction" — true only while every
+    // change gets its own WAL record. A bulk load via `COPY ... FROM STDIN`
+    // does not: PostgreSQL writes the whole batch as one `heap_multi_insert`
+    // WAL record, and pgoutput stamps every INSERT message that record
+    // produces with that one record's wal_start. No TRUNCATE anywhere in
+    // this test — this collision predates TRUNCATE support entirely and
+    // was already there for a plain bulk load. Reproduced live before this
+    // test was written, five rows via one COPY:
+    //   insert id=1  lsn=0/192FF88  event_index=0
+    //   insert id=2  lsn=0/192FF88  event_index=1
+    //   insert id=3  lsn=0/192FF88  event_index=2
+    //   insert id=4  lsn=0/192FF88  event_index=3
+    //   insert id=5  lsn=0/192FF88  event_index=4
+    //   unique lsn: 1, unique (lsn, event_index): 5
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let cfg = config(&conn);
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
+    });
+
+    // One statement, one implicit transaction, five rows — COPY commits as
+    // its own transaction with no explicit BEGIN/COMMIT needed.
+    {
+        use bytes::Bytes;
+        use futures_util::SinkExt;
+
+        let mut sink = Box::pin(
+            client
+                .copy_in("COPY public.users (id, name, email, bio) FROM STDIN")
+                .await
+                .expect("start COPY"),
+        );
+        let payload =
+            "1\tAlice\t\\N\t\\N\n2\tBob\t\\N\t\\N\n3\tCarol\t\\N\t\\N\n4\tDan\t\\N\t\\N\n5\tEve\t\\N\t\\N\n";
+        sink.send(Bytes::from(payload))
+            .await
+            .expect("send COPY data");
+        sink.as_mut().finish().await.expect("finish COPY");
+    }
+
+    let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("the transaction should arrive within 20 seconds")
+        .expect("channel closed");
+
+    assert_eq!(
+        tx.changes.len(),
+        5,
+        "all five COPY-loaded rows must land in one transaction"
+    );
+    assert!(
+        tx.changes
+            .iter()
+            .all(|ev| ev.operation == Operation::Insert),
+        "COPY loads rows, not truncates: {:?}",
+        tx.changes
+    );
+
+    // The whole point: one WAL record, one lsn, for every row — sorting and
+    // deduplicating a copy must collapse it to exactly one value.
+    let lsns: Vec<Lsn> = tx.changes.iter().map(|ev| ev.lsn).collect();
+    let mut unique_lsns = lsns.clone();
+    unique_lsns.sort();
+    unique_lsns.dedup();
+    assert_eq!(
+        unique_lsns.len(),
+        1,
+        "a bulk COPY load writes one heap_multi_insert WAL record, so every \
+         row must share one lsn, got {lsns:?}"
+    );
+
+    // event_index is what actually tells the five rows apart, and
+    // (lsn, event_index) must still be unique even though lsn alone is not.
+    let mut pairs: Vec<(Lsn, u32)> = tx
+        .changes
+        .iter()
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+    let total = pairs.len();
+    pairs.sort();
+    pairs.dedup();
+    assert_eq!(
+        pairs.len(),
+        total,
+        "(lsn, event_index) must be unique across every COPY-loaded row"
+    );
 
     handle.abort();
 }
