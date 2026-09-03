@@ -259,7 +259,7 @@ impl Assembler {
             // where the tag they saw doesn't supply one.
             PgOutputMessage::Truncate { relation_ids } => {
                 let open = self.open.as_mut().ok_or_else(|| {
-                    PgcdcError::Decode("row message outside a transaction".into())
+                    PgcdcError::Decode("TRUNCATE message outside a transaction".into())
                 })?;
                 for relation_id in relation_ids {
                     if open.changes.len() >= self.max_events {
@@ -599,6 +599,33 @@ mod tests {
         assert!(
             matches!(&err, PgcdcError::Decode(msg) if msg.contains("outside a transaction")),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn truncate_outside_a_transaction_does_not_call_itself_a_row_message() {
+        // TRUNCATE copied its guard from the row arms (Insert/Update/Delete), which
+        // correctly call themselves "row message" — but a TRUNCATE is not a row
+        // message, and the diagnostic must not claim it is. It still needs to say
+        // "outside a transaction" so the failure mode reads the same as the row arms'.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1000);
+        let err = a
+            .handle(
+                PgOutputMessage::Truncate {
+                    relation_ids: vec![16385],
+                },
+                Lsn(0x200),
+                &mut cache,
+            )
+            .unwrap_err();
+        let PgcdcError::Decode(msg) = &err else {
+            panic!("got {err:?}")
+        };
+        assert!(msg.contains("outside a transaction"), "got {msg:?}");
+        assert!(
+            !msg.contains("row message"),
+            "TRUNCATE is not a row message, got {msg:?}"
         );
     }
 
