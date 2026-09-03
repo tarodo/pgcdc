@@ -728,6 +728,15 @@ pub async fn run(
             if shutdown.load(Ordering::Relaxed) {
                 return Ok(());
             }
+            // The other of `maybe_report`'s two call sites (the first is inside
+            // `stream_once`'s loop): while the outer loop is stuck here — no
+            // connection, no session, nothing for the in-session call site to run
+            // inside of — this is the only place left that can print a report at
+            // all, and it is exactly the place where `streaming=false` needs to be
+            // observable. Checked every chunk, same as the shutdown flag above, so
+            // the report comes out within one poll interval of the ten-second mark
+            // rather than only once per whole (possibly much longer) backoff pause.
+            maybe_report(&metrics, &mut last_report);
             let chunk = remaining.min(SHUTDOWN_POLL_INTERVAL);
             tokio::time::sleep(chunk).await;
             remaining = remaining.saturating_sub(chunk);
@@ -755,6 +764,40 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// but volume, and ten seconds is the compromise between "you can see the process is
 /// alive" and "the log does not get flooded" (DECISIONS Q23).
 const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Prints the `metrics_report` line once `METRICS_REPORT_INTERVAL` has elapsed since the
+/// last one — from wherever it is called. Pulled out of `stream_once`'s loop (its
+/// original and, until this fix, only call site) so that `run()`'s outer loop can call it
+/// too, from inside the sliced backoff pause: without a second call site, `streaming` in
+/// this line could never be observed as `false` by a live reader, because the only place
+/// that ever printed it was a loop that runs entirely between `set_streaming(true)` and
+/// the return that leads into `set_streaming(false)` — a reviewer measured this directly,
+/// stopping Postgres for 32 seconds and getting three summaries in that window, all three
+/// `streaming=true`, and zero summaries during the outage itself. `last_report` is one
+/// `Instant` the two call sites share (`run()` owns it and lends it to `stream_once` by
+/// mutable reference for the length of one session) — sharing it, rather than each site
+/// keeping its own countdown, is what keeps this from double-printing at the boundary
+/// between a session ending and the backoff pause starting.
+fn maybe_report(metrics: &Metrics, last_report: &mut tokio::time::Instant) {
+    if last_report.elapsed() < METRICS_REPORT_INTERVAL {
+        return;
+    }
+    *last_report = tokio::time::Instant::now();
+    let s = metrics.snapshot();
+    info!(
+        events = s.events_total,
+        transactions = s.transactions_total,
+        bytes = s.bytes_received_total,
+        reconnects = s.reconnects_total,
+        errors = s.errors_total,
+        last_received_lsn = %Lsn(s.last_received_lsn),
+        last_acknowledged_lsn = %Lsn(s.last_acknowledged_lsn),
+        buffer = s.transaction_buffer_size,
+        streaming = s.streaming,
+        ack_age_s = ?s.seconds_since_last_ack,
+        "metrics_report"
+    );
+}
 
 /// One replication session: pre-flight check, connect, loop. Returns on a connection
 /// drop or on an orderly shutdown.
@@ -913,24 +956,11 @@ async fn stream_once(
         // The metrics report at INFO once per METRICS_REPORT_INTERVAL — not on every
         // event (that is at DEBUG, below). It sits at the start of a loop turn, outside
         // the order write→processed→(timer)barrier→durable→ack→feedback, because it only
-        // reads a snapshot and affects nothing (§16, DECISIONS Q23).
-        if last_report.elapsed() >= METRICS_REPORT_INTERVAL {
-            *last_report = tokio::time::Instant::now();
-            let s = metrics.snapshot();
-            info!(
-                events = s.events_total,
-                transactions = s.transactions_total,
-                bytes = s.bytes_received_total,
-                reconnects = s.reconnects_total,
-                errors = s.errors_total,
-                last_received_lsn = %Lsn(s.last_received_lsn),
-                last_acknowledged_lsn = %Lsn(s.last_acknowledged_lsn),
-                buffer = s.transaction_buffer_size,
-                streaming = s.streaming,
-                ack_age_s = ?s.seconds_since_last_ack,
-                "metrics_report"
-            );
-        }
+        // reads a snapshot and affects nothing (§16, DECISIONS Q23). This is one of TWO
+        // call sites for `maybe_report` — the other is the backoff pause in `run()`, for
+        // exactly the case this loop cannot cover: no session, no loop turn to sit at the
+        // start of.
+        maybe_report(metrics, last_report);
 
         // A bounded read is safe here because production runs on the multi-threaded
         // runtime: the transport picks the Inline driver by the runtime flavor, and its

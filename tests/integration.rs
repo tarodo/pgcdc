@@ -3170,32 +3170,110 @@ async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_streaming_flag_goes_false_when_the_session_is_lost() {
-    // The plan for this test was originally "point at a dead port, like
-    // `sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port`, and read
-    // `streaming=false` off a `metrics_report` line emitted from inside the
-    // reconnect loop." That does not work, and not because of a timing
-    // budget: the `metrics_report` check lives inside `stream_once`'s OWN
-    // per-session loop, reached only once `START_REPLICATION` has already
-    // succeeded (`replication.rs`, right after the `replication_started`
-    // log). A genuinely dead port never gets there at all. This was
-    // confirmed empirically, not assumed: pointed at `127.0.0.1:1` with the
-    // same short backoff bounds as that sigterm test, the process printed
-    // 51 "reconnecting" lines across 15 real seconds and not one
-    // "metrics_report" line. There is no code path in which that specific
-    // log line can carry `streaming=false` — the line itself cannot appear
-    // while disconnected, no matter how long you wait.
+async fn metrics_report_shows_streaming_false_against_a_dead_port() {
+    // C1: before this fix, `maybe_report` (then not even its own function —
+    // just an inline block) had exactly ONE call site, inside `stream_once`'s
+    // own per-session loop, reached only once `START_REPLICATION` had already
+    // succeeded and `set_streaming(true)` had already run. A genuinely dead
+    // port never gets there at all, and the one call site that DID run —
+    // `handle_session_outcome`, on the way back OUT of a session — never
+    // prints anything. So every `metrics_report` line the process could ever
+    // produce was, by construction, printed while `streaming` was `true`:
+    // confirmed empirically before this fix, pointed at `127.0.0.1:1` with
+    // short backoff bounds, the process printed dozens of "reconnecting"
+    // lines over tens of seconds and not one "metrics_report" line — and a
+    // reviewer's own live run against a stopped Postgres got three summaries
+    // across 65 seconds, all three `streaming=true`, zero summaries during
+    // the 32-second outage itself.
     //
-    // So this test pins the actual defect (the gauge, not one specific
-    // line that happens to read it) directly through the same `Arc<Metrics>`
-    // `run()` takes — the same handle any other consumer (a future
-    // `/metrics` route, a health check) would read. It drives a REAL
-    // disconnect (not a dead port) precisely so the flag has genuinely been
-    // `true` beforehand: against a target that can never stream at all, the
-    // flag would stay `false` from its default for a reason unrelated to
-    // `set_streaming(false)`, and deleting that call would go unnoticed —
-    // exactly the "false only because nothing ever set it true" trap the
-    // task brief warns about.
+    // The fix gives `maybe_report` a second call site inside the sliced
+    // backoff pause in `run()`'s outer loop — see its doc comment — which is
+    // exactly what this test is pinning: port 1 never listens on any
+    // ordinary machine, so preflight fails immediately and predictably, no
+    // Postgres container is needed, and the process spends the entire test
+    // sitting in that backoff pause with no session at all.
+    let mut child = common::KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+            .args([
+                "--database-url",
+                "postgres://u:p@127.0.0.1:1/db",
+                "--publication",
+                "pgcdc_pub",
+                "--slot",
+                "pgcdc_slot",
+                "--reconnect-initial-ms",
+                "50",
+                "--reconnect-max-ms",
+                "3000",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the binary"),
+    );
+
+    let stderr = child.stderr.take().expect("stderr was requested as piped");
+    let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lines_writer = lines.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            lines_writer.lock().unwrap().push(line);
+        }
+    });
+
+    // METRICS_REPORT_INTERVAL is a fixed ten seconds, not configurable — this
+    // test is slow by construction, and there is no cheap proxy (unlike a
+    // backoff-delay field) to poll faster on. The budget is a generous 30s,
+    // not a tight one: it exists to fail loudly if the report never comes at
+    // all, not to pin the exact latency.
+    let start = std::time::Instant::now();
+    let mut found = None;
+    for _ in 0..600 {
+        if let Some(line) = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|l| l.contains("metrics_report") && l.contains("streaming=false"))
+        {
+            found = Some(line.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let elapsed = start.elapsed();
+    eprintln!(
+        "metrics_report_shows_streaming_false_against_a_dead_port: first \
+         streaming=false metrics_report seen after {elapsed:?}: {found:?}"
+    );
+    assert!(
+        found.is_some(),
+        "no metrics_report line with streaming=false within 30 seconds, saw: {:?}",
+        lines.lock().unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_streaming_flag_goes_false_when_the_session_is_lost() {
+    // This test predates C1 and was written when reading `streaming=false`
+    // off an actual `metrics_report` line against a dead port was provably
+    // impossible (see the superseded comment this replaced, still visible in
+    // history, and `metrics_report_shows_streaming_false_against_a_dead_port`
+    // above, which now covers exactly that scenario). It is kept anyway: it
+    // pins the gauge itself through the same `Arc<Metrics>` `run()` takes —
+    // the same handle any other consumer (a future `/metrics` route, a
+    // health check) would read — rather than through one specific log line,
+    // and it does so in well under a second instead of waiting out the fixed
+    // ten-second report interval.
+    //
+    // It drives a REAL disconnect (not a dead port) precisely so the flag has
+    // genuinely been `true` beforehand: against a target that can never
+    // stream at all, the flag would stay `false` from its default for a
+    // reason unrelated to `set_streaming(false)`, and deleting that call
+    // would go unnoticed — exactly the "false only because nothing ever set
+    // it true" trap the task brief warns about.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
