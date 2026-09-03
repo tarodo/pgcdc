@@ -83,10 +83,13 @@ pub enum PgcdcError {
 
     /// `--output-path` is only meaningful paired with `--output file`, so clap
     /// cannot mark it plain `required`; the pairing is checked by hand in
-    /// `main.rs`, before a sink is built and before `run()` — same timing as
-    /// `InvalidDatabaseUrl` and `InvalidReconnectBounds` above, so it gets the
-    /// same treatment: a real `error_kind`, not a bare log line (README's exit
-    /// code table).
+    /// `main.rs`, before a sink is even built. `InvalidDatabaseUrl` and
+    /// `InvalidReconnectBounds` are checked later than this — inside `run()`
+    /// (`src/postgres/replication.rs`), after the sink already exists, but
+    /// still before any connection is attempted. Different moment, same
+    /// category: all three are config-time failures with no network
+    /// involved, so this gets the same treatment as those two — a real
+    /// `error_kind`, not a bare log line (README's exit code table).
     #[error("--output file requires --output-path")]
     OutputPathRequired,
 }
