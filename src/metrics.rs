@@ -135,7 +135,7 @@ impl Metrics {
             streaming: self.streaming.load(Ordering::Relaxed),
             seconds_since_last_ack: match self.last_ack_at_ms.load(Ordering::Relaxed) {
                 0 => None,
-                at => Some(self.start.elapsed().as_secs().saturating_sub(at / 1000)),
+                at => Some((self.start.elapsed().as_millis() as u64).saturating_sub(at) / 1000),
             },
         }
     }
@@ -212,6 +212,24 @@ mod tests {
             m.snapshot().seconds_since_last_ack,
             Some(0),
             "an acknowledgement that just happened is zero seconds old, not None"
+        );
+    }
+
+    #[test]
+    fn a_sub_second_gap_does_not_round_up_to_a_whole_second() {
+        // Regression: subtracting `now / 1000` from `ack / 1000` (both floored to
+        // whole seconds first) instead of dividing the millisecond gap directly
+        // rounds a 100ms-old acknowledgement up to a full second whenever `ack`
+        // and `now` straddle a second boundary. Parking the acknowledgement just
+        // before the 1s mark and reading it back just after forces that straddle.
+        let m = Metrics::new();
+        std::thread::sleep(std::time::Duration::from_millis(950));
+        m.note_acknowledged_now();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            m.snapshot().seconds_since_last_ack,
+            Some(0),
+            "a 100ms-old acknowledgement must not report as a whole second stale"
         );
     }
 }
