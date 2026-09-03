@@ -250,6 +250,16 @@ impl Assembler {
                     changes,
                 }))
             }
+            // The decoder now understands 'T' (pgoutput.rs), but turning it into
+            // ChangeEvent(s) at the transaction level is separate follow-up work:
+            // deciding what a truncate looks like as a row-level event is not yet
+            // settled. Failing loudly here is not a regression — before this match
+            // arm existed, a TRUNCATE never reached this far at all: the decoder
+            // itself rejected 'T' as PgcdcError::UnsupportedMessage.
+            PgOutputMessage::Truncate { relation_ids } => Err(PgcdcError::Decode(format!(
+                "TRUNCATE decoded (relations {relation_ids:?}) but transaction-level handling \
+                 is not implemented yet"
+            ))),
         }
     }
 }

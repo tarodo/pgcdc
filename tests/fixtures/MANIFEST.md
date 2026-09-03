@@ -150,6 +150,89 @@ confirms the expectation from the brief rather than testing our own code — the
 of a fixture is itself the required result for stage 2 (the test "rollback → decoder sees 0
 events" is written without byte data, simply as an assertion of absence).
 
+## `0032_truncate.bin` — TRUNCATE (separate capture, 2026-09-03)
+
+Captured for Task 1 of the `truncate-support` plan, **not** part of the 2026-08-30
+`spike`/`gen-fixtures.sql` session above: `pubtruncate` on `pgcdc_pub` is `true` by
+default, so a `TRUNCATE` on a published table reaches pgoutput as message kind `'T'`,
+which stage 0/2 never captured (see "Not analysed" item 5 in `docs/pgoutput-notes.md`)
+and which the decoder rejected as unsupported.
+
+Capture method: `docker compose up -d --wait` (fresh `app` database, same
+`docker/init.sql` schema: `public.users` REPLICA IDENTITY FULL, `public.items`
+REPLICA IDENTITY DEFAULT, publication `pgcdc_pub` FOR TABLE both). A throwaway
+logical slot `probe` (plugin `pgoutput`) was created with
+`pg_create_logical_replication_slot('probe', 'pgoutput')`. `pg_recvlogical --no-loop -f -`
+was deliberately **not** used — it blocks waiting for more input even with
+`--no-loop` once it has drained the available data, which would hang the capture.
+Instead, non-blocking peeks were taken with:
+
+```sql
+SELECT lsn, xid, encode(data, 'hex')
+FROM pg_logical_slot_peek_binary_changes(
+  'probe', NULL, NULL, 'proto_version', '1', 'publication_names', 'pgcdc_pub');
+```
+
+(`peek`, not `get`, so the slot position never advances and the same history can be
+re-read). SQL run against the `probe` slot, in order:
+
+```sql
+TRUNCATE public.users;                              -- xid 748, captured as 0032
+TRUNCATE public.items;                               -- xid 749
+TRUNCATE public.users, public.items;                  -- xid 750
+TRUNCATE public.users RESTART IDENTITY CASCADE;       -- xid 751
+```
+
+`0032_truncate.bin` (10 bytes) holds the `'T'` message from the **first** transaction,
+`TRUNCATE public.users;` with no options — chosen because the brief asks specifically for
+"the actual value of the flags byte for a plain TRUNCATE with no options". Bytes:
+
+```
+00000000: 5400 0000 0100 0000 4001                 T.......@.
+```
+
+| off | len | bytes | field | value |
+|----:|----:|-------|------|----------|
+| 0 | 1 | `54` | message type | `'T'` |
+| 1 | 4 | `00 00 00 01` | relation count (Int32) | `1` |
+| 5 | 1 | `00` | flags (Int8) | **`0x00` — no CASCADE, no RESTART IDENTITY** |
+| 6 | 4 | `00 00 40 01` | relation OID (Int32) | `16385` (`public.users`) |
+
+10 of 10 accounted for, no remainder. The layout matches the brief's expectation
+(`'T'`, `Int32` count, `Int8` flags, that many `Int32` OIDs) exactly — no divergence.
+OID `16385` is byte-for-byte the same OID `0002_relation.bin` carries for `users`; the
+RELATION payload in this same transaction (not saved as a fixture, only the TRUNCATE
+message was) was compared programmatically against `0002_relation.bin` and is
+**identical**, confirming the capture pipeline reproduces the same wire format as the
+original 2026-08-30 session.
+
+**Two facts established from the bytes, not from documentation:**
+
+1. **RELATION precedes TRUNCATE for every relation it names — every single time, not
+   just the first.** In `TRUNCATE public.users;` (xid 748, the very first activity on
+   `probe`) the sequence was BEGIN → RELATION(users) → TRUNCATE → COMMIT, unsurprising
+   for a brand-new slot. But `TRUNCATE public.users, public.items;` (xid 750) — run
+   *after* both relations had already been sent once each in xid 748/749 on this same
+   slot — still produced BEGIN → RELATION(users) → RELATION(items) → TRUNCATE → COMMIT:
+   both RELATION messages were resent immediately before the TRUNCATE that named them,
+   even though nothing about either relation had changed. `TRUNCATE public.users
+   RESTART IDENTITY CASCADE;` (xid 751) resent RELATION(users) a **third** time in the
+   session for the same reason. This is different from ordinary DML, where the relation
+   cache survives across transactions and RELATION is not resent for an unchanged table
+   (`docs/pgoutput-notes.md` §6) — TRUNCATE does not rely on that cache being warm.
+2. **The flags byte for a plain TRUNCATE is `0x00`.** Confirmed identically across xid
+   748 (`TRUNCATE public.users;`) and xid 749 (`TRUNCATE public.items;`). As a
+   non-fixture cross-check, `TRUNCATE public.users RESTART IDENTITY CASCADE;` (xid 751)
+   produced flags `0x03` instead — consistent with two option bits set rather than one,
+   though decoding what each individual bit means was out of scope for Task 1 (the
+   decoder reads and discards the whole byte).
+
+`TRUNCATE public.users, public.items;` (xid 750) additionally confirmed the multi-relation
+form: tag `'T'`, count `00 00 00 02`, flags `00`, then two OIDs `00 00 40 01` (`users`)
+and `00 00 40 08` (`items`), in the same order as named in the SQL — 14 bytes, no
+remainder. Not saved as a fixture; `0032_truncate.bin` alone is enough to pin the parse
+per the brief (Task 1, Step 4).
+
 ## Note: RELATION messages and `wal_start`/`wal_end` = `0/0` (cause unconfirmed)
 
 Both RELATION messages (`0002_relation.bin`, `0012_relation.bin`) arrived with `wal_start`
@@ -192,10 +275,13 @@ anything (e.g. for a progress checkpoint).
 | `insert` | 4 |
 | `update` | 4 |
 | `delete` | 3 |
-| **Total** | **31** |
+| `truncate` | 1 |
+| **Total** | **32** |
 
-All six required message types are present (BEGIN, COMMIT, RELATION, INSERT, UPDATE,
-DELETE). RELATION occurs exactly twice — once per table (`users`, `items`) in this run;
-that's an observation about this particular set, not a protocol rule — see
-`docs/pgoutput-notes.md` §6. No TRUNCATE/TYPE/ORIGIN messages occur in this SQL set — they
-were out of scope for the capture that produced these fixtures.
+All six message types from the original session are present (BEGIN, COMMIT, RELATION,
+INSERT, UPDATE, DELETE). RELATION occurs exactly twice in that session — once per table
+(`users`, `items`); that's an observation about this particular set, not a protocol rule —
+see `docs/pgoutput-notes.md` §6. TYPE/ORIGIN/MESSAGE ('Y'/'O'/'M') remain out of scope: no
+user-defined types, no cascading replication, no `pg_logical_emit_message` call was ever
+made against either slot. TRUNCATE ('T') was out of scope for the original session but is
+now covered by `0032_truncate.bin`, captured separately — see the section above.
