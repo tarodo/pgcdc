@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use pgcdc::config::{Config, DatabaseUrl, OutputKind};
 use pgcdc::error::PgcdcError;
+use pgcdc::event::Operation;
 use pgcdc::lsn::Lsn;
 use pgcdc::sink::{Durability, Sink};
 use pgcdc::transaction::Transaction;
@@ -2285,6 +2286,219 @@ async fn a_replayed_transactions_lsn_values_match_the_first_delivery() {
         second_lsns, first_lsns,
         "each change's lsn must be identical after a replay — it is the server's own \
          WAL address, not something recomputed on redecoding"
+    );
+
+    // Proof this was an actual reconnect and not the first session somehow
+    // redelivering the transaction by itself.
+    assert!(
+        metrics.snapshot().reconnects_total >= 1,
+        "reconnects_total must have advanced after the drop"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_truncates_sharing_an_lsn_are_told_apart_by_event_index() {
+    // event_index exists because lsn alone cannot tell apart two truncate
+    // events produced by ONE `TRUNCATE users, items;` statement: pgoutput
+    // sends a single 'T' record naming both relations, and `Assembler`
+    // (src/transaction.rs) turns it into one event per relation, all
+    // stamped with that one record's wal_start. Reproduced live before
+    // planning began, on a real server:
+    //   truncate  users  lsn=0/1937038
+    //   truncate  items  lsn=0/1937038    <- same lsn
+    // A consumer deduplicating by lsn alone would keep only one of the two
+    // truncates and leave the other table permanently out of sync.
+    //
+    // Three assertions below, each catching a different way this could
+    // stay broken:
+    // 1. the two truncate events really do share one lsn — this pins the
+    //    very reason the field exists, and this test would go
+    //    green-and-meaningless if PostgreSQL ever stopped doing that;
+    // 2. their event_index values differ — the actual disambiguator;
+    // 3. (lsn, event_index) is unique across every event of the run, not
+    //    just the two truncates.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::setup_items_table(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let cfg = config(&conn);
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
+    });
+
+    // One transaction: an insert into each demo table, then a single
+    // TRUNCATE naming both.
+    client
+        .batch_execute(
+            "BEGIN;
+             INSERT INTO users VALUES (1, 'Alice', NULL, NULL);
+             INSERT INTO items VALUES (10, 'Widget', 5);
+             TRUNCATE users, items;
+             COMMIT;",
+        )
+        .await
+        .unwrap();
+
+    let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("the transaction should arrive within 20 seconds")
+        .expect("channel closed");
+    assert_eq!(
+        tx.changes.len(),
+        4,
+        "two inserts and two truncate events, one per table"
+    );
+
+    let truncates: Vec<_> = tx
+        .changes
+        .iter()
+        .filter(|ev| ev.operation == Operation::Truncate)
+        .collect();
+    assert_eq!(
+        truncates.len(),
+        2,
+        "TRUNCATE users, items names two tables, got {truncates:?}"
+    );
+
+    // Assertion 1: the two truncate events share one lsn.
+    assert_eq!(
+        truncates[0].lsn, truncates[1].lsn,
+        "both truncate events must carry the one message's wal_start"
+    );
+
+    // Assertion 2: their event_index values differ.
+    assert_ne!(
+        truncates[0].event_index, truncates[1].event_index,
+        "event_index is what tells the two truncate events apart"
+    );
+
+    // Assertion 3: (lsn, event_index) is unique across every event of the run.
+    let mut pairs: Vec<(Lsn, u32)> = tx
+        .changes
+        .iter()
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+    let total = pairs.len();
+    pairs.sort();
+    pairs.dedup();
+    assert_eq!(
+        pairs.len(),
+        total,
+        "(lsn, event_index) must be unique across every event of the run"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn event_index_survives_a_replay_byte_for_byte() {
+    // Same construction as a_replayed_transactions_lsn_values_match_the_first_delivery
+    // above, but checking (lsn, event_index) rather than lsn alone. A key
+    // that is unique but changes on redelivery is worse than no key at
+    // all: a consumer would store the same event twice under two
+    // different identities. ack_interval_ms is set far beyond this test's
+    // lifetime so the periodic barrier cannot fire, and the keepalive path
+    // stays shut too — see the sibling test's comment for the full
+    // argument. The transaction below is therefore still unacknowledged
+    // when the connection drops, forcing a real replay of this exact
+    // transaction rather than a race against our own acknowledgement.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::setup_items_table(&client).await;
+    let slot = "pgcdc_slot_event_index_replay";
+    common::create_slot(&client, slot).await;
+
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let mut cfg = config(&conn);
+    cfg.slot = slot.into();
+    cfg.ack_interval_ms = 600_000;
+    let m = metrics.clone();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None)), m).await
+    });
+
+    // Same shape as the previous test: two inserts, then a TRUNCATE naming
+    // both tables, so the replayed transaction also carries the
+    // motivating case — two events sharing one lsn.
+    client
+        .batch_execute(
+            "BEGIN;
+             INSERT INTO users VALUES (1, 'Alice', NULL, NULL);
+             INSERT INTO items VALUES (10, 'Widget', 5);
+             TRUNCATE users, items;
+             COMMIT;",
+        )
+        .await
+        .unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("the first delivery should arrive within 20 seconds")
+        .expect("channel closed");
+    assert_eq!(first.changes.len(), 4);
+    let first_pairs: Vec<(Lsn, u32)> = first
+        .changes
+        .iter()
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+
+    // Nothing was acknowledged yet (see the comment above), so this forces
+    // PostgreSQL to resend the same, still-unconfirmed transaction once
+    // pgcdc reconnects.
+    common::terminate_replication_backend(&client).await;
+
+    let second = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("the replayed transaction should arrive within 20 seconds")
+        .expect("channel closed");
+
+    assert_eq!(
+        second.xid, first.xid,
+        "this must be the SAME transaction replayed, not a different one"
+    );
+    let second_pairs: Vec<(Lsn, u32)> = second
+        .changes
+        .iter()
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+    assert_eq!(
+        second_pairs, first_pairs,
+        "(lsn, event_index) must be identical, pair for pair, after a replay — a key that \
+         changes on redelivery is worse than no key at all"
+    );
+
+    // The truncate events specifically: they are the motivating case, two
+    // events sharing one lsn and told apart only by event_index. Already
+    // covered by the full-vector comparison above, called out again here
+    // so a break in just this pair cannot hide inside a passing sum.
+    let first_truncates: Vec<(Lsn, u32)> = first
+        .changes
+        .iter()
+        .filter(|ev| ev.operation == Operation::Truncate)
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+    let second_truncates: Vec<(Lsn, u32)> = second
+        .changes
+        .iter()
+        .filter(|ev| ev.operation == Operation::Truncate)
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+    assert_eq!(first_truncates.len(), 2, "sanity: both truncates present");
+    assert_eq!(
+        second_truncates, first_truncates,
+        "the truncate events' (lsn, event_index) pairs must also match after a replay"
     );
 
     // Proof this was an actual reconnect and not the first session somehow
