@@ -141,7 +141,25 @@ pub struct Config {
     #[arg(long, env = "PGCDC_OUTPUT_PATH")]
     pub output_path: Option<std::path::PathBuf>,
 
-    #[arg(long, env = "PGCDC_MAX_TRANSACTION_EVENTS", default_value = "100000")]
+    // The lower bound — 1 — is forbidden for the same reason as the interval
+    // flags below: zero would refuse every transaction outright. The upper
+    // bound — u32::MAX — is what makes `event_index as u32` in `Assembler`
+    // (`src/transaction.rs`) exact by construction; see the comment there for
+    // the full chain.
+    //
+    // `clap::value_parser!` has no `ValueParserFactory` impl for `usize`
+    // (only the fixed-width integer types, `u8`..`i64`, get one), so
+    // `value_parser!(usize).range(..)` does not compile — unlike the four
+    // `u64` flags below, this one builds `RangedU64ValueParser` directly.
+    // `usize: TryFrom<u64>` holds on every target this project builds for,
+    // so the conversion inside the parser cannot fail.
+    #[arg(
+        long,
+        env = "PGCDC_MAX_TRANSACTION_EVENTS",
+        default_value = "100000",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
+            .range(1..=(u32::MAX as u64))
+    )]
     pub max_transaction_events: usize,
 
     // The lower bound — 1 — is forbidden by the parser, not just described in
@@ -349,6 +367,33 @@ mod tests {
     fn slot_busy_budget_ms_defaults_to_thirty_seconds() {
         let cfg = Config::try_parse_from(base_args()).expect("minimal arguments are valid");
         assert_eq!(cfg.slot_busy_budget_ms, 30_000);
+    }
+
+    #[test]
+    fn max_transaction_events_is_capped_so_the_event_index_cannot_wrap() {
+        // The ordinal is a u32. Bounding the flag here is what makes the cast in
+        // `Assembler` lossless by construction rather than by an argument about
+        // running out of memory first: an OOM is loud, a wrapped index is silent,
+        // and a wrapped index means two events share a deduplication key.
+        let too_large = (u32::MAX as u64 + 1).to_string();
+        let err = Config::try_parse_from([
+            "pgcdc",
+            "--database-url",
+            "postgres://u@h/d",
+            "--publication",
+            "p",
+            "--slot",
+            "s",
+            "--max-transaction-events",
+            &too_large,
+        ])
+        .expect_err("a limit past u32::MAX must be rejected, not silently accepted");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "rejection must come from the parser, so the exit code is 2 and the \
+             message names the flag"
+        );
     }
 
     #[test]

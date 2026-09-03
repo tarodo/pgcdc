@@ -246,11 +246,18 @@ impl Assembler {
                         // slot replays the same transaction with the same
                         // changes in the same order.
                         //
-                        // usize -> u32 truncates only past 4_294_967_296 events in
-                        // one transaction: `self.max_events` (`--max-transaction-events`,
-                        // default 100_000) refuses the buffer long before that, and
-                        // even with that flag raised past u32::MAX, holding that many
-                        // buffered `PendingChange`s would exhaust RAM first.
+                        // usize -> u32 is exact by construction, not merely likely:
+                        // `--max-transaction-events` (`self.max_events`, `src/config.rs`)
+                        // is bounded to `1..=u32::MAX` by the parser, and the push guard
+                        // in `handle` (`if open.changes.len() >= self.max_events`) refuses
+                        // to grow the buffer past that limit — so the largest possible
+                        // `event_index` here is `max_events - 1 <= u32::MAX - 1`, which
+                        // always fits. This used to be argued from memory exhaustion
+                        // ("that many buffered `PendingChange`s would run the process out
+                        // of RAM first"), which is the wrong shape of argument for this
+                        // project: an OOM is loud, but a wrapped `u32` is silent, and a
+                        // wrapped index would mean two different events share the
+                        // `(lsn, event_index)` deduplication key from Q35.
                         event_index: event_index as u32,
                         lsn: c.lsn,
                         commit_lsn: Lsn(commit_lsn),

@@ -146,7 +146,7 @@ Every flag has a matching environment variable. Flags win over the environment.
 | `--output` | `PGCDC_OUTPUT` | `stdout` | `stdout` or `file` |
 | `--output-path` | `PGCDC_OUTPUT_PATH` | — | required when `--output file` |
 | `--ack-interval-ms` | `PGCDC_ACK_INTERVAL_MS` | `200` | how often the barrier runs and a position is acknowledged |
-| `--max-transaction-events` | `PGCDC_MAX_TRANSACTION_EVENTS` | `100000` | a transaction larger than this is a fatal error, not a silent OOM |
+| `--max-transaction-events` | `PGCDC_MAX_TRANSACTION_EVENTS` | `100000` | a transaction larger than this is a fatal error, not a silent OOM; accepted range `1..=4294967295` (`u32::MAX`), so the `event_index` ordinal never wraps |
 | `--reconnect-initial-ms` | `PGCDC_RECONNECT_INITIAL_MS` | `100` | first backoff delay after a drop |
 | `--reconnect-max-ms` | `PGCDC_RECONNECT_MAX_MS` | `30000` | backoff ceiling |
 | `--slot-busy-budget-ms` | `PGCDC_SLOT_BUSY_BUDGET_MS` | `30000` | how long a slot may keep answering "busy" before it is fatal |
