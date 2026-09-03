@@ -6,7 +6,7 @@ A minimal Change Data Capture engine for PostgreSQL, in Rust. It reads logical r
 events over the `pgoutput` protocol and emits normalized JSON Lines.
 
 ```json
-{"schema":"public","table":"users","operation":"insert","after":{"id":"1","name":"Alice"},"transaction_id":737,"lsn":"0/192FF88","commit_lsn":"0/1930098","commit_timestamp":"2026-09-03T10:48:43.022891Z"}
+{"schema":"public","table":"users","operation":"insert","after":{"id":"1","name":"Alice"},"transaction_id":737,"event_index":0,"lsn":"0/192FF88","commit_lsn":"0/1930098","commit_timestamp":"2026-09-03T10:48:43.022891Z"}
 ```
 
 While testing a small Kafka-less CDC consumer, I observed a failure mode that silently

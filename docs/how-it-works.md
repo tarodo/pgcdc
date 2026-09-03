@@ -20,7 +20,7 @@ INSERT INTO users VALUES (1, 'Alice');
 turns into
 ```json
 {"schema":"public","table":"users","operation":"insert","after":{"id":"1","name":"Alice"},
- "transaction_id":748,"lsn":"0/19742B8","commit_lsn":"0/19743B0","commit_timestamp":"..."}
+ "transaction_id":737,"event_index":0,"lsn":"0/192FF88","commit_lsn":"0/1930098","commit_timestamp":"..."}
 ```
 
 This is CDC — change data capture. The industrial equivalent you have probably seen is
