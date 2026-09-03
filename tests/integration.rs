@@ -628,12 +628,16 @@ async fn a_bulk_copy_load_shares_one_lsn_and_is_told_apart_by_event_index() {
     // reasoned that lsn is "assigned by the server rather than counted by
     // us, therefore unique within a transaction" — true only while every
     // change gets its own WAL record. A bulk load via `COPY ... FROM STDIN`
-    // does not: PostgreSQL writes the whole batch as one `heap_multi_insert`
-    // WAL record, and pgoutput stamps every INSERT message that record
-    // produces with that one record's wal_start. No TRUNCATE anywhere in
-    // this test — this collision predates TRUNCATE support entirely and
-    // was already there for a plain bulk load. Reproduced live before this
-    // test was written, five rows via one COPY:
+    // does not: `heap_multi_insert` packs as many rows as fit in one table
+    // page into each WAL record it writes, then starts a new record for the
+    // next page — how many rows share a record depends on row width and
+    // volume, not a fixed "one record per COPY" (measured separately: a
+    // 100-row COPY against a wider, users-shaped table split into two
+    // records, 52 rows then 48). These five rows are narrow enough to stay
+    // on one page, so they land in one record and share one lsn. No
+    // TRUNCATE anywhere in this test — this collision predates TRUNCATE
+    // support entirely and was already there for a plain bulk load.
+    // Reproduced live before this test was written, five rows via one COPY:
     //   insert id=1  lsn=0/192FF88  event_index=0
     //   insert id=2  lsn=0/192FF88  event_index=1
     //   insert id=3  lsn=0/192FF88  event_index=2
@@ -694,8 +698,9 @@ async fn a_bulk_copy_load_shares_one_lsn_and_is_told_apart_by_event_index() {
         tx.changes
     );
 
-    // The whole point: one WAL record, one lsn, for every row — sorting and
-    // deduplicating a copy must collapse it to exactly one value.
+    // The point for these five narrow rows: one WAL record, one lsn —
+    // sorting and deduplicating a copy must collapse it to exactly one
+    // value. A wider or larger COPY would not (see the comment above).
     let lsns: Vec<Lsn> = tx.changes.iter().map(|ev| ev.lsn).collect();
     let mut unique_lsns = lsns.clone();
     unique_lsns.sort();
@@ -703,8 +708,8 @@ async fn a_bulk_copy_load_shares_one_lsn_and_is_told_apart_by_event_index() {
     assert_eq!(
         unique_lsns.len(),
         1,
-        "a bulk COPY load writes one heap_multi_insert WAL record, so every \
-         row must share one lsn, got {lsns:?}"
+        "these five narrow rows should fit in one heap_multi_insert WAL \
+         record, so every row must share one lsn, got {lsns:?}"
     );
 
     // event_index is what actually tells the five rows apart, and
