@@ -178,11 +178,11 @@ async fn reconnect_bounds_above_the_ceiling_fail_before_any_connection() {
 async fn sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port() {
     // Previously a signal arriving while the DB was unreachable went
     // unnoticed entirely — neither did the outer reconnect loop read the
-    // shutdown flag, nor was the backoff sleep interruptible. The reviewer
-    // reproduced this live: the binary on a dead port, SIGTERM, still alive
-    // five seconds later, and only SIGKILL changed anything. Port 1 never
-    // listens on any ordinary machine, so preflight will fail immediately
-    // and predictably — no Postgres container is needed here at all.
+    // shutdown flag, nor was the backoff sleep interruptible. Reproduced
+    // live: the binary on a dead port, SIGTERM, still alive five seconds
+    // later, and only SIGKILL changed anything. Port 1 never listens on any
+    // ordinary machine, so preflight will fail immediately and predictably
+    // — no Postgres container is needed here at all.
     let mut child = common::KillOnDrop(
         std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
             .args([
@@ -1052,7 +1052,7 @@ async fn the_servers_confirmed_position_never_races_ahead_of_what_we_acknowledge
     // `metrics.set_last_acknowledged_lsn` in that same function never sees
     // that substitution at all.
     //
-    // The scenario (a reviewer's probe, turned into a test).
+    // The scenario:
     // `acknowledge_durable` is only called when the barrier has something
     // to acknowledge (`sink.flush()` returned `Some`) — a single small
     // transaction would be a dud: the very first barrier tick would
@@ -2342,8 +2342,8 @@ async fn a_dropped_connection_is_recovered_without_losing_rows() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replayed_transactions_lsn_values_match_the_first_delivery() {
-    // The reviewer's other question: do lsn/commit_lsn survive a redelivery?
-    // They must, because they are the server's own WAL addresses, not
+    // Do lsn/commit_lsn survive a redelivery? They must, because they are
+    // the server's own WAL addresses, not
     // something pgcdc computes — decoding the same bytes twice has to
     // produce the same numbers. To prove that honestly, the transaction
     // below must still be UNACKNOWLEDGED at the moment the connection
@@ -2786,7 +2786,7 @@ async fn file_output_binary_writes_durable_json_lines() {
 async fn truncate_does_not_wedge_the_slot() {
     // Regression test for the original TRUNCATE defect. A publication's `pubtruncate`
     // defaults to true, so a TRUNCATE on a published table reaches pgoutput as message
-    // kind 'T'. Before this plan's Task 1, `decode` rejected 'T' with
+    // kind 'T'. Previously, `decode` rejected 'T' with
     // `PgcdcError::UnsupportedMessage`, which is fatal (src/error.rs) — the process died
     // with exit code 1 before the record's LSN was ever acknowledged, so the slot's
     // confirmed_flush_lsn never moved past it. Reproduced live before planning began:
@@ -3054,7 +3054,7 @@ async fn a_terminated_process_drains_before_the_periodic_barrier_would() {
     // `flush_and_acknowledge`.
     //
     // Previously a fixed `sleep` stood here instead of waiting
-    // for proof. The reviewer uncovered the real cause of the flakiness: at
+    // for proof. The real cause of the flakiness: at
     // 150ms the child process hadn't even managed to install its signal
     // handler yet, at 700ms it passed by a hair (~0.4s of margin) — under
     // twenty parallel containers that budget isn't enough, and SIGTERM goes
@@ -3647,9 +3647,9 @@ async fn metrics_report_shows_streaming_false_against_a_dead_port() {
     // confirmed empirically before this fix, pointed at `127.0.0.1:1` with
     // short backoff bounds, the process printed dozens of "reconnecting"
     // lines over tens of seconds and not one "metrics_report" line — and a
-    // reviewer's own live run against a stopped Postgres got three summaries
-    // across 65 seconds, all three `streaming=true`, zero summaries during
-    // the 32-second outage itself.
+    // live run against a stopped Postgres got three summaries across 65
+    // seconds, all three `streaming=true`, zero summaries during the
+    // 32-second outage itself.
     //
     // The fix gives `maybe_report` a second call site inside the sliced
     // backoff pause in `run()`'s outer loop — see its doc comment — which is
@@ -3797,13 +3797,13 @@ async fn the_streaming_flag_goes_false_when_the_session_is_lost() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_streaming_flag_goes_false_after_a_fatal_error() {
-    // Round 1 review finding: `metrics.set_streaming(false)` sat textually
-    // after the `match` in `run()`'s loop, which reads as "runs for every
-    // outcome of stream_once" but does not — two of that match's four arms
-    // `return` before ever reaching a line placed after it:
+    // `metrics.set_streaming(false)` sat textually after the `match` in
+    // `run()`'s loop, which reads as "runs for every outcome of
+    // stream_once" but does not — two of that match's four arms `return`
+    // before ever reaching a line placed after it:
     // `Ok(SessionOutcome::ShutdownRequested) => return Ok(())` and
-    // `Err(e) => return Err(e)` (the fatal branch). The reviewer reproduced
-    // both live: a real SIGTERM during an active stream, and a real fatal
+    // `Err(e) => return Err(e)` (the fatal branch). Reproduced live:
+    // a real SIGTERM during an active stream, and a real fatal
     // `TransactionTooLarge`. Both left the caller's own `Arc<Metrics>`
     // reporting a stale `streaming: true` after `run()` had already
     // returned — `run` is a public library entry point that takes that
@@ -3819,8 +3819,8 @@ async fn the_streaming_flag_goes_false_after_a_fatal_error() {
     // that function (`postgres::replication::tests`), including the two that
     // used to be missed. This test proves the same thing end to end, through
     // the real `run()` + `stream_once`, for the fatal-error arm specifically
-    // (the reviewer's own suggested reproduction: `max_transaction_events`
-    // set low enough that a real transaction trips it). The clean-shutdown
+    // (`max_transaction_events` set low enough that a real transaction
+    // trips it). The clean-shutdown
     // arm is NOT exercised this way here: doing that would mean sending a
     // real SIGTERM to this test binary's own process, and roughly two dozen
     // OTHER tests in this same file also call `run()` in-process — a signal

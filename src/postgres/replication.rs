@@ -481,9 +481,9 @@ enum LoopAction {
 /// at this put `metrics.set_streaming(false)` textually after the `match`
 /// that used to sit directly in `run()` — which reads as "runs for every
 /// outcome" but doesn't, because two of that match's arms `return` before
-/// reaching a line placed after it. That version shipped, a reviewer caught
-/// it against a live SIGTERM and a live fatal error, and both times the
-/// caller's own `Arc<Metrics>` was left showing a stale `streaming = true`.
+/// reaching a line placed after it. That version left `streaming` stuck at
+/// `true` in the caller's own `Arc<Metrics>` after a live SIGTERM and after
+/// a live fatal error alike.
 /// Here the call is the FIRST line of this function, before the match that
 /// decides what happens next — there is no arm left for an edit to add that
 /// could skip it, and the four cases below are pinned individually by a
@@ -821,9 +821,9 @@ const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 /// too, from inside the sliced backoff pause: without a second call site, `streaming` in
 /// this line could never be observed as `false` by a live reader, because the only place
 /// that ever printed it was a loop that runs entirely between `set_streaming(true)` and
-/// the return that leads into `set_streaming(false)` — a reviewer measured this directly,
-/// stopping Postgres for 32 seconds and getting three summaries in that window, all three
-/// `streaming=true`, and zero summaries during the outage itself. `last_report` is one
+/// the return that leads into `set_streaming(false)` — confirmed by stopping Postgres for
+/// 32 seconds: three summaries printed in that window, all three `streaming=true`, and
+/// zero summaries during the outage itself. `last_report` is one
 /// `Instant` the two call sites share (`run()` owns it and lends it to `stream_once` by
 /// mutable reference for the length of one session) — sharing it, rather than each site
 /// keeping its own countdown, is what keeps this from double-printing at the boundary
@@ -1097,12 +1097,11 @@ mod tests {
     // handle_session_outcome: one test per arm, all four. The two that
     // matter most are `ShutdownRequested` and a fatal `Err` — both `return`
     // out of `run()`'s loop before the point where a previous version of
-    // this code cleared the streaming gauge, so both were the ones a
-    // reviewer caught still reporting `streaming: true` on a live SIGTERM
-    // and a live fatal error. Fixed here by moving the gauge write to the
-    // first line of this function, ahead of the match entirely — these
-    // tests exercise that guarantee directly, without a live Postgres or a
-    // real signal.
+    // this code cleared the streaming gauge, so both left `streaming: true`
+    // reported on a live SIGTERM and a live fatal error. Fixed here by
+    // moving the gauge write to the first line of this function, ahead of
+    // the match entirely — these tests exercise that guarantee directly,
+    // without a live Postgres or a real signal.
 
     #[test]
     fn shutdown_requested_clears_streaming_and_stops_the_loop() {

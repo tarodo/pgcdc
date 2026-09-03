@@ -152,7 +152,7 @@ events" is written without byte data, simply as an assertion of absence).
 
 ## `0032_truncate.bin` — TRUNCATE (separate capture, 2026-09-03)
 
-Captured for Task 1 of the `truncate-support` plan, **not** part of the 2026-08-30
+Captured while adding TRUNCATE support, **not** part of the 2026-08-30
 `spike`/`gen-fixtures.sql` session above: `pubtruncate` on `pgcdc_pub` is `true` by
 default, so a `TRUNCATE` on a published table reaches pgoutput as message kind `'T'`,
 which stage 0/2 never captured (see "Not analysed" item 5 in `docs/pgoutput-notes.md`)
@@ -224,14 +224,13 @@ original 2026-08-30 session.
    748 (`TRUNCATE public.users;`) and xid 749 (`TRUNCATE public.items;`). As a
    non-fixture cross-check, `TRUNCATE public.users RESTART IDENTITY CASCADE;` (xid 751)
    produced flags `0x03` instead — consistent with two option bits set rather than one,
-   though decoding what each individual bit means was out of scope for Task 1 (the
+   though decoding what each individual bit means was out of scope here (the
    decoder reads and discards the whole byte).
 
 `TRUNCATE public.users, public.items;` (xid 750) additionally confirmed the multi-relation
 form: tag `'T'`, count `00 00 00 02`, flags `00`, then two OIDs `00 00 40 01` (`users`)
 and `00 00 40 08` (`items`), in the same order as named in the SQL — 14 bytes, no
-remainder. Not saved as a fixture; `0032_truncate.bin` alone is enough to pin the parse
-per the brief (Task 1, Step 4).
+remainder. Not saved as a fixture; `0032_truncate.bin` alone is enough to pin the parse.
 
 ## Note: RELATION messages and `wal_start`/`wal_end` = `0/0` (cause unconfirmed)
 
