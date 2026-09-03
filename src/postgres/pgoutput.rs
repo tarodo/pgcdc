@@ -254,7 +254,14 @@ pub fn decode(payload: &[u8]) -> Result<PgOutputMessage, PgcdcError> {
             // The flags byte (CASCADE / RESTART IDENTITY) is read to keep the offsets
             // right, then discarded — see the doc comment on the Truncate variant.
             let _flags = r.u8()?;
-            let mut relation_ids = Vec::with_capacity(nrelations as usize);
+            // No Vec::with_capacity(nrelations as usize) here: nrelations is an untrusted
+            // i32 straight off the wire, unlike every other count in this decoder (the rest
+            // are i16, capped at 32767). A crafted or corrupted frame can claim
+            // i32::MAX, which asks for 8 GiB up front — and Rust's allocator aborts the
+            // process on failure instead of returning an error, defeating the Decode
+            // contract above. Growing one push at a time is bounded by what the buffer
+            // actually holds, since each iteration still has to read 4 real bytes.
+            let mut relation_ids = Vec::new();
             for _ in 0..nrelations {
                 relation_ids.push(r.u32()?);
             }
@@ -539,6 +546,35 @@ mod tests {
             }
             other => panic!("expected Truncate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn truncate_with_i32_max_relation_count_is_a_decode_error_not_an_abort() {
+        // 'T', nrelations = i32::MAX (0x7FFFFFFF), flags = 0x00, then nothing: no relation
+        // ids at all. With Vec::with_capacity(nrelations as usize) this frame asks the
+        // allocator for 8 GiB before a single OID is read; under a memory-limited cgroup
+        // that allocation aborts the process (SIGABRT), bypassing decode's error path
+        // entirely. It must come back as an ordinary Decode error instead.
+        let frame: &[u8] = &[0x54, 0x7F, 0xFF, 0xFF, 0xFF, 0x00];
+        assert!(
+            matches!(decode(frame), Err(PgcdcError::Decode(_))),
+            "an i32::MAX relation count must decode-error, not panic or abort"
+        );
+    }
+
+    #[test]
+    fn truncate_with_negative_relation_count_is_a_decode_error() {
+        // 'T', nrelations = -1 (0xFFFFFFFF as i32). `as usize` sign-extends this to
+        // 18446744073709551615 — an impossible allocation request, worse than the
+        // i32::MAX case above.
+        let frame: &[u8] = &[0x54, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(
+            matches!(
+                decode(frame),
+                Err(PgcdcError::Decode(msg)) if msg.contains("negative truncate relation count")
+            ),
+            "a negative relation count must decode-error with a message naming the field"
+        );
     }
 
     const UPDATE_FULL: &[u8] = include_bytes!("../../tests/fixtures/0006_update.bin");
