@@ -1241,4 +1241,44 @@ mod tests {
         let err = a.handle(delete_msg(), Lsn(0x210), &mut cache).unwrap_err();
         assert!(matches!(err, PgcdcError::TransactionTooLarge { limit: 1 }));
     }
+
+    #[test]
+    fn truncate_respects_the_max_events_limit() {
+        // Same guard, TRUNCATE arm's own copy. Unlike the other three arms this
+        // one loops — one message can name several relations — so the stronger
+        // property to check is not just "eventually errors" but "errors exactly
+        // on the relation that overflows the limit", leaving the ones that fit
+        // already buffered rather than either silently dropping the whole
+        // message or letting it all through uncounted.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(1);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(users_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        a.handle(
+            PgOutputMessage::Relation(items_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        let err = a
+            .handle(
+                PgOutputMessage::Truncate {
+                    relation_ids: vec![16385, 16392],
+                },
+                Lsn(0x200),
+                &mut cache,
+            )
+            .unwrap_err();
+        assert!(matches!(err, PgcdcError::TransactionTooLarge { limit: 1 }));
+        assert_eq!(
+            a.len(),
+            1,
+            "the first relation was buffered before the second hit the limit"
+        );
+    }
 }
