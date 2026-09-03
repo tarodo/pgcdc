@@ -200,9 +200,11 @@ run or restart pgcdc needs to change.
 **The deduplication key is `(lsn, event_index)`, not `lsn` alone.** `lsn` is the WAL address
 of the change's own record, assigned by the server, not a counter we keep — stable across a
 redelivery after a crash, and increasing in the order the changes happened. But it is not
-always unique on its own: a single `TRUNCATE` naming several tables becomes several events
-that all carry the WAL position of the one message that produced them, so `event_index` —
-this event's position within its transaction — is what tells them apart. `commit_lsn` still
+always unique on its own: a bulk `COPY` load packs several rows into each WAL record it
+writes (how many depends on row width — PostgreSQL fills a page, then starts the next
+record), and a single `TRUNCATE` naming several tables is one record for all of them — either
+way, every event that one record produces carries the same `lsn`, so `event_index` — this
+event's position within its transaction — is what tells them apart. `commit_lsn` still
 cannot serve as a key: every change in the same transaction carries the same `commit_lsn`,
 because it names the commit record, not the individual change. Group by `commit_lsn` to find
 everything one transaction touched; identify or deduplicate an individual change by
