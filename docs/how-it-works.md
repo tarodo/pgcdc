@@ -301,11 +301,11 @@ Err(_elapsed) => {}
 
 ### ② Decode `pgoutput`
 
-`decode()` turns bytes into one of six messages: `Begin`, `Commit`, `Relation`,
-`Insert`, `Update`, `Delete`.
+`decode()` turns bytes into one of seven messages: `Begin`, `Commit`, `Relation`,
+`Insert`, `Update`, `Delete`, `Truncate`.
 
 This is a binary protocol, read by hand byte by byte. How it is built is in
-[pgoutput-notes.md](pgoutput-notes.md), 963 lines derived from 31 frozen dumps of
+[pgoutput-notes.md](pgoutput-notes.md), 965 lines derived from 31 frozen dumps of
 real bytes (`tests/fixtures/`). An example from there, so you get the level of pedantry:
 
 > The timestamp counts from **2000-01-01**, not from the Unix epoch. Get it wrong and take
@@ -410,16 +410,16 @@ With a comment worth reading in full:
 |---|---|---|
 | [src/main.rs](../src/main.rs) | 56 | entry point: parse the flags, pick a sink, run, return an exit code |
 | [src/config.rs](../src/config.rs) | 487 | ten CLI flags and their paired environment variables |
-| [src/postgres/replication.rs](../src/postgres/replication.rs) | 1732 | **the heart**: two loops, reconnect, acknowledgement, shutdown |
-| [src/postgres/pgoutput.rs](../src/postgres/pgoutput.rs) | 631 | binary protocol decoding |
+| [src/postgres/replication.rs](../src/postgres/replication.rs) | 2142 | **the heart**: two loops, reconnect, acknowledgement, shutdown |
+| [src/postgres/pgoutput.rs](../src/postgres/pgoutput.rs) | 711 | binary protocol decoding |
 | [src/postgres/guard.rs](../src/postgres/guard.rs) | 182 | the pre-flight check on the slot |
-| [src/transaction.rs](../src/transaction.rs) | 1166 | `Assembler` — buffers until `COMMIT` |
+| [src/transaction.rs](../src/transaction.rs) | 1311 | `Assembler` — buffers until `COMMIT` |
 | [src/lsn.rs](../src/lsn.rs) | 189 | the four positions and the rules between them |
 | [src/schema.rs](../src/schema.rs) | 109 | cache of table descriptions (`RELATION`) |
-| [src/event.rs](../src/event.rs) | 126 | `ChangeEvent` — what goes out as JSON |
+| [src/event.rs](../src/event.rs) | 130 | `ChangeEvent` — what goes out as JSON |
 | [src/sink/](../src/sink/) | 699 | the `Sink` trait + two implementations |
 | [src/error.rs](../src/error.rs) | 167 | every kind of error and the fatal / recoverable split |
-| [src/metrics.rs](../src/metrics.rs) | 133 | eight counters |
+| [src/metrics.rs](../src/metrics.rs) | 241 | eight counters |
 
 Where to start reading: `main.rs` → `run()` in `replication.rs` → `stream_once()` in the same file.
 
@@ -633,6 +633,6 @@ classified in `is_fatal()`.
 
 ---
 
-Next: [DECISIONS.md](../DECISIONS.md) — why it was done this way (33 decisions),
+Next: [DECISIONS.md](../DECISIONS.md) — why it was done this way (34 decisions),
 [spike-findings.md](spike-findings.md) — what we found out about the transport library and what
 must not be used, [pgoutput-notes.md](pgoutput-notes.md) — the bytes of the protocol.

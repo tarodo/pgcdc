@@ -133,6 +133,13 @@ pub enum PgOutputMessage {
         old_kind: OldTupleKind,
         old: TupleData,
     },
+    /// A TRUNCATE of one or more relations, all inside one transaction.
+    /// The flags byte (CASCADE, RESTART IDENTITY) is read and discarded: its
+    /// effects reach a row-level consumer as the extra relation ids in this
+    /// same message, or not at all (RESTART IDENTITY touches sequences).
+    Truncate {
+        relation_ids: Vec<u32>,
+    },
 }
 
 pub fn decode(payload: &[u8]) -> Result<PgOutputMessage, PgcdcError> {
@@ -236,6 +243,29 @@ pub fn decode(payload: &[u8]) -> Result<PgOutputMessage, PgcdcError> {
                 old_kind,
                 old: read_tuple(&mut r)?,
             }
+        }
+        'T' => {
+            let nrelations = r.i32()?;
+            if nrelations < 0 {
+                return Err(PgcdcError::Decode(format!(
+                    "negative truncate relation count {nrelations}"
+                )));
+            }
+            // The flags byte (CASCADE / RESTART IDENTITY) is read to keep the offsets
+            // right, then discarded — see the doc comment on the Truncate variant.
+            let _flags = r.u8()?;
+            // No Vec::with_capacity(nrelations as usize) here: nrelations is an untrusted
+            // i32 straight off the wire, unlike every other count in this decoder (the rest
+            // are i16, capped at 32767). A crafted or corrupted frame can claim
+            // i32::MAX, which asks for 8 GiB up front — and Rust's allocator aborts the
+            // process on failure instead of returning an error, defeating the Decode
+            // contract above. Growing one push at a time is bounded by what the buffer
+            // actually holds, since each iteration still has to read 4 real bytes.
+            let mut relation_ids = Vec::new();
+            for _ in 0..nrelations {
+                relation_ids.push(r.u32()?);
+            }
+            PgOutputMessage::Truncate { relation_ids }
         }
         other => return Err(PgcdcError::UnsupportedMessage { kind: other }),
     };
@@ -445,9 +475,10 @@ mod tests {
 
     #[test]
     fn other_message_kinds_are_still_explicitly_unsupported() {
-        // TRUNCATE, TYPE, ORIGIN and anything unknown must still produce an
-        // explicit error, not a silent skip (spec §8).
-        for kind in *b"TYOMS" {
+        // TYPE, ORIGIN, MESSAGE and anything unknown must still produce an
+        // explicit error, not a silent skip (spec §8). TRUNCATE ('T') is now
+        // handled and is covered by its own tests below.
+        for kind in *b"YOMS" {
             let payload = [kind, 0x00, 0x00, 0x00, 0x00];
             assert!(
                 matches!(decode(&payload), Err(PgcdcError::UnsupportedMessage { .. })),
@@ -495,6 +526,55 @@ mod tests {
         // For DELETE the tag is mandatory: the deleted row needs to be identified by something.
         let bad = [0x44u8, 0x00, 0x00, 0x40, 0x08, 0x4E, 0x00, 0x00];
         assert!(matches!(decode(&bad), Err(PgcdcError::Decode(_))));
+    }
+
+    const TRUNCATE: &[u8] = include_bytes!("../../tests/fixtures/0032_truncate.bin");
+
+    #[test]
+    fn truncate_decodes_to_the_relations_it_names() {
+        // Captured with pg_logical_slot_peek_binary_changes from `TRUNCATE public.users;`
+        // (no CASCADE/RESTART IDENTITY): tag 'T', count 1, flags 0x00, OID 16385 (users) —
+        // the same OID as the frozen 0002_relation.bin. 10 bytes, no remainder.
+        assert_eq!(TRUNCATE.len(), 10);
+        match decode(TRUNCATE).expect("the capture must decode") {
+            PgOutputMessage::Truncate { relation_ids } => {
+                assert_eq!(
+                    relation_ids,
+                    vec![16385],
+                    "a plain TRUNCATE public.users names exactly the users OID"
+                );
+            }
+            other => panic!("expected Truncate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_with_i32_max_relation_count_is_a_decode_error_not_an_abort() {
+        // 'T', nrelations = i32::MAX (0x7FFFFFFF), flags = 0x00, then nothing: no relation
+        // ids at all. With Vec::with_capacity(nrelations as usize) this frame asks the
+        // allocator for 8 GiB before a single OID is read; under a memory-limited cgroup
+        // that allocation aborts the process (SIGABRT), bypassing decode's error path
+        // entirely. It must come back as an ordinary Decode error instead.
+        let frame: &[u8] = &[0x54, 0x7F, 0xFF, 0xFF, 0xFF, 0x00];
+        assert!(
+            matches!(decode(frame), Err(PgcdcError::Decode(_))),
+            "an i32::MAX relation count must decode-error, not panic or abort"
+        );
+    }
+
+    #[test]
+    fn truncate_with_negative_relation_count_is_a_decode_error() {
+        // 'T', nrelations = -1 (0xFFFFFFFF as i32). `as usize` sign-extends this to
+        // 18446744073709551615 — an impossible allocation request, worse than the
+        // i32::MAX case above.
+        let frame: &[u8] = &[0x54, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(
+            matches!(
+                decode(frame),
+                Err(PgcdcError::Decode(msg)) if msg.contains("negative truncate relation count")
+            ),
+            "a negative relation count must decode-error with a message naming the field"
+        );
     }
 
     const UPDATE_FULL: &[u8] = include_bytes!("../../tests/fixtures/0006_update.bin");

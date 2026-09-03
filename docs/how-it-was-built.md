@@ -17,20 +17,23 @@ rewriting to match whatever got built.
 That constraint held. The spec was never edited to match the implementation. Every place I
 needed to depart from it — because it was wrong, silent on a question, or contradicted itself —
 became a numbered, justified entry in [DECISIONS.md](../DECISIONS.md) instead of a quiet
-rewrite of the source document. By the end there were thirty-three of them (`Q1`–`Q33`), each
+rewrite of the source document. By the end there were thirty-four of them (`Q1`–`Q34`), each
 recording the decision, the reasoning, and the alternative I rejected.
 
-Seven places in the spec needed correction outright: an assumption that a ready-made
+Eight places in the spec needed correction outright: an assumption that a ready-made
 replication library existed when none did; an `fsync`-per-commit design that caps throughput
 at roughly a hundred transactions a second; treating stdout as if it could offer durability;
 a logging plan that would print a thousand lines a second under normal load; a rollback test
 that was mislabeled — it can't test our code, since logical decoding physically never delivers
 a rolled-back transaction, so it needed renaming to say honestly what it actually tests: our
 understanding of the protocol; TOAST handling deferred to a later phase it can't actually wait
-for, because the protocol sends the marker in the MVP regardless; and a
+for, because the protocol sends the marker in the MVP regardless; a
 persistent checkpoint file, which reintroduces exactly the second source of truth the rest of
-the design was built to avoid. Each correction is recorded in DECISIONS.md's corrections
-section, tied to the decision that fixed it.
+the design was built to avoid; and TRUNCATE, deferred to the same later phase even though the
+decoder section already listed it as optional-if-encountered and forbade silently ignoring an
+unsupported message where that isn't safe — implemented once a live reproduction showed
+ignoring it wedges the replication slot for good. Each correction is recorded in
+DECISIONS.md's corrections section, tied to the decision that fixed it.
 
 ---
 
@@ -70,7 +73,7 @@ accuracy.
 
 ---
 
-## Thirty-three decisions, six stages
+## Thirty-four decisions, six stages
 
 Development went as a vertical slice — spike, then byte-level fixtures frozen from real
 protocol traffic, then test-driven implementation stage by stage (`Q8`) — rather than building
@@ -176,7 +179,7 @@ re-reads in full once it's grown long.
 ## Whose decisions these were
 
 None of the above was generated and accepted wholesale. The specification was drafted by a
-language model, on request, from a prompt I wrote; the thirty-three decisions that followed, the
+language model, on request, from a prompt I wrote; the thirty-four decisions that followed, the
 six-stage plan, the pre-flight guard the spike demanded, what got deliberately broken at each
 review, and the fix for every defect described here were mine. The model was a tool used at
 each of those points — to draft the spec text, to help write and review code — the way a

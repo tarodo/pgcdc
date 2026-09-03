@@ -22,7 +22,7 @@ irreversible — it permits the server to delete that WAL.
 
 ## What it does
 
-- Decodes `BEGIN`, `COMMIT`, `RELATION`, `INSERT`, `UPDATE`, `DELETE` from `pgoutput`.
+- Decodes `BEGIN`, `COMMIT`, `RELATION`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` from `pgoutput`.
 - Emits whole transactions only, on `COMMIT` — a rolled-back transaction never reaches the output.
 - Distinguishes a full old row (`before_kind: "full"`) from a key-only one (`before_kind: "key"`).
 - Names TOAST values the server did not resend in `unchanged_columns`, instead of reporting them as `null`.
@@ -31,8 +31,8 @@ irreversible — it permits the server to delete that WAL.
 - Reconnects with exponential backoff, and stops cleanly on `SIGTERM` / `SIGINT`.
 - Exits non-zero on anything a retry cannot fix.
 
-**Not in scope:** Kafka and other sinks, initial snapshots, DDL replication, fetching TOAST
-values the server did not send, multi-database or multi-publication runs.
+**Not in scope:** Kafka and other sinks, initial snapshots, schema changes (`CREATE`/`ALTER`/`DROP TABLE`
+and other DDL), fetching TOAST values the server did not send, multi-database or multi-publication runs.
 
 ---
 
@@ -154,10 +154,10 @@ pgcdc --output stdout … | jq -r '.table'
 | Field | Meaning |
 |---|---|
 | `schema`, `table` | source relation |
-| `operation` | `insert` / `update` / `delete` |
-| `before` | old row; `null` for `insert` |
-| `before_kind` | `full` (whole old row) or `key` (primary key only) — `null` when `before` is `null` |
-| `after` | new row; `null` for `delete` |
+| `operation` | `insert` / `update` / `delete` / `truncate` |
+| `before` | old row; `null` for `insert`, and always `null` for `truncate` |
+| `before_kind` | `full` (whole old row) or `key` (primary key only) — `null` when `before` is `null`, which includes every `truncate` |
+| `after` | new row; `null` for `delete`, and always `null` for `truncate` |
 | `unchanged_columns` | TOAST columns the server did not resend; they are absent from `after`, not `null` in it |
 | `transaction_id` | the transaction's xid |
 | `lsn` | position of this change |
@@ -165,6 +165,22 @@ pgcdc --output stdout … | jq -r '.table'
 | `commit_timestamp` | commit time, RFC 3339, microseconds, UTC |
 
 Column order follows the table, not the alphabet.
+
+**A `truncate` event carries no row identity — that's why both `before` and `after` are
+`null`.** `TRUNCATE` says "this table is now empty", not "these specific rows are gone", so
+there is nothing to put in either field. A consumer must drop everything it currently holds
+for that `schema`/`table` pair rather than try to match individual rows against the event. A
+single SQL `TRUNCATE` naming several tables arrives as one `truncate` event per relation, each
+with its own `schema`/`table`, so downstream handling never has to special-case a
+multi-table statement.
+
+**Upgrading from a build that predates `TRUNCATE` support:** a publication created without an
+explicit `publish` list (`CREATE PUBLICATION … FOR TABLE …`, no `WITH (publish = …)`) has
+`pubtruncate` on by default, so any `TRUNCATE` on a published table used to reach the decoder
+as an unsupported message and exit fatally — the slot's `confirmed_flush_lsn` could never
+advance past that record, and every restart landed on the same message again, wedging the
+process permanently. `TRUNCATE` now decodes like any other operation; nothing about how you
+run or restart pgcdc needs to change.
 
 **`lsn` is the event identifier — use it for deduplication, not `commit_lsn`.** It is the
 WAL address of the change's own record, assigned by the server, not a counter we keep — so
