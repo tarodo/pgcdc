@@ -416,7 +416,9 @@ median and a spread — not one more run of the above.
 | [docs/spec.md](docs/spec.md) | the binding specification the code was built against, and where it came from |
 | [docs/how-it-works.md](docs/how-it-works.md) | how the code is laid out — written for someone reading Rust for the first time |
 | [docs/operability.md](docs/operability.md) | metrics, log fields, and alerting advice for someone running pgcdc |
+| [CHANGELOG.md](CHANGELOG.md) | what changed in each release, and what an upgrade may break |
 | [DECISIONS.md](DECISIONS.md) | every accepted decision and the alternatives rejected, with reasons |
+| [docs/decision-notes.md](docs/decision-notes.md) | the reproductions and mechanism walk-throughs behind three of them |
 | [docs/pgoutput-notes.md](docs/pgoutput-notes.md) | byte-level breakdown of the protocol |
 | [docs/spike-findings.md](docs/spike-findings.md) | what we found in the transport crate, and what must not be used |
 | [docs/how-it-was-built.md](docs/how-it-was-built.md) | the process this project was built with, and what it caught |
