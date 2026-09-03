@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use pgcdc::config::{Config, DatabaseUrl, OutputKind};
 use pgcdc::error::PgcdcError;
+use pgcdc::event::Operation;
 use pgcdc::lsn::Lsn;
 use pgcdc::sink::{Durability, Sink};
 use pgcdc::transaction::Transaction;
@@ -531,10 +532,19 @@ async fn changes_in_one_transaction_share_commit_lsn_but_each_lsn_is_distinct_an
     // transaction carries the same value — it cannot tell two changes in
     // that transaction apart, and README's "## Output" section says so.
     // lsn is the WAL address of the change's OWN record, assigned by the
-    // server rather than counted by us, so it must differ for every change
-    // and grow in the order the changes were decoded. Without a test, that
-    // claim is only a comment: this pins it against a real transaction that
-    // touches two tables with three different kinds of change.
+    // server rather than counted by us — but "own record" is the load-bearing
+    // part: this only holds while every change gets its own WAL record, which
+    // is true of a standalone INSERT/UPDATE/DELETE statement (what this
+    // transaction uses below) but NOT of a bulk COPY load or a multi-relation
+    // TRUNCATE, where several changes share one record and therefore one lsn.
+    // That is exactly why event_index exists — see
+    // a_bulk_copy_load_shares_one_lsn_and_is_told_apart_by_event_index and
+    // two_truncates_sharing_an_lsn_are_told_apart_by_event_index below, and
+    // Q35 in DECISIONS.md. Within this statement-per-row transaction's shape,
+    // lsn must differ for every change and grow in the order the changes were
+    // decoded. Without a test, that claim is only a comment: this pins it
+    // against a real transaction that touches two tables with three different
+    // kinds of change.
     let (_pg, conn) = common::start_postgres().await;
     let client = common::connect(&conn).await;
     common::setup_schema(&client).await;
@@ -607,6 +617,116 @@ async fn changes_in_one_transaction_share_commit_lsn_but_each_lsn_is_distinct_an
             "lsn must increase strictly in emission order, got {lsns:?}"
         );
     }
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bulk_copy_load_shares_one_lsn_and_is_told_apart_by_event_index() {
+    // The counterexample to the test right above this one, and the reason
+    // Q31 (DECISIONS.md) was corrected rather than merely refined: Q31
+    // reasoned that lsn is "assigned by the server rather than counted by
+    // us, therefore unique within a transaction" — true only while every
+    // change gets its own WAL record. A bulk load via `COPY ... FROM STDIN`
+    // does not: `heap_multi_insert` packs as many rows as fit in one table
+    // page into each WAL record it writes, then starts a new record for the
+    // next page — how many rows share a record depends on row width and
+    // volume, not a fixed "one record per COPY" (measured separately: a
+    // 100-row COPY against a wider, users-shaped table split into two
+    // records, 52 rows then 48). These five rows are narrow enough to stay
+    // on one page, so they land in one record and share one lsn. No
+    // TRUNCATE anywhere in this test — this collision predates TRUNCATE
+    // support entirely and was already there for a plain bulk load.
+    // Reproduced live before this test was written, five rows via one COPY:
+    //   insert id=1  lsn=0/192FF88  event_index=0
+    //   insert id=2  lsn=0/192FF88  event_index=1
+    //   insert id=3  lsn=0/192FF88  event_index=2
+    //   insert id=4  lsn=0/192FF88  event_index=3
+    //   insert id=5  lsn=0/192FF88  event_index=4
+    //   unique lsn: 1, unique (lsn, event_index): 5
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let cfg = config(&conn);
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
+    });
+
+    // One statement, one implicit transaction, five rows — COPY commits as
+    // its own transaction with no explicit BEGIN/COMMIT needed.
+    {
+        use bytes::Bytes;
+        use futures_util::SinkExt;
+
+        let mut sink = Box::pin(
+            client
+                .copy_in("COPY public.users (id, name, email, bio) FROM STDIN")
+                .await
+                .expect("start COPY"),
+        );
+        let payload =
+            "1\tAlice\t\\N\t\\N\n2\tBob\t\\N\t\\N\n3\tCarol\t\\N\t\\N\n4\tDan\t\\N\t\\N\n5\tEve\t\\N\t\\N\n";
+        sink.send(Bytes::from(payload))
+            .await
+            .expect("send COPY data");
+        sink.as_mut().finish().await.expect("finish COPY");
+    }
+
+    let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("the transaction should arrive within 20 seconds")
+        .expect("channel closed");
+
+    assert_eq!(
+        tx.changes.len(),
+        5,
+        "all five COPY-loaded rows must land in one transaction"
+    );
+    assert!(
+        tx.changes
+            .iter()
+            .all(|ev| ev.operation == Operation::Insert),
+        "COPY loads rows, not truncates: {:?}",
+        tx.changes
+    );
+
+    // The point for these five narrow rows: one WAL record, one lsn —
+    // sorting and deduplicating a copy must collapse it to exactly one
+    // value. A wider or larger COPY would not (see the comment above).
+    let lsns: Vec<Lsn> = tx.changes.iter().map(|ev| ev.lsn).collect();
+    let mut unique_lsns = lsns.clone();
+    unique_lsns.sort();
+    unique_lsns.dedup();
+    assert_eq!(
+        unique_lsns.len(),
+        1,
+        "these five narrow rows should fit in one heap_multi_insert WAL \
+         record, so every row must share one lsn, got {lsns:?}"
+    );
+
+    // event_index is what actually tells the five rows apart, and
+    // (lsn, event_index) must still be unique even though lsn alone is not.
+    let mut pairs: Vec<(Lsn, u32)> = tx
+        .changes
+        .iter()
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+    let total = pairs.len();
+    pairs.sort();
+    pairs.dedup();
+    assert_eq!(
+        pairs.len(),
+        total,
+        "(lsn, event_index) must be unique across every COPY-loaded row"
+    );
 
     handle.abort();
 }
@@ -1262,12 +1382,22 @@ async fn file_output_without_a_path_is_rejected_by_the_binary() {
         .output()
         .expect("spawn the binary");
     assert!(!output.status.success());
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a fatal config error must produce exit code 1 (DECISIONS Q22), not 2 — this is caught \
+         by hand in main.rs, not by clap"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.is_empty(), "stdout carries only the payload");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("--output-path"),
         "the message names the missing flag: {stderr}"
+    );
+    assert!(
+        stderr.contains("output_path_required"),
+        "stderr must name the reason via the machine-readable error_kind label, got: {stderr}"
     );
 }
 
@@ -2285,6 +2415,219 @@ async fn a_replayed_transactions_lsn_values_match_the_first_delivery() {
         second_lsns, first_lsns,
         "each change's lsn must be identical after a replay — it is the server's own \
          WAL address, not something recomputed on redecoding"
+    );
+
+    // Proof this was an actual reconnect and not the first session somehow
+    // redelivering the transaction by itself.
+    assert!(
+        metrics.snapshot().reconnects_total >= 1,
+        "reconnects_total must have advanced after the drop"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_truncates_sharing_an_lsn_are_told_apart_by_event_index() {
+    // event_index exists because lsn alone cannot tell apart two truncate
+    // events produced by ONE `TRUNCATE users, items;` statement: pgoutput
+    // sends a single 'T' record naming both relations, and `Assembler`
+    // (src/transaction.rs) turns it into one event per relation, all
+    // stamped with that one record's wal_start. Reproduced live before
+    // planning began, on a real server:
+    //   truncate  users  lsn=0/1937038
+    //   truncate  items  lsn=0/1937038    <- same lsn
+    // A consumer deduplicating by lsn alone would keep only one of the two
+    // truncates and leave the other table permanently out of sync.
+    //
+    // Three assertions below, each catching a different way this could
+    // stay broken:
+    // 1. the two truncate events really do share one lsn — this pins the
+    //    very reason the field exists, and this test would go
+    //    green-and-meaningless if PostgreSQL ever stopped doing that;
+    // 2. their event_index values differ — the actual disambiguator;
+    // 3. (lsn, event_index) is unique across every event of the run, not
+    //    just the two truncates.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::setup_items_table(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let cfg = config(&conn);
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(
+            cfg,
+            Box::new(ChannelSink(tx_send, None)),
+            std::sync::Arc::new(pgcdc::metrics::Metrics::new()),
+        )
+        .await
+    });
+
+    // One transaction: an insert into each demo table, then a single
+    // TRUNCATE naming both.
+    client
+        .batch_execute(
+            "BEGIN;
+             INSERT INTO users VALUES (1, 'Alice', NULL, NULL);
+             INSERT INTO items VALUES (10, 'Widget', 5);
+             TRUNCATE users, items;
+             COMMIT;",
+        )
+        .await
+        .unwrap();
+
+    let tx = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("the transaction should arrive within 20 seconds")
+        .expect("channel closed");
+    assert_eq!(
+        tx.changes.len(),
+        4,
+        "two inserts and two truncate events, one per table"
+    );
+
+    let truncates: Vec<_> = tx
+        .changes
+        .iter()
+        .filter(|ev| ev.operation == Operation::Truncate)
+        .collect();
+    assert_eq!(
+        truncates.len(),
+        2,
+        "TRUNCATE users, items names two tables, got {truncates:?}"
+    );
+
+    // Assertion 1: the two truncate events share one lsn.
+    assert_eq!(
+        truncates[0].lsn, truncates[1].lsn,
+        "both truncate events must carry the one message's wal_start"
+    );
+
+    // Assertion 2: their event_index values differ.
+    assert_ne!(
+        truncates[0].event_index, truncates[1].event_index,
+        "event_index is what tells the two truncate events apart"
+    );
+
+    // Assertion 3: (lsn, event_index) is unique across every event of the run.
+    let mut pairs: Vec<(Lsn, u32)> = tx
+        .changes
+        .iter()
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+    let total = pairs.len();
+    pairs.sort();
+    pairs.dedup();
+    assert_eq!(
+        pairs.len(),
+        total,
+        "(lsn, event_index) must be unique across every event of the run"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn event_index_survives_a_replay_byte_for_byte() {
+    // Same construction as a_replayed_transactions_lsn_values_match_the_first_delivery
+    // above, but checking (lsn, event_index) rather than lsn alone. A key
+    // that is unique but changes on redelivery is worse than no key at
+    // all: a consumer would store the same event twice under two
+    // different identities. ack_interval_ms is set far beyond this test's
+    // lifetime so the periodic barrier cannot fire, and the keepalive path
+    // stays shut too — see the sibling test's comment for the full
+    // argument. The transaction below is therefore still unacknowledged
+    // when the connection drops, forcing a real replay of this exact
+    // transaction rather than a race against our own acknowledgement.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::setup_items_table(&client).await;
+    let slot = "pgcdc_slot_event_index_replay";
+    common::create_slot(&client, slot).await;
+
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+    let mut cfg = config(&conn);
+    cfg.slot = slot.into();
+    cfg.ack_interval_ms = 600_000;
+    let m = metrics.clone();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None)), m).await
+    });
+
+    // Same shape as the previous test: two inserts, then a TRUNCATE naming
+    // both tables, so the replayed transaction also carries the
+    // motivating case — two events sharing one lsn.
+    client
+        .batch_execute(
+            "BEGIN;
+             INSERT INTO users VALUES (1, 'Alice', NULL, NULL);
+             INSERT INTO items VALUES (10, 'Widget', 5);
+             TRUNCATE users, items;
+             COMMIT;",
+        )
+        .await
+        .unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("the first delivery should arrive within 20 seconds")
+        .expect("channel closed");
+    assert_eq!(first.changes.len(), 4);
+    let first_pairs: Vec<(Lsn, u32)> = first
+        .changes
+        .iter()
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+
+    // Nothing was acknowledged yet (see the comment above), so this forces
+    // PostgreSQL to resend the same, still-unconfirmed transaction once
+    // pgcdc reconnects.
+    common::terminate_replication_backend(&client).await;
+
+    let second = tokio::time::timeout(Duration::from_secs(20), tx_recv.recv())
+        .await
+        .expect("the replayed transaction should arrive within 20 seconds")
+        .expect("channel closed");
+
+    assert_eq!(
+        second.xid, first.xid,
+        "this must be the SAME transaction replayed, not a different one"
+    );
+    let second_pairs: Vec<(Lsn, u32)> = second
+        .changes
+        .iter()
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+    assert_eq!(
+        second_pairs, first_pairs,
+        "(lsn, event_index) must be identical, pair for pair, after a replay — a key that \
+         changes on redelivery is worse than no key at all"
+    );
+
+    // The truncate events specifically: they are the motivating case, two
+    // events sharing one lsn and told apart only by event_index. Already
+    // covered by the full-vector comparison above, called out again here
+    // so a break in just this pair cannot hide inside a passing sum.
+    let first_truncates: Vec<(Lsn, u32)> = first
+        .changes
+        .iter()
+        .filter(|ev| ev.operation == Operation::Truncate)
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+    let second_truncates: Vec<(Lsn, u32)> = second
+        .changes
+        .iter()
+        .filter(|ev| ev.operation == Operation::Truncate)
+        .map(|ev| (ev.lsn, ev.event_index))
+        .collect();
+    assert_eq!(first_truncates.len(), 2, "sanity: both truncates present");
+    assert_eq!(
+        second_truncates, first_truncates,
+        "the truncate events' (lsn, event_index) pairs must also match after a replay"
     );
 
     // Proof this was an actual reconnect and not the first session somehow

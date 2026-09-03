@@ -21,7 +21,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Pulled explicitly so a registry problem is a distinct, readable failure
-      # rather than 32 tests timing out one after another.
+      # rather than every container-starting test timing out one after another.
       - name: Pull the Postgres image
         run: docker pull postgres:16-alpine
 
