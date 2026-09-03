@@ -332,10 +332,14 @@ Two more fields ride in the same `metrics_report` line. They are not counters �
 observations of state, which is why they get a description here instead of a ninth and tenth
 row above:
 
-- `streaming` — whether a replication session is running right now. It is written when a
-  session starts, and again whenever one ends in a way the process survives to report on —
-  a disconnect or a recoverable error — because a gauge only success updates reports health
-  nobody has actually observed.
+- `streaming` — whether a replication session is running right now. It is written `true`
+  once a session actually starts, and `false` on every one of the ways a session or the
+  process itself can stop again — a disconnect, a recoverable error, a clean shutdown, and
+  a fatal error alike — because a gauge only success updates reports health nobody has
+  actually observed. The line carrying `streaming=false` is not limited to the moment a
+  session just ended, either: it also comes out periodically while the process sits with
+  no connection at all, retrying against a server that is not answering — see "That first
+  pair misses a disconnected process" below.
 - `ack_age_s` — seconds since this process last acknowledged a position to Postgres, or
   `None` if it never has. `None` and `Some(0)` are kept deliberately distinct: a process that
   just started and one that has been stuck for an hour without ever acknowledging anything
@@ -400,11 +404,16 @@ exact same positions it printed while healthy — the pair looks identical to a 
 one. The signal for that case is different: `streaming=false` together with a climbing
 `ack_age_s`.
 
-A content-based alert on `metrics_report` cannot see a fully unreachable server either: the
-line is only emitted from inside a running session, and a connection that never succeeds
-never reaches that point at all. Measured against a dead port: fifteen seconds produced 51
-`reconnecting` warnings and zero `metrics_report` lines. Alert on `reconnecting` itself too,
-not only on what a `metrics_report` line says.
+A `metrics_report` line comes out even while the process cannot reach the server at all, not
+only from inside a running session: the countdown to the next report is also checked once
+per poll interval during the paused wait between reconnect attempts, specifically so a line
+with `streaming=false` keeps coming out on schedule through an outage, not only right at the
+moment a session ends. Measured against a dead port: the process kept printing `reconnecting`
+warnings — how many depends on the backoff settings and the machine, tens of them over tens
+of seconds is typical — while also printing a `metrics_report` line with `streaming=false`
+roughly every ten seconds throughout. Alert on `reconnecting` itself too, not only on what a
+`metrics_report` line says: it is the one signal that starts immediately, rather than after
+the first ten-second interval elapses.
 
 ---
 

@@ -40,9 +40,15 @@ impl Default for Metrics {
     }
 }
 
-/// A field-consistent snapshot. Needed both by the periodic report and by
-/// tests: reading eight atomics separately in an assertion would mean getting
-/// values from different moments in time.
+/// A snapshot of every field `Metrics` holds, taken by `snapshot()` below as ten
+/// independent `Relaxed` loads (nine `AtomicU64` fields and one `AtomicBool`) plus one
+/// non-atomic `Instant::elapsed()` call used to turn the raw `last_ack_at_ms` load into
+/// `seconds_since_last_ack`. This is NOT a field-consistent snapshot in the sense of all
+/// ten values being read as of the same instant — each load can interleave with a
+/// concurrent writer independently of the others, the same way any `Relaxed` read can.
+/// What it does give both the periodic report and tests is a single `struct` to pass
+/// around and assert on, instead of ten separate method calls each capable of observing
+/// a different moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub events_total: u64,

@@ -581,15 +581,22 @@ INFO  slot_preflight_ok slot=pgcdc_slot restart_lsn=Some("0/192FED8") ...
 INFO  replication_started slot=pgcdc_slot publication=pgcdc_pub
 INFO  metrics_report events=3 transactions=3 bytes=395 reconnects=0 errors=0
       last_received_lsn=0/1974170 last_acknowledged_lsn=0/19741A8 buffer=0
+      streaming=true ack_age_s=Some(2)
 ```
 
-The report comes out once every ten seconds. Per-event lines are at `DEBUG`
+The report comes out once every ten seconds — including while the process has no
+connection at all: it also prints from inside the paused wait between reconnect
+attempts, specifically so `streaming=false` is something you can actually see during an
+outage, not only inferred from its absence. Per-event lines are at `DEBUG`
 (`RUST_LOG=debug`), because at a thousand transactions a second that is a thousand lines a second.
 
 Warning signs:
 - `buffer` does not drop to zero — an open transaction is stuck;
 - `last_received_lsn` grows while `last_acknowledged_lsn` stands still — we are not reaching the barrier;
 - `reconnects` grows steadily — something is tearing the connection;
+- `streaming=false` together with a climbing `ack_age_s` — the pair above looks identical
+  to a healthy, idle process while disconnected, since neither position moves either way;
+  this is the signal that tells the two apart;
 - `error_kind="slot_unusable"` or `"slot_busy_timed_out"` — the process is about to exit with a 1,
   and that is right.
 
