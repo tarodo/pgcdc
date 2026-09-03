@@ -328,11 +328,28 @@ Eight counters, all `AtomicU64` (`src/metrics.rs`):
 | `last_acknowledged_lsn` | last position acknowledged to Postgres — our own decision, not the slot's state |
 | `transaction_buffer_size` | changes buffered in an open transaction — a gauge; must fall to zero on commit and on reconnect |
 
-A `metrics_report` line carrying all eight goes out at **INFO** every ten seconds. The
-interval is not configurable: it is volume, not behavior.
+Two more fields ride in the same `metrics_report` line. They are not counters — they are
+observations of state, which is why they get a description here instead of a ninth and tenth
+row above:
+
+- `streaming` — whether a replication session is running right now. It is written `true`
+  once a session actually starts, and `false` on every one of the ways a session or the
+  process itself can stop again — a disconnect, a recoverable error, a clean shutdown, and
+  a fatal error alike — because a gauge only success updates reports health nobody has
+  actually observed. The line carrying `streaming=false` is not limited to the moment a
+  session just ended, either: it also comes out periodically while the process sits with
+  no connection at all, retrying against a server that is not answering — see "That first
+  pair misses a disconnected process" below.
+- `ack_age_s` — seconds since this process last acknowledged a position to Postgres, or
+  `None` if it never has. `None` and `Some(0)` are kept deliberately distinct: a process that
+  just started and one that has been stuck for an hour without ever acknowledging anything
+  must not read the same.
+
+A `metrics_report` line carrying all eight counters plus these two goes out at **INFO** every
+ten seconds. The interval is not configurable: it is volume, not behavior.
 
 ```text
-INFO metrics_report events=3 transactions=3 bytes=395 reconnects=0 errors=0 last_received_lsn=0/1974170 last_acknowledged_lsn=0/19741A8 buffer=0
+INFO metrics_report events=3 transactions=3 bytes=395 reconnects=0 errors=0 last_received_lsn=0/1974170 last_acknowledged_lsn=0/19741A8 buffer=0 streaming=true ack_age_s=Some(2)
 ```
 
 Once per replication session — on a cold start and on every reconnect — the pre-flight
@@ -380,6 +397,23 @@ This holds for every log line at every level.
 
 Worth alerting on: `last_received_lsn` advancing while `last_acknowledged_lsn` stands still;
 `transaction_buffer_size` that never returns to zero; a steadily climbing `reconnects_total`.
+
+**That first pair misses a disconnected process.** While the connection is down neither
+position moves at all, so a process that lost its connection an hour ago keeps printing the
+exact same positions it printed while healthy — the pair looks identical to a healthy, idle
+one. The signal for that case is different: `streaming=false` together with a climbing
+`ack_age_s`.
+
+A `metrics_report` line comes out even while the process cannot reach the server at all, not
+only from inside a running session: the countdown to the next report is also checked once
+per poll interval during the paused wait between reconnect attempts, specifically so a line
+with `streaming=false` keeps coming out on schedule through an outage, not only right at the
+moment a session ends. Measured against a dead port: the process kept printing `reconnecting`
+warnings — how many depends on the backoff settings and the machine, tens of them over tens
+of seconds is typical — while also printing a `metrics_report` line with `streaming=false`
+roughly every ten seconds throughout. Alert on `reconnecting` itself too, not only on what a
+`metrics_report` line says: it is the one signal that starts immediately, rather than after
+the first ten-second interval elapses.
 
 ---
 

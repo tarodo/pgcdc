@@ -463,6 +463,51 @@ fn session_was_productive(tracker: &LsnTracker, acked_before: Lsn) -> bool {
     tracker.acked() > acked_before
 }
 
+/// What `run()`'s outer loop should do next, decided once from the outcome of
+/// one session.
+#[derive(Debug)]
+enum LoopAction {
+    /// Keep looping: the outer loop decides how long to back off.
+    Reconnect,
+    /// A clean shutdown: `run()` returns `Ok(())`.
+    Stop,
+    /// A fatal error: `run()` propagates it.
+    Abort(PgcdcError),
+}
+
+/// Turns one session's outcome into a `LoopAction`, clearing the streaming
+/// gauge on the way. Pulled out of `run()`'s loop body for the same reason as
+/// `classify_start_outcome`/`session_was_productive` above: a first attempt
+/// at this put `metrics.set_streaming(false)` textually after the `match`
+/// that used to sit directly in `run()` — which reads as "runs for every
+/// outcome" but doesn't, because two of that match's arms `return` before
+/// reaching a line placed after it. That version shipped, a reviewer caught
+/// it against a live SIGTERM and a live fatal error, and both times the
+/// caller's own `Arc<Metrics>` was left showing a stale `streaming = true`.
+/// Here the call is the FIRST line of this function, before the match that
+/// decides what happens next — there is no arm left for an edit to add that
+/// could skip it, and the four cases below are pinned individually by a
+/// value-level unit test that needs neither a live Postgres nor a real
+/// signal to exercise the two arms (`Stop`, `Abort`) that used to be missed.
+fn handle_session_outcome(
+    outcome: Result<SessionOutcome, PgcdcError>,
+    metrics: &Metrics,
+) -> LoopAction {
+    metrics.set_streaming(false);
+    match outcome {
+        Ok(SessionOutcome::ShutdownRequested) => LoopAction::Stop,
+        Ok(SessionOutcome::Disconnected) => LoopAction::Reconnect,
+        // Recoverable errors lead into a reconnect, fatal ones out.
+        // The classification lives in the type (`is_fatal`), not in parsing text.
+        Err(e) if !e.is_fatal() => {
+            warn!(error = %e, error_kind = e.kind(), "postgres_connection_lost");
+            metrics.add_error();
+            LoopAction::Reconnect
+        }
+        Err(e) => LoopAction::Abort(e),
+    }
+}
+
 /// The pause before the next connection attempt. Wrapped in a type rather than a bare
 /// `Duration` living inside the infinite loop of `run()` with real `sleep`s — for
 /// testability: in that form the mutation "remove the reset" was caught by no test at
@@ -545,6 +590,16 @@ async fn acknowledge_durable(
         .await
         .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
 
+    // Only now, after the send has actually gone out: `Metrics::note_acknowledged_now`'s
+    // own doc comment says "after a position has actually been acknowledged to the
+    // server", and until this line the call sat before `send_feedback` instead of after
+    // it — a failed send left the ack-age clock freshly reset over an acknowledgement the
+    // server never received, the opposite of what the gauge exists to report during an
+    // outage. `set_last_acknowledged_lsn` above stays where it is: that position is the
+    // tracker's own decision about what it will feedback next, not a claim about what the
+    // peer has seen, and moving it would not change what this call fixes.
+    metrics.note_acknowledged_now();
+
     Ok(acked)
 }
 
@@ -567,6 +622,42 @@ async fn flush_and_acknowledge(
     Ok(())
 }
 
+/// Clears the streaming gauge when dropped — including a drop that is not a `return` at
+/// all. `handle_session_outcome` clears the gauge on every one of the four ways a
+/// *session* can end, but there is a fifth way `run()` itself can stop running that never
+/// reaches it: the caller cancelling the task this future is spawned on
+/// (`handle.abort()`), or losing a race arm in a `tokio::select!` wrapped around this
+/// call. Reproduced directly: spawn `run()`, wait for `set_streaming(true)` to land, then
+/// `abort()` the task — the snapshot shows `streaming: true` forever after, because
+/// dropping the future mid-`.await` skips every line of code that would otherwise have
+/// cleared it, and there is nothing left running to ever flip it back. `run()` is a
+/// public entry point of the library, not just the binary's `main` (which never cancels
+/// it), so a caller embedding this crate and racing it against something else is not a
+/// hypothetical.
+///
+/// Chosen over documenting this as a known limitation in DECISIONS.md Q33: the fix costs
+/// one field and a five-line `Drop` impl, an async fn's local variables are already
+/// dropped in place when its generated Future is dropped mid-poll (the same mechanism
+/// that makes `flush_and_acknowledge` on the shutdown path cancel-safe to begin with), and
+/// unlike the shutdown/fatal-error paths this one has no return value to carry a caveat
+/// on — a doc comment on `run()` would be advice a caller has to remember to act on, while
+/// this is simply always true. Holds a clone of the `Arc`, not a borrow of it: the whole
+/// point is for the caller's own `Arc<Metrics>` to read `false` after the task is gone, so
+/// borrowing back into that same value would not even typecheck.
+///
+/// Idempotent by construction, not just by accident: on every ordinary exit path
+/// `handle_session_outcome` has already set the gauge to `false` before `run()` returns,
+/// so the guard's own drop on the way out is a second, harmless write of the same value —
+/// verified by `streaming_guard_clears_the_gauge_on_an_abrupt_drop_not_just_a_return`
+/// below, which checks the drop fires even when nothing else in `run()` ever ran.
+struct StreamingGuard(Arc<Metrics>);
+
+impl Drop for StreamingGuard {
+    fn drop(&mut self) {
+        self.0.set_streaming(false);
+    }
+}
+
 pub async fn run(
     config: Config,
     mut sink: Box<dyn Sink>,
@@ -575,6 +666,11 @@ pub async fn run(
     // First of all — before any connection and any log where the string could surface.
     config.database_url.validate()?;
     config.validate_reconnect_bounds()?;
+
+    // See `StreamingGuard`'s own doc comment: this is what makes `streaming` come back
+    // down to `false` even when `run()` stops running via a cancelled task or a lost
+    // `select!` race, neither of which ever reaches `handle_session_outcome`.
+    let _streaming_guard = StreamingGuard(metrics.clone());
 
     let mut state = SessionState::new(config.max_transaction_events);
     let mut backoff = ReconnectBackoff::new(
@@ -632,7 +728,7 @@ pub async fn run(
 
         let acked_before = state.tracker.acked();
 
-        match stream_once(
+        let outcome = stream_once(
             &config,
             &mut sink,
             &mut state,
@@ -641,17 +737,15 @@ pub async fn run(
             &mut last_report,
             &mut slot_busy_patience,
         )
-        .await
-        {
-            Ok(SessionOutcome::ShutdownRequested) => return Ok(()),
-            Ok(SessionOutcome::Disconnected) => {}
-            // Recoverable errors lead into a reconnect, fatal ones out.
-            // The classification lives in the type (`is_fatal`), not in parsing text.
-            Err(e) if !e.is_fatal() => {
-                warn!(error = %e, error_kind = e.kind(), "postgres_connection_lost");
-                metrics.add_error();
-            }
-            Err(e) => return Err(e),
+        .await;
+
+        // handle_session_outcome clears the streaming gauge as its first
+        // action, before deciding what happens next — see its doc comment
+        // for why that used to be a separate, skippable line here instead.
+        match handle_session_outcome(outcome, &metrics) {
+            LoopAction::Stop => return Ok(()),
+            LoopAction::Reconnect => {}
+            LoopAction::Abort(e) => return Err(e),
         }
 
         // The productivity flag is pulled out into `session_was_productive`: the
@@ -684,6 +778,15 @@ pub async fn run(
             if shutdown.load(Ordering::Relaxed) {
                 return Ok(());
             }
+            // The other of `maybe_report`'s two call sites (the first is inside
+            // `stream_once`'s loop): while the outer loop is stuck here — no
+            // connection, no session, nothing for the in-session call site to run
+            // inside of — this is the only place left that can print a report at
+            // all, and it is exactly the place where `streaming=false` needs to be
+            // observable. Checked every chunk, same as the shutdown flag above, so
+            // the report comes out within one poll interval of the ten-second mark
+            // rather than only once per whole (possibly much longer) backoff pause.
+            maybe_report(&metrics, &mut last_report);
             let chunk = remaining.min(SHUTDOWN_POLL_INTERVAL);
             tokio::time::sleep(chunk).await;
             remaining = remaining.saturating_sub(chunk);
@@ -711,6 +814,40 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// but volume, and ten seconds is the compromise between "you can see the process is
 /// alive" and "the log does not get flooded" (DECISIONS Q23).
 const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Prints the `metrics_report` line once `METRICS_REPORT_INTERVAL` has elapsed since the
+/// last one — from wherever it is called. Pulled out of `stream_once`'s loop (its
+/// original and, until this fix, only call site) so that `run()`'s outer loop can call it
+/// too, from inside the sliced backoff pause: without a second call site, `streaming` in
+/// this line could never be observed as `false` by a live reader, because the only place
+/// that ever printed it was a loop that runs entirely between `set_streaming(true)` and
+/// the return that leads into `set_streaming(false)` — a reviewer measured this directly,
+/// stopping Postgres for 32 seconds and getting three summaries in that window, all three
+/// `streaming=true`, and zero summaries during the outage itself. `last_report` is one
+/// `Instant` the two call sites share (`run()` owns it and lends it to `stream_once` by
+/// mutable reference for the length of one session) — sharing it, rather than each site
+/// keeping its own countdown, is what keeps this from double-printing at the boundary
+/// between a session ending and the backoff pause starting.
+fn maybe_report(metrics: &Metrics, last_report: &mut tokio::time::Instant) {
+    if last_report.elapsed() < METRICS_REPORT_INTERVAL {
+        return;
+    }
+    *last_report = tokio::time::Instant::now();
+    let s = metrics.snapshot();
+    info!(
+        events = s.events_total,
+        transactions = s.transactions_total,
+        bytes = s.bytes_received_total,
+        reconnects = s.reconnects_total,
+        errors = s.errors_total,
+        last_received_lsn = %Lsn(s.last_received_lsn),
+        last_acknowledged_lsn = %Lsn(s.last_acknowledged_lsn),
+        buffer = s.transaction_buffer_size,
+        streaming = s.streaming,
+        ack_age_s = ?s.seconds_since_last_ack,
+        "metrics_report"
+    );
+}
 
 /// One replication session: pre-flight check, connect, loop. Returns on a connection
 /// drop or on an orderly shutdown.
@@ -832,6 +969,7 @@ async fn stream_once(
         Instant::now(),
     )?;
     info!(slot = %config.slot, publication = %config.publication, "replication_started");
+    metrics.set_streaming(true);
 
     if reconnecting {
         // Only now: the stream is genuinely open and started by the server. Logging this
@@ -868,22 +1006,11 @@ async fn stream_once(
         // The metrics report at INFO once per METRICS_REPORT_INTERVAL — not on every
         // event (that is at DEBUG, below). It sits at the start of a loop turn, outside
         // the order write→processed→(timer)barrier→durable→ack→feedback, because it only
-        // reads a snapshot and affects nothing (§16, DECISIONS Q23).
-        if last_report.elapsed() >= METRICS_REPORT_INTERVAL {
-            *last_report = tokio::time::Instant::now();
-            let s = metrics.snapshot();
-            info!(
-                events = s.events_total,
-                transactions = s.transactions_total,
-                bytes = s.bytes_received_total,
-                reconnects = s.reconnects_total,
-                errors = s.errors_total,
-                last_received_lsn = %Lsn(s.last_received_lsn),
-                last_acknowledged_lsn = %Lsn(s.last_acknowledged_lsn),
-                buffer = s.transaction_buffer_size,
-                "metrics_report"
-            );
-        }
+        // reads a snapshot and affects nothing (§16, DECISIONS Q23). This is one of TWO
+        // call sites for `maybe_report` — the other is the backoff pause in `run()`, for
+        // exactly the case this loop cannot cover: no session, no loop turn to sit at the
+        // start of.
+        maybe_report(metrics, last_report);
 
         // A bounded read is safe here because production runs on the multi-threaded
         // runtime: the transport picks the Inline driver by the runtime flavor, and its
@@ -966,6 +1093,71 @@ async fn stream_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // handle_session_outcome: one test per arm, all four. The two that
+    // matter most are `ShutdownRequested` and a fatal `Err` — both `return`
+    // out of `run()`'s loop before the point where a previous version of
+    // this code cleared the streaming gauge, so both were the ones a
+    // reviewer caught still reporting `streaming: true` on a live SIGTERM
+    // and a live fatal error. Fixed here by moving the gauge write to the
+    // first line of this function, ahead of the match entirely — these
+    // tests exercise that guarantee directly, without a live Postgres or a
+    // real signal.
+
+    #[test]
+    fn shutdown_requested_clears_streaming_and_stops_the_loop() {
+        let metrics = Metrics::new();
+        metrics.set_streaming(true);
+        let action = handle_session_outcome(Ok(SessionOutcome::ShutdownRequested), &metrics);
+        assert!(
+            !metrics.snapshot().streaming,
+            "a clean shutdown must not leave streaming stuck at true for a caller \
+             still holding this Arc<Metrics> after run() returns"
+        );
+        assert!(matches!(action, LoopAction::Stop), "{action:?}");
+    }
+
+    #[test]
+    fn disconnected_clears_streaming_and_asks_to_reconnect() {
+        let metrics = Metrics::new();
+        metrics.set_streaming(true);
+        let action = handle_session_outcome(Ok(SessionOutcome::Disconnected), &metrics);
+        assert!(!metrics.snapshot().streaming, "{:?}", metrics.snapshot());
+        assert!(matches!(action, LoopAction::Reconnect), "{action:?}");
+    }
+
+    #[test]
+    fn a_recoverable_error_clears_streaming_counts_it_and_asks_to_reconnect() {
+        let metrics = Metrics::new();
+        metrics.set_streaming(true);
+        let action = handle_session_outcome(
+            Err(PgcdcError::Connection("connection reset by peer".into())),
+            &metrics,
+        );
+        assert!(!metrics.snapshot().streaming, "{:?}", metrics.snapshot());
+        assert_eq!(metrics.snapshot().errors_total, 1);
+        assert!(matches!(action, LoopAction::Reconnect), "{action:?}");
+    }
+
+    #[test]
+    fn a_fatal_error_clears_streaming_and_aborts_the_loop() {
+        let metrics = Metrics::new();
+        metrics.set_streaming(true);
+        let action =
+            handle_session_outcome(Err(PgcdcError::TransactionTooLarge { limit: 2 }), &metrics);
+        assert!(
+            !metrics.snapshot().streaming,
+            "a fatal error must not leave streaming stuck at true for a caller \
+             still holding this Arc<Metrics> after run() returns with Err"
+        );
+        assert!(
+            matches!(
+                action,
+                LoopAction::Abort(PgcdcError::TransactionTooLarge { limit: 2 })
+            ),
+            "{action:?}"
+        );
+    }
 
     #[test]
     fn start_replication_rejected_by_the_server_is_fatal_wrong_plugin() {
@@ -1727,6 +1919,224 @@ mod tests {
             metrics.snapshot().transaction_buffer_size,
             0,
             "the gauge MUST fall to zero along with the reset of the assembler"
+        );
+    }
+
+    // I1: StreamingGuard.
+
+    #[test]
+    fn streaming_guard_clears_the_gauge_on_an_abrupt_drop_not_just_a_return() {
+        // The scenario `run()` itself cannot cover: nothing after the guard's
+        // construction ever runs (no session, no `handle_session_outcome`, no
+        // `return`) — the drop below stands in for a cancelled task or a lost
+        // `select!` race, both of which tear down `run()`'s Future the same way,
+        // by dropping it mid-poll without executing another line of its body.
+        let metrics = Arc::new(Metrics::new());
+        metrics.set_streaming(true);
+        {
+            let _guard = StreamingGuard(metrics.clone());
+            assert!(
+                metrics.snapshot().streaming,
+                "must still read true while the guard is alive and nothing has failed yet"
+            );
+        }
+        assert!(
+            !metrics.snapshot().streaming,
+            "the drop, not a return, must be what clears it"
+        );
+    }
+
+    #[test]
+    fn streaming_guard_drop_is_a_harmless_no_op_when_the_gauge_is_already_false() {
+        // The ordinary exit path: handle_session_outcome has already cleared the
+        // gauge before run() returns, so the guard's own drop on the way out just
+        // writes the same value again. Pinned so a future change cannot assume the
+        // guard is only ever meaningful on the abrupt path above.
+        let metrics = Arc::new(Metrics::new());
+        drop(StreamingGuard(metrics.clone()));
+        assert!(!metrics.snapshot().streaming);
+    }
+
+    // I2: a failed acknowledgement must not start the ack-age clock.
+
+    /// Drives `acknowledge_durable` against a real, then abruptly killed, Postgres —
+    /// directly, not through `stream_once`'s loop. Inside that loop the read
+    /// (`next_raw_event`) and the ack-interval flush both watch the same connection on
+    /// every turn, so a live reproduction through the full loop would be racing the read
+    /// against the flush for whichever one notices the dead connection first — and the
+    /// read, being in flight almost continuously, wins that race in practice, making the
+    /// scenario this test needs (the flush is the one that finds out) unreachable through
+    /// the loop with any reliability. Calling the function directly removes the race:
+    /// nothing else is watching this connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_feedback_send_does_not_start_the_ack_age_clock() {
+        use testcontainers::core::{IntoContainerPort, WaitFor};
+        use testcontainers::runners::AsyncRunner;
+        use testcontainers::{GenericImage, ImageExt};
+
+        let container = GenericImage::new("postgres", "16-alpine")
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
+            .with_env_var("POSTGRES_DB", "app")
+            .with_cmd([
+                "postgres",
+                "-c",
+                "wal_level=logical",
+                "-c",
+                "max_replication_slots=10",
+                "-c",
+                "max_wal_senders=10",
+            ])
+            .start()
+            .await
+            .expect("start postgres");
+        let port = container
+            .get_host_port_ipv4(5432.tcp())
+            .await
+            .expect("port");
+        let conn = format!("postgres://postgres:postgres@127.0.0.1:{port}/app");
+
+        let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "CREATE TABLE t (id INT PRIMARY KEY);
+                 CREATE PUBLICATION pgcdc_pub FOR TABLE t;",
+            )
+            .await
+            .expect("schema and publication");
+        // Separate from the batch above: `pg_create_logical_replication_slot`
+        // refuses to run inside a transaction that has already performed
+        // writes, and `batch_execute` sends its whole string as one implicit
+        // transaction block.
+        client
+            .query(
+                "SELECT pg_create_logical_replication_slot('pgcdc_slot', 'pgoutput')",
+                &[],
+            )
+            .await
+            .expect("create slot");
+
+        let stream_config = ReplicationStreamConfig::new(
+            "pgcdc_slot".to_string(),
+            "pgcdc_pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_binary(false)
+        .with_messages(false);
+        let mut stream = LogicalReplicationStream::new(&replication_url(&conn), stream_config)
+            .await
+            .expect("open replication stream");
+        stream.start(None).await.expect("start replication");
+
+        client
+            .execute("INSERT INTO t VALUES (1)", &[])
+            .await
+            .expect("insert");
+
+        // send_feedback() is a documented no-op while nothing has been received yet
+        // (pg_walstream short-circuits on last_received_lsn == 0), so a real
+        // acknowledgement below can only succeed once real data has actually arrived.
+        let cancel = CancellationToken::new();
+        loop {
+            tokio::time::timeout(Duration::from_secs(10), stream.next_raw_event(&cancel))
+                .await
+                .expect("timed out waiting for the insert to arrive")
+                .expect("read a raw event");
+            if stream.current_lsn() > 0 {
+                break;
+            }
+        }
+
+        let metrics = Arc::new(Metrics::new());
+        let mut state = SessionState::new(100_000);
+        let durable = Lsn(stream.current_lsn());
+
+        // A genuine, successful acknowledgement while the connection is still healthy —
+        // there has to be a real "last successful ack" on record for the assertion below
+        // to mean anything: without one, a bug that leaves the age at `None` after a
+        // failure would be indistinguishable from correct behavior that also leaves it at
+        // `None` for the unrelated reason that nothing had ever succeeded yet.
+        acknowledge_durable(&mut state, &mut stream, durable, &metrics)
+            .await
+            .expect("the connection is still healthy at this point");
+        assert_eq!(metrics.snapshot().seconds_since_last_ack, Some(0));
+
+        // Long enough that "the age kept climbing from here" and "the age was reset to
+        // fresh by the failed attempt below" are distinguishable at the one-second
+        // resolution `seconds_since_last_ack` actually has.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Drop the connection from the server side. Killing the whole container was tried
+        // first and rejected: it tears down the network path entirely, so a write into the
+        // local socket buffer keeps silently "succeeding" for as long as TCP keeps
+        // retransmitting into the void — empirically confirmed still true half a second
+        // later. A live Postgres process closing its end of the socket is different: once
+        // that backend is gone, the port on its end is genuinely unowned, and the next
+        // segment we send into it comes back as a real RST.
+        client
+            .execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE backend_type = 'walsender'",
+                &[],
+            )
+            .await
+            .expect("terminate walsender");
+
+        // Even so, the very NEXT write is not guaranteed to observe it: `pg_terminate_backend`
+        // only sends the signal, it does not wait for the backend to actually exit, and even
+        // once it has, a single `write()` succeeds by handing bytes to the local kernel
+        // buffer — it does not wait for the peer's RST for that specific segment to come
+        // back first. Empirically this warm-up loop needed more than one attempt every time
+        // in manual runs: retrying gives the RST time to land and be reflected in the
+        // socket's own error state. A THROWAWAY `Metrics` absorbs these warm-up attempts —
+        // some of which may well succeed correctly before the connection's local error state
+        // catches up, and correctly updating the age on a genuine success is not the bug this
+        // test is after — so the real `metrics` below observes only the one call that matters.
+        let scratch_metrics = Arc::new(Metrics::new());
+        let mut confirmed_broken = false;
+        for _ in 0..50 {
+            if acknowledge_durable(&mut state, &mut stream, durable, &scratch_metrics)
+                .await
+                .is_err()
+            {
+                confirmed_broken = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            confirmed_broken,
+            "the connection never actually failed within the retry budget"
+        );
+
+        // The connection's brokenness is a property of the socket, not of which `Metrics`
+        // is passed in — so this call, now that the warm-up loop above has confirmed the
+        // socket is in a failing state, is not racing anything: it inherits that same state.
+        let result = acknowledge_durable(&mut state, &mut stream, durable, &metrics).await;
+        assert!(
+            result.is_err(),
+            "expected the already-confirmed-broken connection to keep failing: {result:?}"
+        );
+
+        let age = metrics.snapshot().seconds_since_last_ack;
+        assert!(
+            matches!(age, Some(s) if s >= 1),
+            "a failed send must not start the ack-age clock: the age must still reflect the \
+             earlier, genuinely successful acknowledgement (>= 1s old by now), not this \
+             failed attempt — got {age:?}"
         );
     }
 }

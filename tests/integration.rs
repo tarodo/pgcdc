@@ -3116,21 +3116,29 @@ async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect(
     );
 
     // Wait for the report line, no more than 20 seconds from process start.
+    // The line itself is captured, not just its presence: this is the
+    // cheapest place to also pin the two fields this task adds to it
+    // (`streaming`, `ack_age_s`) — the wait for the interval is already
+    // paid for by the timing assertions below, so checking the field names
+    // land correctly costs nothing extra.
     let mut t_report = None;
+    let mut report_line = None;
     while t_start.elapsed() < Duration::from_secs(20) {
-        if lines
+        if let Some(line) = lines
             .lock()
             .unwrap()
             .iter()
-            .any(|l| l.contains("metrics_report"))
+            .find(|l| l.contains("metrics_report"))
         {
             t_report = Some(t_start.elapsed());
+            report_line = Some(line.clone());
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let t_report = t_report
         .expect("the metrics_report line did not appear within 20 seconds of process start");
+    let report_line = report_line.expect("t_report is Some only alongside report_line");
 
     assert!(
         t_report >= Duration::from_secs(9),
@@ -3145,5 +3153,334 @@ async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect(
         t_reconnected + Duration::from_secs(10)
     );
 
+    // By the time this line is printed the session has been reconnected and
+    // streaming for several seconds, and the earlier INSERT was long since
+    // acknowledged (the default ack interval is 200ms) — so a correctly
+    // wired report reads `streaming=true` and a `Some` age, not `None`.
+    assert!(
+        report_line.contains("streaming=true"),
+        "the report must carry the streaming gauge: {report_line}"
+    );
+    assert!(
+        report_line.contains("ack_age_s=Some("),
+        "an acknowledgement already happened, so the age must be Some, not None: {report_line}"
+    );
+
     let _ = std::fs::remove_file(&out);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_report_shows_streaming_false_against_a_dead_port() {
+    // C1: before this fix, `maybe_report` (then not even its own function —
+    // just an inline block) had exactly ONE call site, inside `stream_once`'s
+    // own per-session loop, reached only once `START_REPLICATION` had already
+    // succeeded and `set_streaming(true)` had already run. A genuinely dead
+    // port never gets there at all, and the one call site that DID run —
+    // `handle_session_outcome`, on the way back OUT of a session — never
+    // prints anything. So every `metrics_report` line the process could ever
+    // produce was, by construction, printed while `streaming` was `true`:
+    // confirmed empirically before this fix, pointed at `127.0.0.1:1` with
+    // short backoff bounds, the process printed dozens of "reconnecting"
+    // lines over tens of seconds and not one "metrics_report" line — and a
+    // reviewer's own live run against a stopped Postgres got three summaries
+    // across 65 seconds, all three `streaming=true`, zero summaries during
+    // the 32-second outage itself.
+    //
+    // The fix gives `maybe_report` a second call site inside the sliced
+    // backoff pause in `run()`'s outer loop — see its doc comment — which is
+    // exactly what this test is pinning: port 1 never listens on any
+    // ordinary machine, so preflight fails immediately and predictably, no
+    // Postgres container is needed, and the process spends the entire test
+    // sitting in that backoff pause with no session at all.
+    let mut child = common::KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+            .args([
+                "--database-url",
+                "postgres://u:p@127.0.0.1:1/db",
+                "--publication",
+                "pgcdc_pub",
+                "--slot",
+                "pgcdc_slot",
+                "--reconnect-initial-ms",
+                "50",
+                "--reconnect-max-ms",
+                "3000",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the binary"),
+    );
+
+    let stderr = child.stderr.take().expect("stderr was requested as piped");
+    let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lines_writer = lines.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            lines_writer.lock().unwrap().push(line);
+        }
+    });
+
+    // METRICS_REPORT_INTERVAL is a fixed ten seconds, not configurable — this
+    // test is slow by construction, and there is no cheap proxy (unlike a
+    // backoff-delay field) to poll faster on. The budget is a generous 30s,
+    // not a tight one: it exists to fail loudly if the report never comes at
+    // all, not to pin the exact latency.
+    let start = std::time::Instant::now();
+    let mut found = None;
+    for _ in 0..600 {
+        if let Some(line) = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|l| l.contains("metrics_report") && l.contains("streaming=false"))
+        {
+            found = Some(line.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let elapsed = start.elapsed();
+    eprintln!(
+        "metrics_report_shows_streaming_false_against_a_dead_port: first \
+         streaming=false metrics_report seen after {elapsed:?}: {found:?}"
+    );
+    assert!(
+        found.is_some(),
+        "no metrics_report line with streaming=false within 30 seconds, saw: {:?}",
+        lines.lock().unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_streaming_flag_goes_false_when_the_session_is_lost() {
+    // This test predates C1 and was written when reading `streaming=false`
+    // off an actual `metrics_report` line against a dead port was provably
+    // impossible (see the superseded comment this replaced, still visible in
+    // history, and `metrics_report_shows_streaming_false_against_a_dead_port`
+    // above, which now covers exactly that scenario). It is kept anyway: it
+    // pins the gauge itself through the same `Arc<Metrics>` `run()` takes —
+    // the same handle any other consumer (a future `/metrics` route, a
+    // health check) would read — rather than through one specific log line,
+    // and it does so in well under a second instead of waiting out the fixed
+    // ten-second report interval.
+    //
+    // It drives a REAL disconnect (not a dead port) precisely so the flag has
+    // genuinely been `true` beforehand: against a target that can never
+    // stream at all, the flag would stay `false` from its default for a
+    // reason unrelated to `set_streaming(false)`, and deleting that call
+    // would go unnoticed — exactly the "false only because nothing ever set
+    // it true" trap the task brief warns about.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let mut cfg = config(&conn);
+    // Long enough that the false window comfortably outlasts test-loop
+    // scheduling jitter, short enough that the whole test stays well under
+    // a second past setup.
+    cfg.reconnect_initial_ms = 200;
+    cfg.reconnect_max_ms = 500;
+
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let run_metrics = metrics.clone();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        let _ =
+            pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx, None)), run_metrics)
+                .await;
+    });
+
+    let mut became_true = false;
+    for _ in 0..100 {
+        if metrics.snapshot().streaming {
+            became_true = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        became_true,
+        "the flag never went true after a real connection: {:?}",
+        metrics.snapshot()
+    );
+
+    // The failure this task closes: a session ending for a reason other
+    // than a clean shutdown.
+    common::terminate_replication_backend(&client).await;
+
+    let mut became_false = false;
+    for _ in 0..100 {
+        if !metrics.snapshot().streaming {
+            became_false = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        became_false,
+        "the flag stayed true after the session was lost: {:?}",
+        metrics.snapshot()
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_streaming_flag_goes_false_after_a_fatal_error() {
+    // Round 1 review finding: `metrics.set_streaming(false)` sat textually
+    // after the `match` in `run()`'s loop, which reads as "runs for every
+    // outcome of stream_once" but does not — two of that match's four arms
+    // `return` before ever reaching a line placed after it:
+    // `Ok(SessionOutcome::ShutdownRequested) => return Ok(())` and
+    // `Err(e) => return Err(e)` (the fatal branch). The reviewer reproduced
+    // both live: a real SIGTERM during an active stream, and a real fatal
+    // `TransactionTooLarge`. Both left the caller's own `Arc<Metrics>`
+    // reporting a stale `streaming: true` after `run()` had already
+    // returned — `run` is a public library entry point that takes that
+    // `Arc` FROM the caller, so a consumer that outlives one call to it (a
+    // health check, a future `/metrics` route) would see exactly the
+    // "idle indistinguishable from working" confusion this whole task
+    // exists to close, just through the fatal-error door instead of the
+    // reconnect-loop door.
+    //
+    // The fix moved the gauge write to the first line of a new
+    // `handle_session_outcome`, ahead of its own match entirely, so there is
+    // no arm left to skip it in — pinned directly by four unit tests next to
+    // that function (`postgres::replication::tests`), including the two that
+    // used to be missed. This test proves the same thing end to end, through
+    // the real `run()` + `stream_once`, for the fatal-error arm specifically
+    // (the reviewer's own suggested reproduction: `max_transaction_events`
+    // set low enough that a real transaction trips it). The clean-shutdown
+    // arm is NOT exercised this way here: doing that would mean sending a
+    // real SIGTERM to this test binary's own process, and roughly two dozen
+    // OTHER tests in this same file also call `run()` in-process — a signal
+    // registered via `tokio::signal::unix::signal` fans out to every such
+    // listener in the process, not just the one under test, so a live
+    // self-signal here risks tearing down whichever of those happens to be
+    // mid-flight concurrently. Every existing SIGTERM test in this suite
+    // sends the signal to a SEPARATE spawned process for exactly this
+    // reason; that convention is kept here rather than being the one test
+    // that breaks it. The unit test covers the ShutdownRequested arm
+    // instead, at no risk and no cost.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let mut cfg = config(&conn);
+    cfg.max_transaction_events = 2;
+
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let run_metrics = metrics.clone();
+    let (tx_send, _rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None)), run_metrics)
+            .await
+    });
+
+    // It must genuinely have been streaming first — same reasoning as the
+    // disconnect test above: against a target that never starts at all,
+    // "streaming ends up false" would be true for the wrong reason.
+    let mut became_true = false;
+    for _ in 0..100 {
+        if metrics.snapshot().streaming {
+            became_true = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        became_true,
+        "the flag never went true after a real connection: {:?}",
+        metrics.snapshot()
+    );
+
+    client
+        .execute(
+            "INSERT INTO users SELECT g, 'x', NULL, NULL FROM generate_series(1, 10) g",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        .await
+        .expect("run should finish, not hang")
+        .expect("join");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, PgcdcError::TransactionTooLarge { limit: 2 }),
+        "got {err:?}"
+    );
+
+    assert!(
+        !metrics.snapshot().streaming,
+        "streaming stayed true after a fatal error: {:?}",
+        metrics.snapshot()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aborting_run_while_streaming_clears_the_streaming_gauge_too() {
+    // I1: `handle_session_outcome` clears `streaming` on every one of the four
+    // ways a session can end, but there is a fifth way `run()` itself can
+    // stop running that never reaches it — the caller tearing the task down
+    // from outside instead of letting `run()` return on its own
+    // (`handle.abort()`, or losing a `tokio::select!` race). `run()` is a
+    // public library entry point, not just the binary's own `main` (which
+    // never cancels it), so a caller embedding this crate and racing it
+    // against something else is not hypothetical. Without `StreamingGuard`,
+    // the snapshot below stays `streaming: true` forever after `abort()`:
+    // dropping the future mid-`.await` skips every line of `run()`'s body
+    // that would otherwise have cleared it, and there is nothing left running
+    // to ever flip it back.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let cfg = config(&conn);
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let run_metrics = metrics.clone();
+    let (tx_send, _rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None)), run_metrics)
+            .await
+    });
+
+    let mut became_true = false;
+    for _ in 0..100 {
+        if metrics.snapshot().streaming {
+            became_true = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        became_true,
+        "the flag never went true after a real connection: {:?}",
+        metrics.snapshot()
+    );
+
+    handle.abort();
+    // Observe the abort actually landing rather than guessing a sleep is long
+    // enough: `JoinHandle::await` after `abort()` resolves once the task's
+    // Future has genuinely been dropped, which is the exact moment
+    // `StreamingGuard` fires.
+    let joined = handle.await;
+    assert!(
+        joined.as_ref().is_err_and(|e| e.is_cancelled()),
+        "{joined:?}"
+    );
+
+    assert!(
+        !metrics.snapshot().streaming,
+        "aborting the task must not leave streaming stuck at true forever: {:?}",
+        metrics.snapshot()
+    );
 }

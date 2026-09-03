@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 /// Process counters. Our own struct, not a facade like `metrics-rs`: a facade with
 /// no exporter attached sends values into the void, and we need them directly
@@ -6,10 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// an assertion about a counter (DECISIONS Q23). Wrapping this in an exporter later
 /// is trivial; getting observability back from a facade is not.
 ///
-/// All fields are `Relaxed`: this is observation, not synchronization. No decision
-/// in the code is made based on a counter's value, so ordering between
-/// them is unnecessary and would cost more.
-#[derive(Debug, Default)]
+/// Every *counter* is `Relaxed`: this is observation, not synchronization. No
+/// decision in the code is made based on a counter's value, so ordering between
+/// them is unnecessary and would cost more. `start` is the one exception: it is
+/// an immutable base fixed at construction, so it needs no synchronisation at all.
+#[derive(Debug)]
 pub struct Metrics {
     events_total: AtomicU64,
     transactions_total: AtomicU64,
@@ -19,11 +21,34 @@ pub struct Metrics {
     last_received_lsn: AtomicU64,
     last_acknowledged_lsn: AtomicU64,
     transaction_buffer_size: AtomicU64,
+    /// Whether a replication stream is running right now. Written on the way up
+    /// AND on the way down — a gauge only success updates reports health nobody
+    /// observed.
+    streaming: AtomicBool,
+    /// Milliseconds since `start` at the last successful acknowledgement, or 0
+    /// for "never". Stored as an offset rather than a wall-clock instant so the
+    /// whole struct stays cheap to read from any thread.
+    last_ack_at_ms: AtomicU64,
+    /// The base the offset above is measured from. Immutable after construction,
+    /// so it needs no synchronisation.
+    start: Instant,
 }
 
-/// A field-consistent snapshot. Needed both by the periodic report and by
-/// tests: reading eight atomics separately in an assertion would mean getting
-/// values from different moments in time.
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A snapshot of every field `Metrics` holds, taken by `snapshot()` below as ten
+/// independent `Relaxed` loads (nine `AtomicU64` fields and one `AtomicBool`) plus one
+/// non-atomic `Instant::elapsed()` call used to turn the raw `last_ack_at_ms` load into
+/// `seconds_since_last_ack`. This is NOT a field-consistent snapshot in the sense of all
+/// ten values being read as of the same instant — each load can interleave with a
+/// concurrent writer independently of the others, the same way any `Relaxed` read can.
+/// What it does give both the periodic report and tests is a single `struct` to pass
+/// around and assert on, instead of ten separate method calls each capable of observing
+/// a different moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub events_total: u64,
@@ -34,11 +59,26 @@ pub struct MetricsSnapshot {
     pub last_received_lsn: u64,
     pub last_acknowledged_lsn: u64,
     pub transaction_buffer_size: u64,
+    pub streaming: bool,
+    /// `None` until the first acknowledgement of this process.
+    pub seconds_since_last_ack: Option<u64>,
 }
 
 impl Metrics {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            events_total: AtomicU64::new(0),
+            transactions_total: AtomicU64::new(0),
+            bytes_received_total: AtomicU64::new(0),
+            reconnects_total: AtomicU64::new(0),
+            errors_total: AtomicU64::new(0),
+            last_received_lsn: AtomicU64::new(0),
+            last_acknowledged_lsn: AtomicU64::new(0),
+            transaction_buffer_size: AtomicU64::new(0),
+            streaming: AtomicBool::new(false),
+            last_ack_at_ms: AtomicU64::new(0),
+            start: Instant::now(),
+        }
     }
 
     pub fn add_events(&self, n: u64) {
@@ -76,6 +116,18 @@ impl Metrics {
         self.transaction_buffer_size.store(n, Ordering::Relaxed);
     }
 
+    pub fn set_streaming(&self, streaming: bool) {
+        self.streaming.store(streaming, Ordering::Relaxed);
+    }
+
+    /// Called after a position has actually been acknowledged to the server.
+    pub fn note_acknowledged_now(&self) {
+        let ms = self.start.elapsed().as_millis() as u64;
+        // Saturate at 1 so that "acknowledged in the first millisecond" is still
+        // distinguishable from "never acknowledged", which is 0.
+        self.last_ack_at_ms.store(ms.max(1), Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             events_total: self.events_total.load(Ordering::Relaxed),
@@ -86,6 +138,11 @@ impl Metrics {
             last_received_lsn: self.last_received_lsn.load(Ordering::Relaxed),
             last_acknowledged_lsn: self.last_acknowledged_lsn.load(Ordering::Relaxed),
             transaction_buffer_size: self.transaction_buffer_size.load(Ordering::Relaxed),
+            streaming: self.streaming.load(Ordering::Relaxed),
+            seconds_since_last_ack: match self.last_ack_at_ms.load(Ordering::Relaxed) {
+                0 => None,
+                at => Some((self.start.elapsed().as_millis() as u64).saturating_sub(at) / 1000),
+            },
         }
     }
 }
@@ -129,5 +186,56 @@ mod tests {
         m.set_transaction_buffer_size(17);
         m.set_transaction_buffer_size(0);
         assert_eq!(m.snapshot().transaction_buffer_size, 0);
+    }
+
+    #[test]
+    fn a_fresh_process_is_not_streaming_and_has_never_acknowledged() {
+        let m = Metrics::new();
+        let s = m.snapshot();
+        assert!(!s.streaming, "nothing has connected yet");
+        assert_eq!(
+            s.seconds_since_last_ack, None,
+            "never acknowledged is not the same as acknowledged zero seconds ago"
+        );
+    }
+
+    #[test]
+    fn the_streaming_flag_follows_failure_as_well_as_success() {
+        // The whole point: the flag must be written on the way down too. A gauge
+        // that only success updates reports health it has not observed.
+        let m = Metrics::new();
+        m.set_streaming(true);
+        assert!(m.snapshot().streaming);
+        m.set_streaming(false);
+        assert!(!m.snapshot().streaming);
+    }
+
+    #[test]
+    fn an_acknowledgement_starts_the_staleness_clock() {
+        let m = Metrics::new();
+        m.note_acknowledged_now();
+        assert_eq!(
+            m.snapshot().seconds_since_last_ack,
+            Some(0),
+            "an acknowledgement that just happened is zero seconds old, not None"
+        );
+    }
+
+    #[test]
+    fn a_sub_second_gap_does_not_round_up_to_a_whole_second() {
+        // Regression: subtracting `now / 1000` from `ack / 1000` (both floored to
+        // whole seconds first) instead of dividing the millisecond gap directly
+        // rounds a 100ms-old acknowledgement up to a full second whenever `ack`
+        // and `now` straddle a second boundary. Parking the acknowledgement just
+        // before the 1s mark and reading it back just after forces that straddle.
+        let m = Metrics::new();
+        std::thread::sleep(std::time::Duration::from_millis(950));
+        m.note_acknowledged_now();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            m.snapshot().seconds_since_last_ack,
+            Some(0),
+            "a 100ms-old acknowledgement must not report as a whole second stale"
+        );
     }
 }
