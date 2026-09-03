@@ -63,7 +63,8 @@ Or build from a checkout:
 cargo build --release
 ```
 
-The binary lands at `target/release/pgcdc`. To build the Docker image instead, see the
+A checkout build lands at `target/release/pgcdc`; `cargo install` puts it in
+`~/.cargo/bin/pgcdc`. To build the Docker image instead, see the
 `demo` profile under Quick start below.
 
 ---

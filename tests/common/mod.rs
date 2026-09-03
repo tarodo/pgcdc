@@ -72,8 +72,8 @@ pub async fn start_postgres() -> (ContainerAsync<GenericImage>, String) {
 /// checkpoint that does the marking is cheap. Verified directly against
 /// this image before use: one ~8MB insert plus one `CHECKPOINT` reliably
 /// flips a freshly created slot straight to `lost` in well under a second,
-/// matching the "reserved → lost in one step" transition this project's own
-/// lab measured (docs/superpowers/plans/2026-09-02-slot-health-preflight.md).
+/// matching the "reserved → lost in one step" transition this project
+/// measured against this image before relying on it.
 pub async fn start_postgres_with_tight_wal_retention() -> (ContainerAsync<GenericImage>, String) {
     start_postgres_with_extra_args(&[
         "-c",

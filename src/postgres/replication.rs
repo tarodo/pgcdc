@@ -1921,7 +1921,7 @@ mod tests {
         );
     }
 
-    // I1: StreamingGuard.
+    // StreamingGuard.
 
     #[test]
     fn streaming_guard_clears_the_gauge_on_an_abrupt_drop_not_just_a_return() {
@@ -1956,7 +1956,7 @@ mod tests {
         assert!(!metrics.snapshot().streaming);
     }
 
-    // I2: a failed acknowledgement must not start the ack-age clock.
+    // A failed acknowledgement must not start the ack-age clock.
 
     /// Drives `acknowledge_durable` against a real, then abruptly killed, Postgres —
     /// directly, not through `stream_once`'s loop. Inside that loop the read

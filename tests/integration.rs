@@ -3636,7 +3636,7 @@ async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn metrics_report_shows_streaming_false_against_a_dead_port() {
-    // C1: before this fix, `maybe_report` (then not even its own function —
+    // Before this fix, `maybe_report` (then not even its own function —
     // just an inline block) had exactly ONE call site, inside `stream_once`'s
     // own per-session loop, reached only once `START_REPLICATION` had already
     // succeeded and `set_streaming(true)` had already run. A genuinely dead
@@ -3722,16 +3722,17 @@ async fn metrics_report_shows_streaming_false_against_a_dead_port() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_streaming_flag_goes_false_when_the_session_is_lost() {
-    // This test predates C1 and was written when reading `streaming=false`
-    // off an actual `metrics_report` line against a dead port was provably
-    // impossible (see the superseded comment this replaced, still visible in
-    // history, and `metrics_report_shows_streaming_false_against_a_dead_port`
-    // above, which now covers exactly that scenario). It is kept anyway: it
-    // pins the gauge itself through the same `Arc<Metrics>` `run()` takes —
-    // the same handle any other consumer (a future `/metrics` route, a
-    // health check) would read — rather than through one specific log line,
-    // and it does so in well under a second instead of waiting out the fixed
-    // ten-second report interval.
+    // This test predates the fix above and was written when reading
+    // `streaming=false` off an actual `metrics_report` line against a dead
+    // port was provably impossible (see the superseded comment this replaced,
+    // still visible in history, and
+    // `metrics_report_shows_streaming_false_against_a_dead_port` above, which
+    // now covers exactly that scenario). It is kept anyway: it pins the gauge
+    // itself through the same `Arc<Metrics>` `run()` takes — the same handle
+    // any other consumer (a future `/metrics` route, a health check) would
+    // read — rather than through one specific log line, and it does so in well
+    // under a second instead of waiting out the fixed ten-second report
+    // interval.
     //
     // It drives a REAL disconnect (not a dead port) precisely so the flag has
     // genuinely been `true` beforehand: against a target that can never
@@ -3892,7 +3893,7 @@ async fn the_streaming_flag_goes_false_after_a_fatal_error() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn aborting_run_while_streaming_clears_the_streaming_gauge_too() {
-    // I1: `handle_session_outcome` clears `streaming` on every one of the four
+    // `handle_session_outcome` clears `streaming` on every one of the four
     // ways a session can end, but there is a fifth way `run()` itself can
     // stop running that never reaches it — the caller tearing the task down
     // from outside instead of letting `run()` return on its own

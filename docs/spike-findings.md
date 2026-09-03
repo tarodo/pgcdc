@@ -533,7 +533,7 @@ is cured by ten lines of our own code, not by changing the transport.
 driver by the flavor of the current tokio runtime: multi-threaded → `Inline`,
 single-threaded → `Threaded`.
 
-**Verified** (task 4 audit, review round 1, F2): on a multi-threaded runtime,
+**Verified** by a later audit, not by the original spike: on a multi-threaded runtime,
 `Inline` (copy.rs:73-88) drains the buffer it has already accumulated when a read is cancelled and
 returns the ready message if there is one — the buffer lives on the connection
 (`worker.read_buf`), not in the future that gets dropped. The crate has its
@@ -558,8 +558,7 @@ production, and not some other one. `#[tokio::main]` gives a multi-threaded runt
 `#[tokio::test]` gives a single-threaded one by default. So all integration tests
 MUST carry `flavor = "multi_thread"`, or they silently exercise a driver
 that production does not use — regardless of what that other
-driver does on cancellation. Introduced in stage 3, the wording corrected in task 4
-(review round 1, F2).
+driver does on cancellation. Introduced in stage 3, the wording corrected later.
 
 ### What next
 

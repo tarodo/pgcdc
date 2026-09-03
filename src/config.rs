@@ -145,6 +145,8 @@ pub struct Config {
     #[arg(long, env = "PGCDC_OUTPUT_PATH")]
     pub output_path: Option<std::path::PathBuf>,
 
+    /// Ceiling on how many changes one transaction may buffer before it is
+    /// refused as too large. Accepted range: 1..=4294967295 (`u32::MAX`).
     // The lower bound — 1 — is forbidden for the same reason as the interval
     // flags below: zero would refuse every transaction outright. The upper
     // bound — u32::MAX — is what makes `event_index as u32` in `Assembler`
