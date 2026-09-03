@@ -117,7 +117,11 @@ pub enum OutputKind {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "pgcdc", about = "PostgreSQL CDC via logical replication")]
+#[command(
+    name = "pgcdc",
+    version,
+    about = "PostgreSQL CDC via logical replication"
+)]
 pub struct Config {
     // hide_env_values: without it, clap prints the RAW environment variable
     // value in `--help` (`[env: PGCDC_DATABASE_URL=postgres://...:hunter2@...]`),
@@ -504,6 +508,18 @@ mod tests {
         use std::str::FromStr;
         let url = DatabaseUrl::from_str("postgres://cdc:hunter2@db.example:5432/app").unwrap();
         assert_eq!(url.expose(), "postgres://cdc:hunter2@db.example:5432/app");
+    }
+
+    #[test]
+    fn the_binary_reports_its_own_version() {
+        // A released binary that cannot say which version it is leaves an operator
+        // guessing after an install. The string comes from Cargo.toml, so it cannot
+        // drift from the crate's real version.
+        let rendered = Config::command().render_version().to_string();
+        assert!(
+            rendered.contains(env!("CARGO_PKG_VERSION")),
+            "--version must report the crate version, got: {rendered}"
+        );
     }
 
     #[test]

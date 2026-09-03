@@ -51,6 +51,14 @@ and other DDL), fetching TOAST values the server did not send, multi-database or
 
 Requires Rust 1.95+ (stable) — see Requirements above.
 
+Install a tagged release directly:
+
+```bash
+cargo install --git https://github.com/tarodo/pgcdc --tag v0.1.1
+```
+
+Or build from a checkout:
+
 ```bash
 cargo build --release
 ```
