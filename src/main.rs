@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use pgcdc::config::{Config, OutputKind};
+use pgcdc::error::PgcdcError;
 use pgcdc::metrics::Metrics;
 use pgcdc::sink::{FileSink, Sink, StdoutSink};
 use tracing::error;
@@ -40,7 +41,8 @@ async fn main() -> ExitCode {
             }
         },
         (OutputKind::File, None) => {
-            error!("--output file requires --output-path");
+            let e = PgcdcError::OutputPathRequired;
+            error!(error_kind = e.kind(), fatal = e.is_fatal(), "{e}");
             return ExitCode::FAILURE;
         }
     };

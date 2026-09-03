@@ -243,7 +243,7 @@ Every fatal condition pgcdc can detect exits non-zero. Every fatal reason carrie
 | `transaction_too_large` | a transaction exceeded `--max-transaction-events` | raise the limit or split the write |
 | `decode`, `unknown_relation`, `unsupported_message` | the protocol stream did not match expectations | a bug or a server version mismatch; report it |
 | `sink` | the output failed | check disk, permissions, downstream |
-| `invalid_database_url`, `invalid_reconnect_bounds` | bad configuration, caught before connecting | fix the flags |
+| `invalid_database_url`, `invalid_reconnect_bounds`, `output_path_required` | bad configuration, caught before connecting | fix the flags |
 | `ack_beyond_durable` | an internal invariant was violated — acknowledging past what is durable | should be unreachable; report it |
 
 ---

@@ -1377,12 +1377,22 @@ async fn file_output_without_a_path_is_rejected_by_the_binary() {
         .output()
         .expect("spawn the binary");
     assert!(!output.status.success());
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a fatal config error must produce exit code 1 (DECISIONS Q22), not 2 — this is caught \
+         by hand in main.rs, not by clap"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.is_empty(), "stdout carries only the payload");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("--output-path"),
         "the message names the missing flag: {stderr}"
+    );
+    assert!(
+        stderr.contains("output_path_required"),
+        "stderr must name the reason via the machine-readable error_kind label, got: {stderr}"
     );
 }
 

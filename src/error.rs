@@ -80,6 +80,15 @@ pub enum PgcdcError {
          retry would sleep for the ceiling duration and then collapse to it on every attempt after"
     )]
     InvalidReconnectBounds { initial: u64, max: u64 },
+
+    /// `--output-path` is only meaningful paired with `--output file`, so clap
+    /// cannot mark it plain `required`; the pairing is checked by hand in
+    /// `main.rs`, before a sink is built and before `run()` — same timing as
+    /// `InvalidDatabaseUrl` and `InvalidReconnectBounds` above, so it gets the
+    /// same treatment: a real `error_kind`, not a bare log line (README's exit
+    /// code table).
+    #[error("--output file requires --output-path")]
+    OutputPathRequired,
 }
 
 impl PgcdcError {
@@ -99,6 +108,7 @@ impl PgcdcError {
             Self::Connection(_) => "connection",
             Self::InvalidDatabaseUrl => "invalid_database_url",
             Self::InvalidReconnectBounds { .. } => "invalid_reconnect_bounds",
+            Self::OutputPathRequired => "output_path_required",
         }
     }
 
@@ -117,6 +127,7 @@ impl PgcdcError {
             Self::Connection(_) => false,
             Self::InvalidDatabaseUrl => true,
             Self::InvalidReconnectBounds { .. } => true,
+            Self::OutputPathRequired => true,
         }
     }
 }
