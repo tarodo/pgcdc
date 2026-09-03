@@ -622,6 +622,42 @@ async fn flush_and_acknowledge(
     Ok(())
 }
 
+/// Clears the streaming gauge when dropped — including a drop that is not a `return` at
+/// all. `handle_session_outcome` clears the gauge on every one of the four ways a
+/// *session* can end, but there is a fifth way `run()` itself can stop running that never
+/// reaches it: the caller cancelling the task this future is spawned on
+/// (`handle.abort()`), or losing a race arm in a `tokio::select!` wrapped around this
+/// call. Reproduced directly: spawn `run()`, wait for `set_streaming(true)` to land, then
+/// `abort()` the task — the snapshot shows `streaming: true` forever after, because
+/// dropping the future mid-`.await` skips every line of code that would otherwise have
+/// cleared it, and there is nothing left running to ever flip it back. `run()` is a
+/// public entry point of the library, not just the binary's `main` (which never cancels
+/// it), so a caller embedding this crate and racing it against something else is not a
+/// hypothetical.
+///
+/// Chosen over documenting this as a known limitation in DECISIONS.md Q33: the fix costs
+/// one field and a five-line `Drop` impl, an async fn's local variables are already
+/// dropped in place when its generated Future is dropped mid-poll (the same mechanism
+/// that makes `flush_and_acknowledge` on the shutdown path cancel-safe to begin with), and
+/// unlike the shutdown/fatal-error paths this one has no return value to carry a caveat
+/// on — a doc comment on `run()` would be advice a caller has to remember to act on, while
+/// this is simply always true. Holds a clone of the `Arc`, not a borrow of it: the whole
+/// point is for the caller's own `Arc<Metrics>` to read `false` after the task is gone, so
+/// borrowing back into that same value would not even typecheck.
+///
+/// Idempotent by construction, not just by accident: on every ordinary exit path
+/// `handle_session_outcome` has already set the gauge to `false` before `run()` returns,
+/// so the guard's own drop on the way out is a second, harmless write of the same value —
+/// verified by `streaming_guard_clears_the_gauge_on_an_abrupt_drop_not_just_a_return`
+/// below, which checks the drop fires even when nothing else in `run()` ever ran.
+struct StreamingGuard(Arc<Metrics>);
+
+impl Drop for StreamingGuard {
+    fn drop(&mut self) {
+        self.0.set_streaming(false);
+    }
+}
+
 pub async fn run(
     config: Config,
     mut sink: Box<dyn Sink>,
@@ -630,6 +666,11 @@ pub async fn run(
     // First of all — before any connection and any log where the string could surface.
     config.database_url.validate()?;
     config.validate_reconnect_bounds()?;
+
+    // See `StreamingGuard`'s own doc comment: this is what makes `streaming` come back
+    // down to `false` even when `run()` stops running via a cancelled task or a lost
+    // `select!` race, neither of which ever reaches `handle_session_outcome`.
+    let _streaming_guard = StreamingGuard(metrics.clone());
 
     let mut state = SessionState::new(config.max_transaction_events);
     let mut backoff = ReconnectBackoff::new(
@@ -1879,6 +1920,41 @@ mod tests {
             0,
             "the gauge MUST fall to zero along with the reset of the assembler"
         );
+    }
+
+    // I1: StreamingGuard.
+
+    #[test]
+    fn streaming_guard_clears_the_gauge_on_an_abrupt_drop_not_just_a_return() {
+        // The scenario `run()` itself cannot cover: nothing after the guard's
+        // construction ever runs (no session, no `handle_session_outcome`, no
+        // `return`) — the drop below stands in for a cancelled task or a lost
+        // `select!` race, both of which tear down `run()`'s Future the same way,
+        // by dropping it mid-poll without executing another line of its body.
+        let metrics = Arc::new(Metrics::new());
+        metrics.set_streaming(true);
+        {
+            let _guard = StreamingGuard(metrics.clone());
+            assert!(
+                metrics.snapshot().streaming,
+                "must still read true while the guard is alive and nothing has failed yet"
+            );
+        }
+        assert!(
+            !metrics.snapshot().streaming,
+            "the drop, not a return, must be what clears it"
+        );
+    }
+
+    #[test]
+    fn streaming_guard_drop_is_a_harmless_no_op_when_the_gauge_is_already_false() {
+        // The ordinary exit path: handle_session_outcome has already cleared the
+        // gauge before run() returns, so the guard's own drop on the way out just
+        // writes the same value again. Pinned so a future change cannot assume the
+        // guard is only ever meaningful on the abrupt path above.
+        let metrics = Arc::new(Metrics::new());
+        drop(StreamingGuard(metrics.clone()));
+        assert!(!metrics.snapshot().streaming);
     }
 
     // I2: a failed acknowledgement must not start the ack-age clock.

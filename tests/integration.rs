@@ -3424,3 +3424,63 @@ async fn the_streaming_flag_goes_false_after_a_fatal_error() {
         metrics.snapshot()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aborting_run_while_streaming_clears_the_streaming_gauge_too() {
+    // I1: `handle_session_outcome` clears `streaming` on every one of the four
+    // ways a session can end, but there is a fifth way `run()` itself can
+    // stop running that never reaches it — the caller tearing the task down
+    // from outside instead of letting `run()` return on its own
+    // (`handle.abort()`, or losing a `tokio::select!` race). `run()` is a
+    // public library entry point, not just the binary's own `main` (which
+    // never cancels it), so a caller embedding this crate and racing it
+    // against something else is not hypothetical. Without `StreamingGuard`,
+    // the snapshot below stays `streaming: true` forever after `abort()`:
+    // dropping the future mid-`.await` skips every line of `run()`'s body
+    // that would otherwise have cleared it, and there is nothing left running
+    // to ever flip it back.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let cfg = config(&conn);
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let run_metrics = metrics.clone();
+    let (tx_send, _rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None)), run_metrics)
+            .await
+    });
+
+    let mut became_true = false;
+    for _ in 0..100 {
+        if metrics.snapshot().streaming {
+            became_true = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        became_true,
+        "the flag never went true after a real connection: {:?}",
+        metrics.snapshot()
+    );
+
+    handle.abort();
+    // Observe the abort actually landing rather than guessing a sleep is long
+    // enough: `JoinHandle::await` after `abort()` resolves once the task's
+    // Future has genuinely been dropped, which is the exact moment
+    // `StreamingGuard` fires.
+    let joined = handle.await;
+    assert!(
+        joined.as_ref().is_err_and(|e| e.is_cancelled()),
+        "{joined:?}"
+    );
+
+    assert!(
+        !metrics.snapshot().streaming,
+        "aborting the task must not leave streaming stuck at true forever: {:?}",
+        metrics.snapshot()
+    );
+}
