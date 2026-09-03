@@ -3251,3 +3251,98 @@ async fn the_streaming_flag_goes_false_when_the_session_is_lost() {
 
     handle.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_streaming_flag_goes_false_after_a_fatal_error() {
+    // Round 1 review finding: `metrics.set_streaming(false)` sat textually
+    // after the `match` in `run()`'s loop, which reads as "runs for every
+    // outcome of stream_once" but does not — two of that match's four arms
+    // `return` before ever reaching a line placed after it:
+    // `Ok(SessionOutcome::ShutdownRequested) => return Ok(())` and
+    // `Err(e) => return Err(e)` (the fatal branch). The reviewer reproduced
+    // both live: a real SIGTERM during an active stream, and a real fatal
+    // `TransactionTooLarge`. Both left the caller's own `Arc<Metrics>`
+    // reporting a stale `streaming: true` after `run()` had already
+    // returned — `run` is a public library entry point that takes that
+    // `Arc` FROM the caller, so a consumer that outlives one call to it (a
+    // health check, a future `/metrics` route) would see exactly the
+    // "idle indistinguishable from working" confusion this whole task
+    // exists to close, just through the fatal-error door instead of the
+    // reconnect-loop door.
+    //
+    // The fix moved the gauge write to the first line of a new
+    // `handle_session_outcome`, ahead of its own match entirely, so there is
+    // no arm left to skip it in — pinned directly by four unit tests next to
+    // that function (`postgres::replication::tests`), including the two that
+    // used to be missed. This test proves the same thing end to end, through
+    // the real `run()` + `stream_once`, for the fatal-error arm specifically
+    // (the reviewer's own suggested reproduction: `max_transaction_events`
+    // set low enough that a real transaction trips it). The clean-shutdown
+    // arm is NOT exercised this way here: doing that would mean sending a
+    // real SIGTERM to this test binary's own process, and roughly two dozen
+    // OTHER tests in this same file also call `run()` in-process — a signal
+    // registered via `tokio::signal::unix::signal` fans out to every such
+    // listener in the process, not just the one under test, so a live
+    // self-signal here risks tearing down whichever of those happens to be
+    // mid-flight concurrently. Every existing SIGTERM test in this suite
+    // sends the signal to a SEPARATE spawned process for exactly this
+    // reason; that convention is kept here rather than being the one test
+    // that breaks it. The unit test covers the ShutdownRequested arm
+    // instead, at no risk and no cost.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let mut cfg = config(&conn);
+    cfg.max_transaction_events = 2;
+
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let run_metrics = metrics.clone();
+    let (tx_send, _rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx_send, None)), run_metrics)
+            .await
+    });
+
+    // It must genuinely have been streaming first — same reasoning as the
+    // disconnect test above: against a target that never starts at all,
+    // "streaming ends up false" would be true for the wrong reason.
+    let mut became_true = false;
+    for _ in 0..100 {
+        if metrics.snapshot().streaming {
+            became_true = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        became_true,
+        "the flag never went true after a real connection: {:?}",
+        metrics.snapshot()
+    );
+
+    client
+        .execute(
+            "INSERT INTO users SELECT g, 'x', NULL, NULL FROM generate_series(1, 10) g",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        .await
+        .expect("run should finish, not hang")
+        .expect("join");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, PgcdcError::TransactionTooLarge { limit: 2 }),
+        "got {err:?}"
+    );
+
+    assert!(
+        !metrics.snapshot().streaming,
+        "streaming stayed true after a fatal error: {:?}",
+        metrics.snapshot()
+    );
+}

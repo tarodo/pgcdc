@@ -463,6 +463,51 @@ fn session_was_productive(tracker: &LsnTracker, acked_before: Lsn) -> bool {
     tracker.acked() > acked_before
 }
 
+/// What `run()`'s outer loop should do next, decided once from the outcome of
+/// one session.
+#[derive(Debug)]
+enum LoopAction {
+    /// Keep looping: the outer loop decides how long to back off.
+    Reconnect,
+    /// A clean shutdown: `run()` returns `Ok(())`.
+    Stop,
+    /// A fatal error: `run()` propagates it.
+    Abort(PgcdcError),
+}
+
+/// Turns one session's outcome into a `LoopAction`, clearing the streaming
+/// gauge on the way. Pulled out of `run()`'s loop body for the same reason as
+/// `classify_start_outcome`/`session_was_productive` above: a first attempt
+/// at this put `metrics.set_streaming(false)` textually after the `match`
+/// that used to sit directly in `run()` — which reads as "runs for every
+/// outcome" but doesn't, because two of that match's arms `return` before
+/// reaching a line placed after it. That version shipped, a reviewer caught
+/// it against a live SIGTERM and a live fatal error, and both times the
+/// caller's own `Arc<Metrics>` was left showing a stale `streaming = true`.
+/// Here the call is the FIRST line of this function, before the match that
+/// decides what happens next — there is no arm left for an edit to add that
+/// could skip it, and the four cases below are pinned individually by a
+/// value-level unit test that needs neither a live Postgres nor a real
+/// signal to exercise the two arms (`Stop`, `Abort`) that used to be missed.
+fn handle_session_outcome(
+    outcome: Result<SessionOutcome, PgcdcError>,
+    metrics: &Metrics,
+) -> LoopAction {
+    metrics.set_streaming(false);
+    match outcome {
+        Ok(SessionOutcome::ShutdownRequested) => LoopAction::Stop,
+        Ok(SessionOutcome::Disconnected) => LoopAction::Reconnect,
+        // Recoverable errors lead into a reconnect, fatal ones out.
+        // The classification lives in the type (`is_fatal`), not in parsing text.
+        Err(e) if !e.is_fatal() => {
+            warn!(error = %e, error_kind = e.kind(), "postgres_connection_lost");
+            metrics.add_error();
+            LoopAction::Reconnect
+        }
+        Err(e) => LoopAction::Abort(e),
+    }
+}
+
 /// The pause before the next connection attempt. Wrapped in a type rather than a bare
 /// `Duration` living inside the infinite loop of `run()` with real `sleep`s — for
 /// testability: in that form the mutation "remove the reset" was caught by no test at
@@ -633,7 +678,7 @@ pub async fn run(
 
         let acked_before = state.tracker.acked();
 
-        match stream_once(
+        let outcome = stream_once(
             &config,
             &mut sink,
             &mut state,
@@ -642,25 +687,16 @@ pub async fn run(
             &mut last_report,
             &mut slot_busy_patience,
         )
-        .await
-        {
-            Ok(SessionOutcome::ShutdownRequested) => return Ok(()),
-            Ok(SessionOutcome::Disconnected) => {}
-            // Recoverable errors lead into a reconnect, fatal ones out.
-            // The classification lives in the type (`is_fatal`), not in parsing text.
-            Err(e) if !e.is_fatal() => {
-                warn!(error = %e, error_kind = e.kind(), "postgres_connection_lost");
-                metrics.add_error();
-            }
-            Err(e) => return Err(e),
-        }
+        .await;
 
-        // Written for every outcome of the match above — success, disconnect, or
-        // error — because it sits AFTER the match rather than inside one of its
-        // arms. A gauge that only the success path updates would keep reporting
-        // `streaming = true` throughout a reconnect storm: the failure to write it
-        // here IS the defect, not a place to skip.
-        metrics.set_streaming(false);
+        // handle_session_outcome clears the streaming gauge as its first
+        // action, before deciding what happens next — see its doc comment
+        // for why that used to be a separate, skippable line here instead.
+        match handle_session_outcome(outcome, &metrics) {
+            LoopAction::Stop => return Ok(()),
+            LoopAction::Reconnect => {}
+            LoopAction::Abort(e) => return Err(e),
+        }
 
         // The productivity flag is pulled out into `session_was_productive`: the
         // decision about what counts as productivity reads acked, not received, and
@@ -977,6 +1013,71 @@ async fn stream_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // handle_session_outcome: one test per arm, all four. The two that
+    // matter most are `ShutdownRequested` and a fatal `Err` — both `return`
+    // out of `run()`'s loop before the point where a previous version of
+    // this code cleared the streaming gauge, so both were the ones a
+    // reviewer caught still reporting `streaming: true` on a live SIGTERM
+    // and a live fatal error. Fixed here by moving the gauge write to the
+    // first line of this function, ahead of the match entirely — these
+    // tests exercise that guarantee directly, without a live Postgres or a
+    // real signal.
+
+    #[test]
+    fn shutdown_requested_clears_streaming_and_stops_the_loop() {
+        let metrics = Metrics::new();
+        metrics.set_streaming(true);
+        let action = handle_session_outcome(Ok(SessionOutcome::ShutdownRequested), &metrics);
+        assert!(
+            !metrics.snapshot().streaming,
+            "a clean shutdown must not leave streaming stuck at true for a caller \
+             still holding this Arc<Metrics> after run() returns"
+        );
+        assert!(matches!(action, LoopAction::Stop), "{action:?}");
+    }
+
+    #[test]
+    fn disconnected_clears_streaming_and_asks_to_reconnect() {
+        let metrics = Metrics::new();
+        metrics.set_streaming(true);
+        let action = handle_session_outcome(Ok(SessionOutcome::Disconnected), &metrics);
+        assert!(!metrics.snapshot().streaming, "{:?}", metrics.snapshot());
+        assert!(matches!(action, LoopAction::Reconnect), "{action:?}");
+    }
+
+    #[test]
+    fn a_recoverable_error_clears_streaming_counts_it_and_asks_to_reconnect() {
+        let metrics = Metrics::new();
+        metrics.set_streaming(true);
+        let action = handle_session_outcome(
+            Err(PgcdcError::Connection("connection reset by peer".into())),
+            &metrics,
+        );
+        assert!(!metrics.snapshot().streaming, "{:?}", metrics.snapshot());
+        assert_eq!(metrics.snapshot().errors_total, 1);
+        assert!(matches!(action, LoopAction::Reconnect), "{action:?}");
+    }
+
+    #[test]
+    fn a_fatal_error_clears_streaming_and_aborts_the_loop() {
+        let metrics = Metrics::new();
+        metrics.set_streaming(true);
+        let action =
+            handle_session_outcome(Err(PgcdcError::TransactionTooLarge { limit: 2 }), &metrics);
+        assert!(
+            !metrics.snapshot().streaming,
+            "a fatal error must not leave streaming stuck at true for a caller \
+             still holding this Arc<Metrics> after run() returns with Err"
+        );
+        assert!(
+            matches!(
+                action,
+                LoopAction::Abort(PgcdcError::TransactionTooLarge { limit: 2 })
+            ),
+            "{action:?}"
+        );
+    }
 
     #[test]
     fn start_replication_rejected_by_the_server_is_fatal_wrong_plugin() {
