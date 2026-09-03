@@ -27,8 +27,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # Unit tests only. 32 of the 37 integration tests start their own Postgres
-      # container, and two of the rest assert on wall-clock deadlines, so they
+      # Unit tests only. Most integration tests start their own Postgres
+      # container, and a few of the rest assert on wall-clock deadlines, so they
       # belong in the scheduled workflow where a load-induced miss does not
       # block a push.
       - name: Unit tests

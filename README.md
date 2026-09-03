@@ -14,8 +14,9 @@ skipped 39 committed rows while the process still exited with code 0. pgcdc expl
 prevent that class of failure, which is why so much of it is about exit codes and about the
 order of two operations.
 
-**The design rule everything else follows from:** a WAL position is never acknowledged to
-PostgreSQL before the sink has confirmed the data is durable. Acknowledging is
+**The design rule everything else follows from:** a WAL position is acknowledged only after
+the configured sink's barrier succeeds. For the file sink, that barrier includes fsync.
+Stdout is best-effort and is excluded from the no-loss durability guarantee. Acknowledging is
 irreversible — it permits the server to delete that WAL.
 
 ---
@@ -160,6 +161,7 @@ pgcdc --output stdout … | jq -r '.table'
 | `after` | new row; `null` for `delete`, and always `null` for `truncate` |
 | `unchanged_columns` | TOAST columns the server did not resend; they are absent from `after`, not `null` in it |
 | `transaction_id` | the transaction's xid |
+| `event_index` | this event's position within its transaction, starting at zero |
 | `lsn` | position of this change |
 | `commit_lsn` | position of the commit record that made it visible |
 | `commit_timestamp` | commit time, RFC 3339, microseconds, UTC |
@@ -182,13 +184,22 @@ advance past that record, and every restart landed on the same message again, we
 process permanently. `TRUNCATE` now decodes like any other operation; nothing about how you
 run or restart pgcdc needs to change.
 
-**`lsn` is the event identifier — use it for deduplication, not `commit_lsn`.** It is the
-WAL address of the change's own record, assigned by the server, not a counter we keep — so
-it is unique within a transaction, stable across a redelivery after a crash, and increases
-in the order the changes happened. `commit_lsn` cannot serve that role: every change in the
-same transaction carries the same `commit_lsn`, because it names the commit record, not the
-individual change. Group by `commit_lsn` to find everything one transaction touched;
-identify or deduplicate an individual change by `lsn`.
+**The deduplication key is `(lsn, event_index)`, not `lsn` alone.** `lsn` is the WAL address
+of the change's own record, assigned by the server, not a counter we keep — stable across a
+redelivery after a crash, and increasing in the order the changes happened. But it is not
+always unique on its own: a single `TRUNCATE` naming several tables becomes several events
+that all carry the WAL position of the one message that produced them, so `event_index` —
+this event's position within its transaction — is what tells them apart. `commit_lsn` still
+cannot serve as a key: every change in the same transaction carries the same `commit_lsn`,
+because it names the commit record, not the individual change. Group by `commit_lsn` to find
+everything one transaction touched; identify or deduplicate an individual change by
+`(lsn, event_index)`.
+
+`(lsn, event_index)` is unique and stable within **one source** — one publication on one
+slot on one PostgreSQL cluster. It says nothing about telling two sources apart. A consumer
+merging output from several PostgreSQL clusters must add its own source identifier (a
+connection string, a cluster name, whatever it already uses) to the key; pgcdc has no way to
+invent one, since it cannot know what distinguishes two clusters for that consumer.
 
 ---
 
@@ -207,7 +218,7 @@ without flushing — and zero is still correct there, but for a different reason
 not pass the barrier was never acknowledged either, so the slot hands it over again on the
 next run, and duplicates are permitted.
 
-A process that could lose events never exits `0`. Every fatal reason carries an
+Every fatal condition pgcdc can detect exits non-zero. Every fatal reason carries an
 `error_kind` you can alert on:
 
 | `error_kind` | What happened | What to do |
@@ -267,15 +278,23 @@ log file to reclaim disk, reproduces two of these exactly.
 
 ## Guarantees
 
+**The no-loss guarantee below covers `--output file`, under the operating assumptions
+above.** `--output stdout` is best-effort — its barrier is a successful write and flush, not
+proof the bytes reached durable storage — so it is excluded from this guarantee; see the
+note under Configuration above. A reader running with `--output stdout` should read this
+whole section as describing `--output file`, not the mode they are running.
+
 **Duplicates after a failure are acceptable; silent loss is not.** After a crash you may
 see events again around the boundary — consumers must be idempotent. Under the operating
-assumptions above, pgcdc never acknowledges a WAL position before the sink has confirmed
-it durable: a failure may produce duplicates, it does not produce gaps in the stream pgcdc
+assumptions above, `--output file` never acknowledges a WAL position before its sink has
+fsynced it: a failure may produce duplicates, it does not produce gaps in the stream pgcdc
 manages.
 
-**A position is acknowledged only after the durability barrier**, never after the write was
-merely accepted. There is a window between the two, and acknowledging inside it would mean
-telling the server to delete WAL that a crash could still take from us.
+**A position is acknowledged only after the configured sink's barrier succeeds**, never
+after the write was merely accepted. There is a window between the two, and acknowledging
+inside it would mean telling the server to delete WAL that a crash could still take from us.
+For the file sink, that barrier is `fsync`; for stdout it is only a successful write and
+flush, which is why stdout is excluded above.
 
 **The slot is the only source of truth for position.** Nothing is checkpointed locally, so
 there is no second place to drift out of sync. Recovery after `SIGKILL` relies on the slot
