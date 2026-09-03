@@ -2440,6 +2440,128 @@ async fn file_output_binary_writes_durable_json_lines() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn truncate_does_not_wedge_the_slot() {
+    // Regression test for the original TRUNCATE defect. A publication's `pubtruncate`
+    // defaults to true, so a TRUNCATE on a published table reaches pgoutput as message
+    // kind 'T'. Before this plan's Task 1, `decode` rejected 'T' with
+    // `PgcdcError::UnsupportedMessage`, which is fatal (src/error.rs) — the process died
+    // with exit code 1 before the record's LSN was ever acknowledged, so the slot's
+    // confirmed_flush_lsn never moved past it. Reproduced live before planning began:
+    // three separate runs, three exit-code-1 deaths on "unsupported pgoutput message
+    // kind 'T'", the slot's position unchanged across all three. Anything committed
+    // after the TRUNCATE — including a subsequent INSERT — was therefore permanently
+    // unreachable, not merely delayed.
+    //
+    // Three assertions below, each catching a different way a fix could stay incomplete:
+    // 1. the process must not exit non-zero — the original defect was a fatal error;
+    // 2. a "truncate" event for `users` must arrive;
+    // 3. the INSERT made AFTER the TRUNCATE must arrive too — this is what proves the
+    //    slot actually advanced past the TRUNCATE record. Without it, a build that only
+    //    downgraded the fatal error to a warning while leaving the slot wedged at the
+    //    same LSN would still pass.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("pgcdc-truncate-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let mut child = common::KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_pgcdc"))
+            .env("PGCDC_DATABASE_URL", &conn)
+            .env("PGCDC_PUBLICATION", "pgcdc_pub")
+            .env("PGCDC_SLOT", "pgcdc_slot")
+            .env("PGCDC_OUTPUT", "file")
+            .env("PGCDC_OUTPUT_PATH", &path)
+            .env("PGCDC_ACK_INTERVAL_MS", "50")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the binary"),
+    );
+
+    // One row before the TRUNCATE, so there is something for it to remove; the TRUNCATE
+    // itself; then one more row after it, whose arrival is the whole point of this test.
+    client
+        .execute("INSERT INTO users VALUES (1, 'Alice', NULL, NULL)", &[])
+        .await
+        .unwrap();
+    client
+        .execute("TRUNCATE TABLE public.users", &[])
+        .await
+        .unwrap();
+    client
+        .execute("INSERT INTO users VALUES (2, 'Bob', NULL, NULL)", &[])
+        .await
+        .unwrap();
+
+    // Poll for three JSON lines, but also watch the child directly on every pass: the
+    // original defect died with a nonzero exit long before three lines could ever
+    // accumulate, and leaving a dead child to spin until the generic 20s timeout below
+    // would obscure exactly the failure this test exists to catch.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let lines = loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = std::fs::remove_file(&path);
+            panic!("the process exited before all three events arrived: {status}");
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        if lines.len() >= 3 {
+            break lines;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&path);
+            panic!(
+                "did not see 3 JSON lines within 20s (got {}): {lines:?}",
+                lines.len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    // Assertion 1: the process did not exit non-zero. Checked here via a graceful
+    // SIGTERM rather than waiting for natural completion — the process streams forever
+    // on its own — the same device as a_terminated_process_exits_zero_after_draining.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = child.wait().expect("wait for the process to exit");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "TRUNCATE must not be fatal for the real binary: {status}"
+    );
+
+    let events: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON line {l:?}: {e}")))
+        .collect();
+
+    // Assertion 2: the truncate event itself arrived, for the right table, with no row
+    // identity (DECISIONS/event.rs: before and after are both null for a truncate).
+    let truncate_event = events
+        .iter()
+        .find(|v| v["operation"] == "truncate" && v["table"] == "users")
+        .unwrap_or_else(|| panic!("no truncate event for users in {events:?}"));
+    assert!(truncate_event["before"].is_null());
+    assert!(truncate_event["after"].is_null());
+
+    // Assertion 3: the INSERT made AFTER the TRUNCATE arrived — proof the slot moved
+    // past the TRUNCATE record instead of getting stuck on it.
+    let post_truncate_insert = events
+        .iter()
+        .find(|v| v["operation"] == "insert" && v["after"]["id"] == "2")
+        .unwrap_or_else(|| {
+            panic!("the INSERT made after TRUNCATE never arrived — the slot is stuck: {events:?}")
+        });
+    assert_eq!(post_truncate_insert["after"]["name"], "Bob");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_terminated_process_exits_zero_after_draining() {
     // A graceful stop must produce zero. Otherwise a supervisor would keep
     // endlessly restarting a process that was stopped intentionally.
