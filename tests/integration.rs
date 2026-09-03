@@ -3116,21 +3116,29 @@ async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect(
     );
 
     // Wait for the report line, no more than 20 seconds from process start.
+    // The line itself is captured, not just its presence: this is the
+    // cheapest place to also pin the two fields this task adds to it
+    // (`streaming`, `ack_age_s`) — the wait for the interval is already
+    // paid for by the timing assertions below, so checking the field names
+    // land correctly costs nothing extra.
     let mut t_report = None;
+    let mut report_line = None;
     while t_start.elapsed() < Duration::from_secs(20) {
-        if lines
+        if let Some(line) = lines
             .lock()
             .unwrap()
             .iter()
-            .any(|l| l.contains("metrics_report"))
+            .find(|l| l.contains("metrics_report"))
         {
             t_report = Some(t_start.elapsed());
+            report_line = Some(line.clone());
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let t_report = t_report
         .expect("the metrics_report line did not appear within 20 seconds of process start");
+    let report_line = report_line.expect("t_report is Some only alongside report_line");
 
     assert!(
         t_report >= Duration::from_secs(9),
@@ -3145,5 +3153,101 @@ async fn metrics_report_line_is_periodic_and_its_countdown_survives_a_reconnect(
         t_reconnected + Duration::from_secs(10)
     );
 
+    // By the time this line is printed the session has been reconnected and
+    // streaming for several seconds, and the earlier INSERT was long since
+    // acknowledged (the default ack interval is 200ms) — so a correctly
+    // wired report reads `streaming=true` and a `Some` age, not `None`.
+    assert!(
+        report_line.contains("streaming=true"),
+        "the report must carry the streaming gauge: {report_line}"
+    );
+    assert!(
+        report_line.contains("ack_age_s=Some("),
+        "an acknowledgement already happened, so the age must be Some, not None: {report_line}"
+    );
+
     let _ = std::fs::remove_file(&out);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_streaming_flag_goes_false_when_the_session_is_lost() {
+    // The plan for this test was originally "point at a dead port, like
+    // `sigterm_is_honored_while_stuck_reconnecting_to_a_dead_port`, and read
+    // `streaming=false` off a `metrics_report` line emitted from inside the
+    // reconnect loop." That does not work, and not because of a timing
+    // budget: the `metrics_report` check lives inside `stream_once`'s OWN
+    // per-session loop, reached only once `START_REPLICATION` has already
+    // succeeded (`replication.rs`, right after the `replication_started`
+    // log). A genuinely dead port never gets there at all. This was
+    // confirmed empirically, not assumed: pointed at `127.0.0.1:1` with the
+    // same short backoff bounds as that sigterm test, the process printed
+    // 51 "reconnecting" lines across 15 real seconds and not one
+    // "metrics_report" line. There is no code path in which that specific
+    // log line can carry `streaming=false` — the line itself cannot appear
+    // while disconnected, no matter how long you wait.
+    //
+    // So this test pins the actual defect (the gauge, not one specific
+    // line that happens to read it) directly through the same `Arc<Metrics>`
+    // `run()` takes — the same handle any other consumer (a future
+    // `/metrics` route, a health check) would read. It drives a REAL
+    // disconnect (not a dead port) precisely so the flag has genuinely been
+    // `true` beforehand: against a target that can never stream at all, the
+    // flag would stay `false` from its default for a reason unrelated to
+    // `set_streaming(false)`, and deleting that call would go unnoticed —
+    // exactly the "false only because nothing ever set it true" trap the
+    // task brief warns about.
+    let (_pg, conn) = common::start_postgres().await;
+    let client = common::connect(&conn).await;
+    common::setup_schema(&client).await;
+    common::create_slot(&client, "pgcdc_slot").await;
+
+    let mut cfg = config(&conn);
+    // Long enough that the false window comfortably outlasts test-loop
+    // scheduling jitter, short enough that the whole test stays well under
+    // a second past setup.
+    cfg.reconnect_initial_ms = 200;
+    cfg.reconnect_max_ms = 500;
+
+    let metrics = std::sync::Arc::new(pgcdc::metrics::Metrics::new());
+    let run_metrics = metrics.clone();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        let _ =
+            pgcdc::postgres::replication::run(cfg, Box::new(ChannelSink(tx, None)), run_metrics)
+                .await;
+    });
+
+    let mut became_true = false;
+    for _ in 0..100 {
+        if metrics.snapshot().streaming {
+            became_true = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        became_true,
+        "the flag never went true after a real connection: {:?}",
+        metrics.snapshot()
+    );
+
+    // The failure this task closes: a session ending for a reason other
+    // than a clean shutdown.
+    common::terminate_replication_backend(&client).await;
+
+    let mut became_false = false;
+    for _ in 0..100 {
+        if !metrics.snapshot().streaming {
+            became_false = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        became_false,
+        "the flag stayed true after the session was lost: {:?}",
+        metrics.snapshot()
+    );
+
+    handle.abort();
 }

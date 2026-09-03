@@ -534,6 +534,7 @@ async fn acknowledge_durable(
     // barrier and the keepalive advance go through this common tail, so neither of them
     // will grow a second write site.
     metrics.set_last_acknowledged_lsn(acked.0);
+    metrics.note_acknowledged_now();
 
     stream.shared_lsn_feedback.update_flushed_lsn(acked.0);
     stream.shared_lsn_feedback.update_applied_lsn(acked.0);
@@ -653,6 +654,13 @@ pub async fn run(
             }
             Err(e) => return Err(e),
         }
+
+        // Written for every outcome of the match above — success, disconnect, or
+        // error — because it sits AFTER the match rather than inside one of its
+        // arms. A gauge that only the success path updates would keep reporting
+        // `streaming = true` throughout a reconnect storm: the failure to write it
+        // here IS the defect, not a place to skip.
+        metrics.set_streaming(false);
 
         // The productivity flag is pulled out into `session_was_productive`: the
         // decision about what counts as productivity reads acked, not received, and
@@ -832,6 +840,7 @@ async fn stream_once(
         Instant::now(),
     )?;
     info!(slot = %config.slot, publication = %config.publication, "replication_started");
+    metrics.set_streaming(true);
 
     if reconnecting {
         // Only now: the stream is genuinely open and started by the server. Logging this
@@ -881,6 +890,8 @@ async fn stream_once(
                 last_received_lsn = %Lsn(s.last_received_lsn),
                 last_acknowledged_lsn = %Lsn(s.last_acknowledged_lsn),
                 buffer = s.transaction_buffer_size,
+                streaming = s.streaming,
+                ack_age_s = ?s.seconds_since_last_ack,
                 "metrics_report"
             );
         }
