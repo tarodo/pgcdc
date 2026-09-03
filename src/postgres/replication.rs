@@ -579,7 +579,6 @@ async fn acknowledge_durable(
     // barrier and the keepalive advance go through this common tail, so neither of them
     // will grow a second write site.
     metrics.set_last_acknowledged_lsn(acked.0);
-    metrics.note_acknowledged_now();
 
     stream.shared_lsn_feedback.update_flushed_lsn(acked.0);
     stream.shared_lsn_feedback.update_applied_lsn(acked.0);
@@ -590,6 +589,16 @@ async fn acknowledge_durable(
         .send_feedback()
         .await
         .map_err(|e| PgcdcError::Connection(format!("send_feedback: {e}")))?;
+
+    // Only now, after the send has actually gone out: `Metrics::note_acknowledged_now`'s
+    // own doc comment says "after a position has actually been acknowledged to the
+    // server", and until this line the call sat before `send_feedback` instead of after
+    // it — a failed send left the ack-age clock freshly reset over an acknowledgement the
+    // server never received, the opposite of what the gauge exists to report during an
+    // outage. `set_last_acknowledged_lsn` above stays where it is: that position is the
+    // tracker's own decision about what it will feedback next, not a claim about what the
+    // peer has seen, and moving it would not change what this call fixes.
+    metrics.note_acknowledged_now();
 
     Ok(acked)
 }
@@ -1869,6 +1878,189 @@ mod tests {
             metrics.snapshot().transaction_buffer_size,
             0,
             "the gauge MUST fall to zero along with the reset of the assembler"
+        );
+    }
+
+    // I2: a failed acknowledgement must not start the ack-age clock.
+
+    /// Drives `acknowledge_durable` against a real, then abruptly killed, Postgres —
+    /// directly, not through `stream_once`'s loop. Inside that loop the read
+    /// (`next_raw_event`) and the ack-interval flush both watch the same connection on
+    /// every turn, so a live reproduction through the full loop would be racing the read
+    /// against the flush for whichever one notices the dead connection first — and the
+    /// read, being in flight almost continuously, wins that race in practice, making the
+    /// scenario this test needs (the flush is the one that finds out) unreachable through
+    /// the loop with any reliability. Calling the function directly removes the race:
+    /// nothing else is watching this connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_feedback_send_does_not_start_the_ack_age_clock() {
+        use testcontainers::core::{IntoContainerPort, WaitFor};
+        use testcontainers::runners::AsyncRunner;
+        use testcontainers::{GenericImage, ImageExt};
+
+        let container = GenericImage::new("postgres", "16-alpine")
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
+            .with_env_var("POSTGRES_DB", "app")
+            .with_cmd([
+                "postgres",
+                "-c",
+                "wal_level=logical",
+                "-c",
+                "max_replication_slots=10",
+                "-c",
+                "max_wal_senders=10",
+            ])
+            .start()
+            .await
+            .expect("start postgres");
+        let port = container
+            .get_host_port_ipv4(5432.tcp())
+            .await
+            .expect("port");
+        let conn = format!("postgres://postgres:postgres@127.0.0.1:{port}/app");
+
+        let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "CREATE TABLE t (id INT PRIMARY KEY);
+                 CREATE PUBLICATION pgcdc_pub FOR TABLE t;",
+            )
+            .await
+            .expect("schema and publication");
+        // Separate from the batch above: `pg_create_logical_replication_slot`
+        // refuses to run inside a transaction that has already performed
+        // writes, and `batch_execute` sends its whole string as one implicit
+        // transaction block.
+        client
+            .query(
+                "SELECT pg_create_logical_replication_slot('pgcdc_slot', 'pgoutput')",
+                &[],
+            )
+            .await
+            .expect("create slot");
+
+        let stream_config = ReplicationStreamConfig::new(
+            "pgcdc_slot".to_string(),
+            "pgcdc_pub".to_string(),
+            1,
+            StreamingMode::Off,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+        .with_binary(false)
+        .with_messages(false);
+        let mut stream = LogicalReplicationStream::new(&replication_url(&conn), stream_config)
+            .await
+            .expect("open replication stream");
+        stream.start(None).await.expect("start replication");
+
+        client
+            .execute("INSERT INTO t VALUES (1)", &[])
+            .await
+            .expect("insert");
+
+        // send_feedback() is a documented no-op while nothing has been received yet
+        // (pg_walstream short-circuits on last_received_lsn == 0), so a real
+        // acknowledgement below can only succeed once real data has actually arrived.
+        let cancel = CancellationToken::new();
+        loop {
+            tokio::time::timeout(Duration::from_secs(10), stream.next_raw_event(&cancel))
+                .await
+                .expect("timed out waiting for the insert to arrive")
+                .expect("read a raw event");
+            if stream.current_lsn() > 0 {
+                break;
+            }
+        }
+
+        let metrics = Arc::new(Metrics::new());
+        let mut state = SessionState::new(100_000);
+        let durable = Lsn(stream.current_lsn());
+
+        // A genuine, successful acknowledgement while the connection is still healthy —
+        // there has to be a real "last successful ack" on record for the assertion below
+        // to mean anything: without one, a bug that leaves the age at `None` after a
+        // failure would be indistinguishable from correct behavior that also leaves it at
+        // `None` for the unrelated reason that nothing had ever succeeded yet.
+        acknowledge_durable(&mut state, &mut stream, durable, &metrics)
+            .await
+            .expect("the connection is still healthy at this point");
+        assert_eq!(metrics.snapshot().seconds_since_last_ack, Some(0));
+
+        // Long enough that "the age kept climbing from here" and "the age was reset to
+        // fresh by the failed attempt below" are distinguishable at the one-second
+        // resolution `seconds_since_last_ack` actually has.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Drop the connection from the server side. Killing the whole container was tried
+        // first and rejected: it tears down the network path entirely, so a write into the
+        // local socket buffer keeps silently "succeeding" for as long as TCP keeps
+        // retransmitting into the void — empirically confirmed still true half a second
+        // later. A live Postgres process closing its end of the socket is different: once
+        // that backend is gone, the port on its end is genuinely unowned, and the next
+        // segment we send into it comes back as a real RST.
+        client
+            .execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE backend_type = 'walsender'",
+                &[],
+            )
+            .await
+            .expect("terminate walsender");
+
+        // Even so, the very NEXT write is not guaranteed to observe it: `pg_terminate_backend`
+        // only sends the signal, it does not wait for the backend to actually exit, and even
+        // once it has, a single `write()` succeeds by handing bytes to the local kernel
+        // buffer — it does not wait for the peer's RST for that specific segment to come
+        // back first. Empirically this warm-up loop needed more than one attempt every time
+        // in manual runs: retrying gives the RST time to land and be reflected in the
+        // socket's own error state. A THROWAWAY `Metrics` absorbs these warm-up attempts —
+        // some of which may well succeed correctly before the connection's local error state
+        // catches up, and correctly updating the age on a genuine success is not the bug this
+        // test is after — so the real `metrics` below observes only the one call that matters.
+        let scratch_metrics = Arc::new(Metrics::new());
+        let mut confirmed_broken = false;
+        for _ in 0..50 {
+            if acknowledge_durable(&mut state, &mut stream, durable, &scratch_metrics)
+                .await
+                .is_err()
+            {
+                confirmed_broken = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            confirmed_broken,
+            "the connection never actually failed within the retry budget"
+        );
+
+        // The connection's brokenness is a property of the socket, not of which `Metrics`
+        // is passed in — so this call, now that the warm-up loop above has confirmed the
+        // socket is in a failing state, is not racing anything: it inherits that same state.
+        let result = acknowledge_durable(&mut state, &mut stream, durable, &metrics).await;
+        assert!(
+            result.is_err(),
+            "expected the already-confirmed-broken connection to keep failing: {result:?}"
+        );
+
+        let age = metrics.snapshot().seconds_since_last_ack;
+        assert!(
+            matches!(age, Some(s) if s >= 1),
+            "a failed send must not start the ack-age clock: the age must still reflect the \
+             earlier, genuinely successful acknowledgement (>= 1s old by now), not this \
+             failed attempt — got {age:?}"
         );
     }
 }
