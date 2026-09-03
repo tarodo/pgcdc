@@ -890,6 +890,8 @@ potential test that **MUST NOT** be written from this document as if it were fac
    `pg_logical_emit_message` was not called; replication is not cascading, so no Origin
    arrives. Their layout was not analysed in this document at all. The stage 2 decoder must
    manage not to break on them — but there is nothing to test those branches against.
+   (`T`'s layout was captured and analysed later, separately from this document's 31-dump
+   session — see `tests/fixtures/MANIFEST.md`, section `0032_truncate.bin`.)
 
 6. **`atttypmod` equals `-1` (`ff ff ff ff`) in all seven columns of both tables.**
    Every type in the schema is `bigint`, `text`, `int`, and none of them has a length modifier. So
