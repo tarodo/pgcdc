@@ -38,6 +38,12 @@ pub struct ChangeEvent {
     pub after: Option<Row>,
     pub unchanged_columns: Vec<String>,
     pub transaction_id: u32,
+    /// This event's position within its transaction, starting at zero and
+    /// counting every change of every kind. Together with `lsn` it identifies
+    /// the event uniquely inside one source: `lsn` alone does not, because a
+    /// single `TRUNCATE` naming several tables becomes several events that all
+    /// carry the WAL position of the one message that produced them.
+    pub event_index: u32,
     pub lsn: Lsn,
     pub commit_lsn: Lsn,
     #[serde(serialize_with = "serialize_ts")]
@@ -78,6 +84,7 @@ mod tests {
             after: Some(after),
             unchanged_columns: Vec::new(),
             transaction_id: 737,
+            event_index: 0,
             lsn: Lsn(0x0192_FFC0),
             commit_lsn: Lsn(0x0193_00D0),
             commit_timestamp: pg_micros_to_utc(841_423_351_314_489),
@@ -91,7 +98,7 @@ mod tests {
             r#"{"schema":"public","table":"users","operation":"insert","#,
             r#""before":null,"before_kind":null,"#,
             r#""after":{"id":"1","name":"Alice","email":"alice@example.com","bio":null},"#,
-            r#""unchanged_columns":[],"transaction_id":737,"#,
+            r#""unchanged_columns":[],"transaction_id":737,"event_index":0,"#,
             r#""lsn":"0/192FFC0","commit_lsn":"0/19300D0","#,
             r#""commit_timestamp":"2026-08-30T16:42:31.314489Z"}"#
         );

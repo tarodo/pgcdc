@@ -84,6 +84,7 @@ mod tests {
             after: Some(after),
             unchanged_columns: Vec::new(),
             transaction_id: 737,
+            event_index: 0,
             lsn: Lsn(0x200),
             commit_lsn: Lsn(0x1000),
             commit_timestamp: pg_micros_to_utc(841_423_351_314_489),

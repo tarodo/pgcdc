@@ -9,7 +9,9 @@ use crate::schema::{Relation, RelationCache};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transaction {
     pub xid: u32,
-    /// LSN of the commit record itself. Goes into JSON as the deduplication key.
+    /// LSN of the commit record itself. Identical for every event in the
+    /// transaction, so it groups events by transaction — it is not a key.
+    /// The dedup key is `(lsn, event_index)`.
     pub commit_lsn: Lsn,
     /// LSN right after the commit record. THIS is what we acknowledge to PostgreSQL.
     pub end_lsn: Lsn,
@@ -228,7 +230,8 @@ impl Assembler {
                 let changes = open
                     .changes
                     .into_iter()
-                    .map(|c| ChangeEvent {
+                    .enumerate()
+                    .map(|(event_index, c)| ChangeEvent {
                         schema: c.schema,
                         table: c.table,
                         operation: c.operation,
@@ -237,6 +240,12 @@ impl Assembler {
                         after: c.after,
                         unchanged_columns: c.unchanged_columns,
                         transaction_id: open.xid,
+                        // The buffer's position is the source of truth: it needs
+                        // no separate counter that could drift from its length,
+                        // and it reproduces identically on redelivery because the
+                        // slot replays the same transaction with the same
+                        // changes in the same order.
+                        event_index: event_index as u32,
                         lsn: c.lsn,
                         commit_lsn: Lsn(commit_lsn),
                         commit_timestamp: ts,
@@ -1239,6 +1248,63 @@ mod tests {
         }
         let tables: Vec<&str> = tx.changes.iter().map(|ev| ev.table.as_str()).collect();
         assert_eq!(tables, vec!["users", "items"]);
+    }
+
+    #[test]
+    fn every_event_in_a_transaction_gets_a_distinct_index() {
+        // One TRUNCATE naming two tables becomes two events that share a WAL
+        // position, so the index is what tells them apart. Row changes in the
+        // same transaction must keep counting from the same sequence — the
+        // ordinal is per transaction, not per message.
+        let mut cache = RelationCache::new();
+        let mut a = Assembler::new(100);
+        a.handle(begin(737), Lsn(0x100), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Relation(users_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        a.handle(
+            PgOutputMessage::Relation(items_relation()),
+            Lsn(0),
+            &mut cache,
+        )
+        .unwrap();
+        a.handle(insert(), Lsn(0x200), &mut cache).unwrap();
+        a.handle(
+            PgOutputMessage::Truncate {
+                relation_ids: vec![16385, 16392],
+            },
+            Lsn(0x300),
+            &mut cache,
+        )
+        .unwrap();
+        let tx = a
+            .handle(commit(), Lsn(0x1000), &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tx.changes.len(), 3);
+        let indices: Vec<u32> = tx.changes.iter().map(|ev| ev.event_index).collect();
+        assert_eq!(
+            indices,
+            vec![0, 1, 2],
+            "indices follow emission order across the whole transaction"
+        );
+        let truncates: Vec<&ChangeEvent> = tx
+            .changes
+            .iter()
+            .filter(|ev| ev.operation == Operation::Truncate)
+            .collect();
+        assert_eq!(truncates.len(), 2);
+        assert_eq!(
+            truncates[0].lsn, truncates[1].lsn,
+            "both truncate events carry the one message's wal_start"
+        );
+        assert_ne!(
+            truncates[0].event_index, truncates[1].event_index,
+            "event_index is what tells the two truncate events apart"
+        );
     }
 
     #[test]
