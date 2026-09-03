@@ -408,17 +408,17 @@ With a comment worth reading in full:
 
 | File | Lines | What is in it |
 |---|---|---|
-| [src/main.rs](../src/main.rs) | 56 | entry point: parse the flags, pick a sink, run, return an exit code |
+| [src/main.rs](../src/main.rs) | 58 | entry point: parse the flags, pick a sink, run, return an exit code |
 | [src/config.rs](../src/config.rs) | 487 | ten CLI flags and their paired environment variables |
 | [src/postgres/replication.rs](../src/postgres/replication.rs) | 2142 | **the heart**: two loops, reconnect, acknowledgement, shutdown |
 | [src/postgres/pgoutput.rs](../src/postgres/pgoutput.rs) | 711 | binary protocol decoding |
 | [src/postgres/guard.rs](../src/postgres/guard.rs) | 182 | the pre-flight check on the slot |
-| [src/transaction.rs](../src/transaction.rs) | 1311 | `Assembler` — buffers until `COMMIT` |
+| [src/transaction.rs](../src/transaction.rs) | 1383 | `Assembler` — buffers until `COMMIT` |
 | [src/lsn.rs](../src/lsn.rs) | 189 | the four positions and the rules between them |
 | [src/schema.rs](../src/schema.rs) | 109 | cache of table descriptions (`RELATION`) |
-| [src/event.rs](../src/event.rs) | 130 | `ChangeEvent` — what goes out as JSON |
-| [src/sink/](../src/sink/) | 699 | the `Sink` trait + two implementations |
-| [src/error.rs](../src/error.rs) | 167 | every kind of error and the fatal / recoverable split |
+| [src/event.rs](../src/event.rs) | 137 | `ChangeEvent` — what goes out as JSON |
+| [src/sink/](../src/sink/) | 703 | the `Sink` trait + two implementations |
+| [src/error.rs](../src/error.rs) | 178 | every kind of error and the fatal / recoverable split |
 | [src/metrics.rs](../src/metrics.rs) | 241 | eight counters |
 
 Where to start reading: `main.rs` → `run()` in `replication.rs` → `stream_once()` in the same file.
