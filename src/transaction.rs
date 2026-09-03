@@ -245,6 +245,12 @@ impl Assembler {
                         // and it reproduces identically on redelivery because the
                         // slot replays the same transaction with the same
                         // changes in the same order.
+                        //
+                        // usize -> u32 truncates only past 4_294_967_296 events in
+                        // one transaction: `self.max_events` (`--max-transaction-events`,
+                        // default 100_000) refuses the buffer long before that, and
+                        // even with that flag raised past u32::MAX, holding that many
+                        // buffered `PendingChange`s would exhaust RAM first.
                         event_index: event_index as u32,
                         lsn: c.lsn,
                         commit_lsn: Lsn(commit_lsn),
